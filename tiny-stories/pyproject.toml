@@ -19,7 +19,7 @@ dependencies = [
 # errors if the dev group doesn't exist. Define an empty one so --no-group
 # has a group to exclude.
 [project.optional-dependencies]
-tpu = ["jax[tpu]==0.8.0", "torch==2.9.0", "torchvision==0.24.0"]
+tpu = ["marin[tpu]; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = []
@@ -50,6 +50,7 @@ find-links = [
     "https://github.com/marin-community/marin/releases/expanded_assets/marin-zephyr-latest",
     "https://github.com/marin-community/marin/releases/expanded_assets/marin-rigging-latest",
     "https://github.com/marin-community/marin/releases/expanded_assets/marin-fray-latest",
+    "https://github.com/marin-community/marin/releases/expanded_assets/marin-finelog-latest",
     "https://github.com/marin-community/marin/releases/expanded_assets/dupekit-0.1.0-40ac799",
     "https://github.com/marin-community/kitoken/releases/expanded_assets/kitoken-0.10.2-a3012f4",
 ]
