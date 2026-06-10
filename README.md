@@ -54,6 +54,28 @@ uv run iris --cluster=marin job run python launch.py --region=europe-west4
 
 If you don't have access to the shared marin cluster, you can run your own iris cluster — see the [iris docs](https://github.com/marin-community/iris) for setup.
 
+## Troubleshooting
+
+### `uv` fails with a 404 downloading a `marin-*` wheel
+
+```
+x Failed to download `marin-iris==0.99.devYYYYMMDD`
+`-> HTTP status client error (404 Not Found) for url
+    (https://github.com/marin-community/marin/releases/download/marin-iris-latest/...)
+```
+
+The `marin-*` wheels are published to rolling GitHub releases whose assets are
+replaced on each upstream rebuild, so a committed `uv.lock` eventually points
+at wheels that no longer exist. Repin against the current wheels:
+
+```
+uv lock --upgrade
+```
+
+A scheduled workflow ([`repin-lockfiles.yml`](.github/workflows/repin-lockfiles.yml))
+keeps the locks in this repo fresh, but if you copied a template into your own
+repo a while ago you'll need to repin yourself.
+
 ## Repo layout
 
 ```

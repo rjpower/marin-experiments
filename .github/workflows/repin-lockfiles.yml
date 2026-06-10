@@ -1,0 +1,52 @@
+# The marin-* wheels that the templates depend on live in rolling GitHub
+# releases (marin-iris-latest, etc.) whose assets are replaced on each
+# upstream rebuild. A committed uv.lock pins an exact dev version, so once
+# upstream rebuilds, the lock points at wheels that no longer exist and a
+# fresh `uv run` 404s. This workflow repins the locks daily (and on demand)
+# so the broken window is bounded to ~1 day instead of waiting on a manual
+# "Repin nightlies" commit.
+name: Repin lockfiles
+
+on:
+  schedule:
+    # Daily, early UTC morning. Minute chosen off the hour to avoid the
+    # GitHub Actions scheduled-job thundering herd.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Repin lockfiles
+        run: |
+          for lock in */uv.lock; do
+            (cd "$(dirname "$lock")" && uv lock --upgrade)
+          done
+
+      - name: Verify locks install
+        # Mirrors what iris workers run (--no-group dev) so a lock that
+        # passes here also installs on the cluster.
+        run: |
+          for lock in */uv.lock; do
+            (cd "$(dirname "$lock")" && uv sync --frozen --no-group dev)
+          done
+
+      - name: Commit and push if changed
+        run: |
+          if git diff --quiet -- '*/uv.lock'; then
+            echo "Lockfiles unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- '*/uv.lock'
+          git commit -m "Repin nightlies."
+          git push
