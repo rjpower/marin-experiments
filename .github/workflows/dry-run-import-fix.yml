@@ -1,0 +1,65 @@
+# The templates in this repo depend on marin (and its sibling libraries) as
+# rolling release wheels. When upstream reorganizes a module, the wheel still
+# installs but the templates' import lines / config construction break — the
+# exact breakage that needed the "Fix imports broken by marin#6007 module
+# reorganization" commit. repin-lockfiles.yml keeps the locks resolvable but
+# cannot catch this API drift.
+#
+# This workflow runs each template's canonical dry-run smoke test nightly. When
+# a template no longer imports/constructs cleanly, it hands the captured failure
+# to Claude Code, which updates the imports to upstream's new locations,
+# re-verifies the dry run, and opens a PR with automerge armed, CC @hammer — so
+# the broken window stays ~1 day instead of waiting for someone to hit the error.
+name: Dry-run import fix
+
+on:
+  schedule:
+    # Daily at 06:40 UTC — after repin-lockfiles.yml (05:23) so the dry run
+    # tests the templates against locks that already point at current wheels.
+    # Minute chosen off the hour to dodge the scheduled-job thundering herd.
+    - cron: "40 6 * * *"
+  workflow_dispatch: {}
+
+# Never let two fix runs race on the shared fix branch / open duplicate PRs.
+concurrency:
+  group: dry-run-import-fix
+  cancel-in-progress: false
+
+jobs:
+  dry-run-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # push the fix branch
+      pull-requests: write # open the PR, request review, arm automerge
+      issues: write # add labels
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          # Full history so the agent can rebase the fix branch onto origin/main.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Configure git identity
+        # Commits the agent makes need an author; attribute them to the Actions
+        # bot (matches the GITHUB_TOKEN that opens the PR).
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Dry-run templates and fix import drift
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python .github/scripts/nightly_dry_run.py --run-id "${{ github.run_id }}"
