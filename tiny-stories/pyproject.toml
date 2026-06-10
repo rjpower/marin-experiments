@@ -13,6 +13,10 @@ dependencies = [
     "marin-iris",
     "marin-zephyr",
     "marin-rigging",
+    # marin.datakit.normalize imports the dupekit module unconditionally; it is
+    # provided by the marin-dupekit distribution, which marin does not pull in
+    # itself, so declare it here.
+    "marin-dupekit",
 ]
 
 # Iris's remote worker runs `uv sync --all-packages --no-group dev`, which
@@ -51,7 +55,6 @@ find-links = [
     "https://github.com/marin-community/marin/releases/expanded_assets/marin-rigging-latest",
     "https://github.com/marin-community/marin/releases/expanded_assets/marin-fray-latest",
     "https://github.com/marin-community/marin/releases/expanded_assets/marin-finelog-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/dupekit-0.1.0-40ac799",
     "https://github.com/marin-community/kitoken/releases/expanded_assets/kitoken-0.10.2-a3012f4",
 ]
 
