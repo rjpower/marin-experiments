@@ -21,9 +21,9 @@ import jax.numpy as jnp
 import jmp
 import optax
 from fsspec import AbstractFileSystem
+from fray import current_client
 from fray.cluster import ResourceConfig
-from fray.v2.client import current_client
-from fray.v2.types import Entrypoint, GpuConfig, JobRequest, TpuConfig, create_environment
+from fray.types import Entrypoint, GpuConfig, JobRequest, TpuConfig, create_environment
 from haliax import Axis
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
