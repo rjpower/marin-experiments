@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "End-to-end LibriSpeech speech-token training experiment using marin as a library dependency."
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "marin",
+    # The umbrella is published to PyPI as marin-core; the name "marin" only
+    # exists as stale GitHub-release wheels (0.99.dev*) that outrank fresh PyPI
+    # builds (0.2.x.dev*) by version number, so we use marin-core here.
+    "marin-core",
     "marin-levanter",
     "marin-iris",
     "marin-zephyr",
@@ -28,7 +31,7 @@ dependencies = [
 # errors if the dev group doesn't exist. Define an empty one so --no-group
 # has a group to exclude.
 [project.optional-dependencies]
-tpu = ["marin[tpu]; sys_platform == 'linux'"]
+tpu = ["marin-core[tpu]; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = []
@@ -52,14 +55,11 @@ override-dependencies = [
 ]
 
 find-links = [
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-haliax-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-levanter-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-iris-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-zephyr-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-rigging-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-fray-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-finelog-latest",
+    # marin-* packages (marin-core, marin-levanter, marin-haliax, marin-iris,
+    # marin-zephyr, marin-rigging, marin-fray, marin-finelog) resolve from PyPI
+    # as nightly 0.2.x.dev wheels. The *-latest GitHub-release find-links are
+    # intentionally dropped: they serve stale 0.99.dev wheels that outrank the
+    # fresh 0.2.x.dev PyPI builds by version number.
     "https://github.com/marin-community/kitoken/releases/expanded_assets/kitoken-0.10.2-a3012f4",
 ]
 
