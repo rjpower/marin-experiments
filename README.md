@@ -1,6 +1,6 @@
 # marin-experiments
 
-Copy-paste templates for running [Marin](https://github.com/marin-community/marin) pipelines as standalone experiments. Each template is a self-contained directory — marin is pulled in as a library via `find-links` wheels, no submodule, no vendoring.
+Copy-paste templates for running [Marin](https://github.com/marin-community/marin) pipelines as standalone experiments. Each template is a self-contained directory — marin is pulled in as a library via PyPI (`marin-core`, `marin-levanter`, … as nightly `0.2.x.dev` wheels), no submodule, no vendoring.
 
 ## Getting started
 
@@ -56,17 +56,11 @@ If you don't have access to the shared marin cluster, you can run your own iris 
 
 ## Troubleshooting
 
-### `uv` fails with a 404 downloading a `marin-*` wheel
+### `uv` fails to resolve or download a `marin-*` wheel
 
-```
-x Failed to download `marin-iris==0.99.devYYYYMMDD`
-`-> HTTP status client error (404 Not Found) for url
-    (https://github.com/marin-community/marin/releases/download/marin-iris-latest/...)
-```
-
-The `marin-*` wheels are published to rolling GitHub releases whose assets are
-replaced on each upstream rebuild, so a committed `uv.lock` eventually points
-at wheels that no longer exist. Repin against the current wheels:
+The `marin-*` packages (`marin-core`, `marin-levanter`, etc.) are published to
+PyPI as nightly `0.2.x.dev` wheels. A committed `uv.lock` can go stale if new
+releases have been published since it was last updated. Repin against the latest:
 
 ```
 uv lock --upgrade
