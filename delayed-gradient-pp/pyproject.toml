@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Delayed-gradient / pipeline-parallel staleness experiments for grug MoE, using marin as a library dependency."
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "marin",
+    # The marin umbrella is published to PyPI as `marin-core` (the `marin` name
+    # only exists as stale GitHub-release wheels; see the find-links note below).
+    "marin-core",
     "marin-levanter",
     # haliax and fray are imported directly (model.py uses haliax; the launcher
     # and trainer use fray.cluster.ResourceConfig), so declare them rather than
@@ -28,7 +30,7 @@ dependencies = [
 # errors if the dev group doesn't exist. Define an empty one so --no-group
 # has a group to exclude.
 [project.optional-dependencies]
-tpu = ["marin[tpu]; sys_platform == 'linux'"]
+tpu = ["marin-core[tpu]; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = []
@@ -51,15 +53,13 @@ override-dependencies = [
     "equinox>=0.11.10",
 ]
 
+# The marin-* dev wheels resolve from PyPI (marin-core, marin-levanter, ... as
+# 0.2.x.devYYYYMMDDHHMM, published nightly). We intentionally do NOT use the
+# GitHub `*-latest` release find-links here: those serve `0.99.dev<date>` wheels
+# that (a) are frozen at 2026-05-29 and (b) outrank the fresh PyPI `0.2.x.dev`
+# wheels by version, so including them silently pins stale marin code. kitoken
+# ships a pinned native build that is not on PyPI, so it keeps its find-link.
 find-links = [
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-haliax-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-levanter-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-iris-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-zephyr-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-rigging-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-fray-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-finelog-latest",
     "https://github.com/marin-community/kitoken/releases/expanded_assets/kitoken-0.10.2-a3012f4",
 ]
 

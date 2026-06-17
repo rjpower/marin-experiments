@@ -14,14 +14,14 @@ to the unwrapped optimizer; for τ>0 it reproduces constant-delay asynchronous S
 exactly. The delay FIFO and any correction statistics are the `O(weights)` state
 we are budgeting for.
 
-> **Status / blocker (2026-06-17).** This experiment depends on the grug MoE
-> `_moe/` refactor in `levanter` (`MOE_REMAT_SAVE_NAMES`, `MoeImplementation`,
-> …; marin PR #6312, landed on `main` 2026-06-11). The marin libs publish
-> pipeline has not landed a new artifact since ~2026-06-06 (PyPI tops out at
-> `marin-levanter==0.2.9.dev202606060818`; the GitHub `*-latest` release assets
-> are frozen at 2026-05-29) even though the nightly workflow reports green. Until
-> a wheel ≥ 2026-06-11 is published, `uv sync` resolves a `levanter` that cannot
-> import `model.py`. See the tracking issue for the unblock options.
+> **Dependencies.** marin is consumed as the nightly `0.2.x.dev` wheels from
+> **PyPI** (`marin-core`, `marin-levanter`, …). This experiment deliberately does
+> *not* use the GitHub `*-latest` release find-links that the other templates
+> use: those serve `0.99.dev<date>` wheels that are stale *and* outrank the fresh
+> PyPI wheels by version, which silently pins old marin code (see the comment in
+> `pyproject.toml`). The model depends on the grug `_moe/` refactor (marin #6312,
+> 2026-06-11), so the lock must stay on a `>= 0.2.14.dev202606120949`
+> `marin-levanter`. Repin with `uv lock --upgrade`.
 
 ## Layout
 
