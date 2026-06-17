@@ -7,6 +7,9 @@ pipeline schedule — which applies **stale gradients** — is worth adopting fo
 pretraining, and whether the staleness can be corrected cheaply with `O(weights)`
 extra optimizer state.
 
+The full writeup — setup, staleness measurements, the corrector sweep, and the
+throughput verdict — is in [`REPORT.md`](REPORT.md).
+
 We study staleness *in software*: instead of building pipeline parallelism, we
 inject a controlled per-parameter gradient delay into a single `jax.jit`'d
 training step and measure the convergence cost. At delay τ=0 this is bit-identical
