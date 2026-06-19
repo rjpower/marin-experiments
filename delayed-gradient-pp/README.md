@@ -87,7 +87,6 @@ in-process on the job that holds the TPU — no Fray driver hop):
 
 ```bash
 GRUG_OPT=muon GRUG_STAGES=6 GRUG_CORRECTOR=weight_pred GRUG_STEPS=6000 \
-  MARIN_PREFIX=gs://marin-eu-west4 \
   uv run iris --cluster=marin job run --no-wait \
     --tpu v6e-8 --enable-extra-resources --extra marin-core:tpu \
     --max-retries 3 --cpu 32 --memory 128GB --disk 50GB \
