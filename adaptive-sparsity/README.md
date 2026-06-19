@@ -102,17 +102,23 @@ CPU smoke test of the routing + adaptive gate (no cluster):
 JAX_PLATFORMS=cpu uv run python _smoke_sparsity.py
 ```
 
-Submit one arm onto a TPU on the shared marin cluster (omit `--region` to take v6e
-capacity anywhere; the data cache is region-agnostic):
+Submit one arm onto a TPU on the shared marin cluster. **Don't pin a region or set
+`MARIN_PREFIX`:** the worker derives its own region bucket from VM metadata, so with
+no `--region` iris takes v6e capacity wherever it is and the data downloads into that
+region — the run is genuinely region-agnostic (no cross-region guard to trip).
 
 ```bash
-MARIN_PREFIX=gs://marin-us-east5 \
 SPARSITY_MODE=adaptive SP_EXPERTS=128 SP_TOPK=8 SP_MIN_K=0 SP_COEF=3 \
   uv run iris --cluster=marin job run --no-wait \
-    --tpu v6e-16 --enable-extra-resources --extra marin-core:tpu \
-    --max-retries 3 --cpu 32 --memory 128GB --disk 50GB \
-    -e WANDB_API_KEY "$WANDB_API_KEY" -- python launch.py
+    --tpu v6e-8 --enable-extra-resources --extra marin-core:tpu \
+    --max-retries 1 --cpu 32 --memory 128GB --disk 50GB \
+    -e WANDB_API_KEY "$WANDB_API_KEY" \
+    -e SPARSITY_MODE adaptive -e SP_EXPERTS 128 -e SP_TOPK 8 -e SP_MIN_K 0 -e SP_COEF 3 \
+    -- python launch.py
 ```
+
+(The arm env vars are passed with `-e` so they reach the remote worker that runs
+`launch.py`; the leading shell assignments are just for readability.)
 
 ## Key results
 

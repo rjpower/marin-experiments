@@ -26,15 +26,17 @@ the only thing that varies across arms is the routing sparsity.
     SP_SMOKE        1 -> use the 10M-token FineWeb-Edu subset for a cluster smoke check (default 0)
 
 Submit one arm directly on a TPU (training runs in-process on the job that holds the
-TPU). Omit ``--region`` so iris can take v6e capacity in any region; the FineWeb-Edu
-cache is region-agnostic (HF-backed), so it materializes in whatever region you land:
+TPU). Do not pin ``--region`` or ``MARIN_PREFIX``: the worker derives its own region
+bucket from VM metadata, so iris can take v6e capacity anywhere and the FineWeb-Edu
+cache (HF-backed) materializes in whatever region you land — no cross-region guard.
+Pass the arm via ``-e`` so it reaches the remote worker that runs this module:
 
-    MARIN_PREFIX=gs://marin-us-east5 \
-    SPARSITY_MODE=fixed SP_EXPERTS=128 SP_TOPK=4 \
-      uv run iris --cluster=marin job run --no-wait \
-        --tpu v6e-16 --enable-extra-resources --extra marin-core:tpu \
-        --max-retries 3 --cpu 32 --memory 128GB --disk 50GB \
-        -e WANDB_API_KEY "$WANDB_API_KEY" -- python launch.py
+    uv run iris --cluster=marin job run --no-wait \
+      --tpu v6e-8 --enable-extra-resources --extra marin-core:tpu \
+      --max-retries 1 --cpu 32 --memory 128GB --disk 50GB \
+      -e WANDB_API_KEY "$WANDB_API_KEY" \
+      -e SPARSITY_MODE fixed -e SP_EXPERTS 128 -e SP_TOPK 4 \
+      -- python launch.py
 """
 
 import dataclasses
