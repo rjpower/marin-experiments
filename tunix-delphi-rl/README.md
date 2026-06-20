@@ -131,10 +131,17 @@ JAX_PLATFORMS=cpu uv run python -c \
   hard-won findings (SFT warm-up, gradient clipping, SFT over-collapse, train/RL
   prompt mismatch). §1–§8 cover the original tunix-on-iris feasibility verdict and
   the arithmetic/algebra results.
+- **[`REPORT.md`](REPORT.md) §10** — the agentic *coding* follow-on (issue #7):
+  Delphi *writes Python* graded by a purely-functional `micropython` interpreter,
+  going **few-shot 3/50 → SFT warm-up 50/50** on a 5-tier ladder (constant print →
+  recursion). Here the lesson *inverts* §9 — **SFT does the work, Dr.GRPO is
+  marginal** (the target is fully demonstrable by SFT). Files: `micropython.py` /
+  `coding_tasks.py` / `coding_env.py` / `train_coding.py` / `launch_coding.py`.
 - **[`DESIGN.md`](DESIGN.md)** — the up-front design + A/B/C strategy trade study
   (port grug to nnx vs load Delphi-as-Qwen3 vs keep equinox) and the rollout plan.
 - **[`AGENTS.md`](AGENTS.md)** — how to work in this directory: the file map, the
   recipe, the **invariants & gotchas that must not be regressed**, and how to add
   a new tool or curriculum stage.
 
-Tracked as weaver issue #229 (feasibility) and issue #5 (agentic follow-on).
+Tracked as weaver issue #229 (feasibility), issue #5 (agentic tool use), and
+issue #7 (agentic coding).

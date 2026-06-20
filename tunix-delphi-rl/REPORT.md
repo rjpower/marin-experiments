@@ -14,6 +14,7 @@ Weaver issue #229 · 2026-06-19 · Author: weaver agent run
 2. **A marin model loads natively** — the target model **Delphi** turned out to be a stock **Qwen3**, so it loads into tunix's native `flax.nnx` Qwen3 with **exact HF-logit parity** (top-1 100%, logit MSE 7e-12) after one rope fix. **No equinox→nnx bridge was needed.**
 3. **The RL loop learns on TPU, up to basic algebra** — a toy GRPO task learns end-to-end on both a CPU and a **v6e-4 TPU** iris job; then **Delphi learned single-digit addition (6% → ~65% solve rate in ~4 min on v6e-4)** and, the stretch goal, **basic linear algebra — `solve for x: a·x+b=c` — from 4.7% to ~37%**, with no calculator tool, under a plain exact-match reward.
 4. **And genuine *agentic tool use* works too (follow-on, issue #5)** — on tunix's agentic stack, Delphi learns to **call an external calculator and chain it**: single (T0), two-deep (T1), and **three-deep chained calls (T2)** — where each tool's output is the next tool's argument — all reach **~100% solve** on `v6e-4`. The enabler is a distribution-matched SFT warm-up; RL alone provably cannot bootstrap the result-copy. See **§9**.
+5. **And it can *write code*, not just call a tool (second follow-on, issue #7)** — given a purely-functional **micropython** interpreter as the grader, the same base LM that scores **3/50 from few-shot** reaches **50/50** on a 5-tier coding ladder (`print 2` … recursive `fib` … FizzBuzz/gcd/Collatz) after a short SFT warm-up — writing genuine recursive/looping programs. Here the lesson *inverts* §9: **SFT does the heavy lifting and Dr.GRPO is marginal**, because the target behavior is fully demonstrable by SFT (RL earns its keep only for the narrow tool-result *copy* of §9). See **§10**.
 
 The headline engineering finding: **the hard part the task anticipated (grug has no generate/KV-cache path, the "RL-rollout gap") did not need to be solved by hand.** Delphi is a Qwen3 on disk, and tunix already ships a complete native Qwen3 with a working KV-cache sampler and an HF-safetensors loader. The integration collapsed from "port an equinox model into a new framework" (weeks) to "a config + a one-line-class bug fix + a calculator environment" (days).
 
@@ -204,4 +205,44 @@ The robust recipe across all stages: **prefix-aligned SFT warm-up (~150–250 tr
 
 ---
 
-Full design + A/B/C strategy trade study: [`DESIGN.md`](DESIGN.md). Per-milestone working logs: `.agents/logs/tunix-iris/`. Agentic follow-on tracked in issue #5.
+## 10. Second follow-on (issue #7): agentic *coding* — Delphi writes Python an interpreter grades
+
+§9 had Delphi *call* a fixed tool. The natural next question the brief implies: can the same 447M base LM be bootstrapped to *write code* — emit a small Python program that a real interpreter executes and grades? We built a purely-functional **micropython** interpreter (the execution environment + verifier), a **50-task difficulty ladder** (`print 2` … `print fib(10)` … FizzBuzz, gcd, Collatz), and trained with the same three-stage recipe, **switched to Dr.GRPO** (more robust on a tiny actor). **Result: a base LM that solves 3/50 from few-shot reaches a perfect 50/50 after a short SFT warm-up — writing genuine recursive/looping programs — and the lesson *inverts* §9: SFT does the heavy lifting and RL is marginal.**
+
+### 10.1 The setup
+
+- **Interpreter (`micropython.py`).** A tree-walking interpreter over Python's `ast` for a safe subset (ints/floats/strings/lists, arithmetic/bool/compare, `if`/`while`/`for`, `def` + recursion, list comprehensions, f-strings, a whitelist of builtins/methods). **Purely functional**: deterministic, sandboxed (no `import`/IO/dunder access, builtin + method whitelists), bounded (step + output caps → infinite loops/runaway recursion terminate cleanly); `run(src) -> ExecResult(stdout, ok, error, steps)` *never raises*. 90 unit tests.
+- **Tasks + training distribution.** `coding_tasks.py` is the **held-out** 50-task ladder (5 tiers × 10: constant → one-step arithmetic → variables/conditionals → loops → functions/recursion), each `(prompt, reference solution, gold stdout)`; the oracle solves 50/50 through the grader. Training uses **41 parameterized task *families*** (`coding_env.py`) — random params per prompt — the same **anti-hardcoding** trick as the CALC random operands: with a *fixed* task and an exact-stdout reward a model could "solve" by printing the constant, so randomized golds force a *general* program. Eval prompts strip answer-leaking hints so solving requires computing.
+- **Action / format.** Single-turn on the proven non-agentic GRPO wiring (`train_delphi.py`): the model writes `<program>` after a 3-demo few-shot prefix and ends with an `END` sentinel; a parser extracts the program, `micropython.run` executes it, and the reward is **exact stdout match plus a dense shaping term** (has-code / ran-ok / output-prefix-overlap) so Dr.GRPO has a gradient before any sample is exact. Same base-LM surface rules as §9 — but multi-line code means **no newline-stop**: generate to the token budget and cut at `END`.
+- **RL: Dr.GRPO** (`DrGRPOLearner`/`DrGRPOConfig`): advantage = group-mean-centered with **no std division**, loss **constant-normalized** (no per-response length bias). A drop-in for the GRPO learner.
+
+### 10.2 Results — few-shot can't code; a short SFT warm-up gets to 96%
+
+Greedy solve on the held-out 50-task ladder, one `v6e-4`:
+
+| configuration | solve | per-tier (t0 / t1 / t2 / t3 / t4) |
+|---|---|---|
+| **few-shot only** (no SFT/RL) | **3/50** | 2 / 0 / 0 / 0 / 1 |
+| SFT 150 | 45/50 | 9 / 10 / 9 / 7 / 10 |
+| SFT 300 | 46/50 | 9 / 9 / 10 / 8 / 10 |
+| SFT 300 → **Dr.GRPO** 80 | **45**/50 | 9 / 9 / 9 / 8 / 10 |
+| SFT 600 | 47/50 | 9 / 9 / 10 / 9 / 10 |
+| SFT 1000 / 1500 | **48/50** | 9 / 10 / 10 / 9 / 10 |
+| SFT 1000 (+2 coverage families) | **50/50** | 10 / 10 / 10 / 10 / 10 |
+
+(SFT 1200 with the coverage families gave 49/50 — a single 7-digit transcription slip, `print(1001000)` for `1000000` — i.e. mild run-to-run variance right at the ceiling.) The programs are genuine code (hints stripped): `print('hello'[::-1])`, recursive `fib`/`factorial`/`is_prime`, accumulator loops, list comprehensions, the Euclidean `gcd`. **Tier 4 (functions/recursion) is the *strongest* tier (10/10)** — those tasks have canonical solutions the SFT learns cleanly.
+
+### 10.3 What it shows — the mirror image of §9
+
+- **The base LM cannot code from few-shot (3/50, tiers 1–3 at 0); a short SFT warm-up unlocks it (→48).** Same wall as the §9 copy: RL only amplifies what the base policy samples, and a 447M / 1.2B-token model almost never samples a correct multi-line program cold. SFT puts "emit a valid program in this format" in distribution.
+- **SFT scales *monotonically and plateaus* — no over-collapse (the opposite of finding 9.3-B).** 45 → 46 → 47 → 48 → 48 across SFT 150 → 1500, then flat. Structural reason: coding has **41 skill-families** (a *broad* target), so more SFT buys coverage; the single narrow CALC behavior instead sharpened to a degenerate point past ~250. *The right SFT amount depends on how broad the target behavior is.*
+- **Dr.GRPO added nothing (46 → 45, within noise) — and that is the result.** SFT already saturates the training families (~98% train solve), so RL has no headroom and the residual eval gap is **held-out generalization**, which RL on the same families cannot close. Contrast §9, where RL was *essential*. **Deciding rule: RL earns its keep only for a *narrow* behavior that must be amplified from rare base-model samples (the tool-result copy); when the target behavior is *fully demonstrable by SFT* (writing programs), SFT alone wins and RL is moot.** Dr.GRPO itself ran stably; it just had nothing to do.
+- **Coverage, not optimization, is the lever.** Broadening 27 → 41 families (to cover the eval's task *types*) moved SFT solve 34 → 48. The two misses at 48/50 were a string **copy-precision** edge (`Hello, World!` → the model lowercased it, having only seen lowercase words) and an **uncovered type** (a descending while-loop countdown); adding two coverage families (a descending-loop countdown; capitalized/punctuated phrases — eval phrases held out) closes them to a clean **50/50**.
+
+### 10.4 Verdict + reproduce
+
+**Yes — the same base LM that learns to *call* a tool (§9) can be bootstrapped to *write code* an interpreter executes, reaching a perfect 50/50 on a 5-tier ladder including recursion.** The recipe is the same three stages (SFT for the program/token format → [tool-call SFT, folded in] → RL), and the cross-experiment lesson sharpens: **SFT does the heavy lifting whenever the target behavior is fully demonstrable; RL (Dr.GRPO) earns its keep only for narrow behaviors that must be amplified from rare base-model samples.** Reproduce with `python launch_coding.py` + `CODING_SFT_STEPS=1000`; files: `micropython.py` / `coding_tasks.py` / `coding_env.py` / `train_coding.py` / `launch_coding.py`.
+
+---
+
+Full design + A/B/C strategy trade study: [`DESIGN.md`](DESIGN.md). Per-milestone working logs: `.agents/logs/tunix-iris/`. Agentic follow-ons tracked in issues #5 (tool use) and #7 (coding).
