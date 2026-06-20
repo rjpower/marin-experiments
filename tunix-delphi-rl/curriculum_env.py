@@ -342,6 +342,8 @@ def evaluate_problems_passk(
 
   prompts = [build_solve_prompt(format_problem_prompt(p)) for p in problems]
   n_correct = [0] * len(problems)
+  frac_sum = [0.0] * len(problems)  # mean fraction-of-tests-passed (the dense signal)
+  ran_sum = [0.0] * len(problems)   # mean fraction-of-tests-that-ran (vs empty/broken)
 
   ctx = mesh if mesh is not None else contextlib.nullcontext()
   with ctx:
@@ -361,8 +363,22 @@ def evaluate_problems_passk(
         texts.extend(out.text)
       for i, completion in enumerate(texts):
         comps = grade_problem(extract_program(completion), problems[i])
+        frac_sum[i] += comps["frac_passed"]
+        ran_sum[i] += comps["ran_ok"]
         if comps["exact"] >= 1.0:
           n_correct[i] += 1
+
+  # Per-level mean frac/ran -- the dense reward signal that decides if RL has a
+  # gradient at the frontier (exact pass@k can be 0 while frac is partial).
+  by_level: Dict[int, List[float]] = {}
+  ran_by_level: Dict[int, List[float]] = {}
+  for i, p in enumerate(problems):
+    by_level.setdefault(p.level, []).append(frac_sum[i] / k)
+    ran_by_level.setdefault(p.level, []).append(ran_sum[i] / k)
+  cells = []
+  for lvl in sorted(by_level):
+    cells.append(f"L{lvl} frac={np.mean(by_level[lvl]):.3f} ran={np.mean(ran_by_level[lvl]):.3f}")
+  print("[curric] FRAC-by-level (mean over draws): " + "  ".join(cells), flush=True)
 
   rows = [
       PassKTaskRow(task_id=p.id, tier=p.level, n_correct=n_correct[i], k=k)
