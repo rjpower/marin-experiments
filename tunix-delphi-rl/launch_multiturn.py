@@ -35,8 +35,8 @@ import os
 import jax
 from huggingface_hub import snapshot_download
 
-from coding_tasks import load_tasks
-from train_multiturn import train_multiturn
+from problems.coding_tasks import load_tasks
+from training.train_multiturn import train_multiturn
 
 DELPHI_REPO = "marin-community/delphi-3e18-447Mparams-1.2Btokens"
 

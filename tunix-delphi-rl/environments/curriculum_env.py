@@ -20,7 +20,8 @@ stop, the rollout-identical prompt builder, the pass@k estimator) and swaps in:
   * per-level pass@1/pass@k eval on HELD-OUT instances
     (:func:`evaluate_problems_passk`) -- the headline measurement.
 
-Import-safe on CPU with a dependency-light ``__main__`` self-check.
+Import-safe on CPU; unit-tested (dependency-light) in
+``tests/test_curriculum_env.py``.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ import numpy as np
 
 import grain.python as grain
 
-from coding_agent_env import (
+from environments.coding_agent_env import (
     PassKResult,
     PassKTaskRow,
     RunCodeAgent,
@@ -43,8 +44,8 @@ from coding_agent_env import (
     _build_round_prompt,
     program_terminal_eos_tokens,
 )
-from coding_env import _GRADE_MAX_STEPS, extract_program
-from coding_problems import (
+from environments.coding_env import _GRADE_MAX_STEPS, extract_program
+from problems.coding_problems import (
     NUM_LEVELS,
     Problem,
     format_problem_prompt,
@@ -55,8 +56,8 @@ from coding_problems import (
     reference_for,
     sample_problem,
 )
-from curriculum import Curriculum, CurriculumConfig
-from delphi_qwen3 import DELPHI_EOS_ID
+from environments.curriculum import Curriculum, CurriculumConfig
+from models.delphi_qwen3 import DELPHI_EOS_ID
 
 from tunix.rl.agentic.environments.tool_environment import ToolEnvironment
 
@@ -394,56 +395,3 @@ def load_eval_suite(levels: Tuple[int, ...], n_per_level: int, seed: int) -> Lis
     problems.extend(load_eval_problems(level, n_per_level, seed))
   return problems
 
-
-if __name__ == "__main__":
-  # Dependency-light CPU self-check (no TPU): serialization round-trip, env grade
-  # over rounds, metric, SFT segments, dataset columns + curriculum ramp.
-  rng = random.Random(0)
-
-  # Problem (de)serialization round-trips (tuples preserved).
-  prob = sample_problem(rng, 2)
-  rt = problem_from_json(problem_to_json(prob))
-  assert rt.family == prob.family and rt.hidden_tests == prob.hidden_tests
-
-  # Env: a correct reference scores the full reward; a wrong program scores less.
-  ref = reference_for(prob)
-  env = TestCaseEnvironment(task={"answer": problem_to_json(prob)}, tool_map={}, max_steps=5)
-
-  def _call(src):
-    return [{
-        "id": "c1",
-        "type": "function",
-        "function": {"name": "run_code", "arguments": json.dumps({"source": src})},
-    }]
-
-  fb_bad = env._execute_tool_calls(_call("def solve(*a):\n  return 0"))
-  assert 0.0 <= env._best_reward < SOLVE_REWARD_THRESHOLD, env._best_reward
-  fb_ok = env._execute_tool_calls(_call(ref))
-  assert env._best_exact == 1.0 and env._compute_final_reward() >= SOLVE_REWARD_THRESHOLD
-  assert "public tests passed" in fb_ok["c1"], fb_ok
-
-  # Metric: first-attempt frac/solve from the reference completion.
-  m = solve_metric_fn(["t"], [ref + "\nEND"], [1.0], None, [problem_to_json(prob)])
-  assert m["coding/first_solve"][0] == 1.0 and m["coding/best_solve"][0] == 1.0
-  assert m["coding/mean_level"][0] == float(prob.level)
-
-  # SFT segments: task context (mask 0) then reference program (mask 1, END).
-  segs = solve_segments(random.Random(1), (1, 2))
-  assert segs[0][1] == 0 and segs[-1][1] == 1 and segs[-1][0].rstrip().endswith("END")
-
-  # Dataset builds with the expected columns and ramps the level over steps.
-  cfg = CurriculumConfig(num_levels=NUM_LEVELS, steps_per_level=2, promote_threshold=0.0)
-  ds = build_curriculum_dataset(steps=10, batch_size=4, seed=0, cur_config=cfg)
-  row = next(iter(ds))
-  assert set(row.keys()) == {"prompts", "answer"}
-  # Early prompts are level 1; later prompts include higher levels (the ramp).
-  src = _CurriculumSource(steps=20, batch_size=4, seed=0, cur_config=cfg)
-  early = max(problem_from_json(src[i][1]).level for i in range(4))
-  late = max(problem_from_json(src[i][1]).level for i in range(len(src) - 4, len(src)))
-  assert early == 1 and late > early, (early, late)
-
-  # Round-prompt builder works with the CoT system prompt (reused from coding_agent_env).
-  built = _build_round_prompt(CODE_SOLVE_SYSTEM_PROMPT, format_problem_prompt(prob), [])
-  assert built.startswith(CODE_SOLVE_SYSTEM_PROMPT)
-
-  print("curriculum_env self-check OK")

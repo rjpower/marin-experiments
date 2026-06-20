@@ -144,7 +144,7 @@ These are the non-obvious things a future tunix-on-marin user will hit. They are
 
 ### Operational notes (iris / TPU)
 
-- **Submission is unchanged from grug experiments:** `iris --cluster=marin job run --tpu v6e-4 --enable-extra-resources --extra tpu --region europe-west4 -- python launch.py`. The worker bundles the dir (git-ls-files; `.venv`/`__pycache__` excluded; 25 MB cap, our bundle is ~0.5 MB), `uv sync`s the committed lock, and runs. Delphi's 1.8 GB weights download from HF at runtime (not bundled).
+- **Submission is unchanged from grug experiments:** `iris --cluster=marin job run --tpu v6e-4 --enable-extra-resources --extra tpu --region europe-west4 -- python examples/launch.py`. The worker bundles the dir (git-ls-files; `.venv`/`__pycache__` excluded; 25 MB cap, our bundle is ~0.5 MB), `uv sync`s the committed lock, and runs. Delphi's 1.8 GB weights download from HF at runtime (not bundled).
 - **`--tpu` is optional** — a CPU job cleanly de-risks packaging+submission before paying for TPU. Memory ≥4 GB / disk ≥10 GB need `--enable-extra-resources`.
 - **Transient TPU bad-nodes:** several v6e nodes failed init with `"Couldn't open iommu group /dev/vfio/N: Device busy"`. iris detects the signature and reschedules automatically — keep `--max-retries` generous (we used 5).
 - **v6e-4 capacity** was readily available (no boot wait) in `europe-west4` and `us-east5-b`; a 447M GRPO job runs colocated on one v6e-4 host in minutes. The marin cluster was reachable via gcloud auth (`iris-controller@hai-gcp-models`, 511/511 workers healthy).
@@ -153,8 +153,8 @@ These are the non-obvious things a future tunix-on-marin user will hit. They are
 
 ```bash
 cd tunix-delphi-rl
-uv sync --frozen --no-group dev                          # stock google-tunix 0.1.7, CPU
-JAX_PLATFORMS=cpu .venv/bin/python test_smoke_cats.py    # M2 toy GRPO learns on CPU
+uv sync --frozen                                         # stock google-tunix 0.1.7 + pytest, CPU
+JAX_PLATFORMS=cpu uv run pytest tests/test_smoke_cats.py -m slow   # M2 toy GRPO learns on CPU
 # Delphi arithmetic on TPU (the winning config):
 .venv/bin/iris --cluster=marin job run --no-wait \
   --tpu v6e-4 --enable-extra-resources --extra tpu --region europe-west4 \
@@ -251,7 +251,7 @@ Greedy solve on the held-out 50-task ladder, one `v6e-4`:
 
 ### 9.4 Verdict (#7) + reproduce
 
-**Yes — the same base LM that learns to *call* a tool (§8) can be bootstrapped to *write code* an interpreter executes, reaching 50/50 on a 5-tier ladder including recursion.** Reproduce with `python launch_coding.py` + `CODING_SFT_STEPS=1000`; files: `micropython.py` / `coding_tasks.py` / `coding_env.py` / `train_coding.py` / `launch_coding.py`.
+**Yes — the same base LM that learns to *call* a tool (§8) can be bootstrapped to *write code* an interpreter executes, reaching 50/50 on a 5-tier ladder including recursion.** Reproduce with `python launch_coding.py` + `CODING_SFT_STEPS=1000`; files: `environments/micropython.py` / `problems/coding_tasks.py` / `environments/coding_env.py` / `training/train_coding.py` / `launch_coding.py`.
 
 ---
 

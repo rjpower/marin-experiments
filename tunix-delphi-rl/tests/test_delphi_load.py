@@ -15,11 +15,12 @@ Gates:
   4. HF PARITY (authoritative) -- top-1 next-token agreement and per-logit fp32
      MSE vs transformers' Delphi. Skipped only if torch is unavailable.
 
-Run with::
+Marked ``slow`` (downloads + loads the 447M Delphi weights and runs forward
+passes); excluded from the default ``uv run pytest`` run. Invoke explicitly::
 
-    JAX_PLATFORMS=cpu python test_delphi_load.py
+    JAX_PLATFORMS=cpu uv run pytest tests/test_delphi_load.py -m slow
 
-or under pytest. Download of Delphi happens automatically if absent.
+Download of Delphi happens automatically if absent.
 """
 
 import contextlib
@@ -28,9 +29,10 @@ import os
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from huggingface_hub import snapshot_download
 
-from delphi_qwen3 import (
+from models.delphi_qwen3 import (
     DELPHI_EOS_ID,
     delphi_config,
     load_delphi,
@@ -176,6 +178,7 @@ def _fraction_alpha_words(text: str) -> float:
   return alpha / len(words)
 
 
+@pytest.mark.slow
 def test_delphi_m1_gates():
   """Runs all M1 gates and asserts the thresholds. Prints real numbers."""
   model_dir = ensure_delphi()
@@ -184,7 +187,7 @@ def test_delphi_m1_gates():
   # ---- Gate 1: key coverage (load_delphi hard-asserts internally) ----------
   model = load_delphi(model_dir, dtype=jnp.bfloat16)
   # Re-run the explicit count for the report.
-  from delphi_qwen3 import _assert_key_coverage  # noqa: PLC0415
+  from models.delphi_qwen3 import _assert_key_coverage  # noqa: PLC0415
 
   keys = _assert_key_coverage(model_dir, delphi_config())
   print(f"[GATE 1 key-coverage] PASS: {len(keys)}/{len(keys)} tensors mapped, "
@@ -342,7 +345,3 @@ def _hf_parity(model_dir, tokenizer):
   with _apply_rope_override(_plain_apply_rope_factory(500000)):
     top1_ns, mse_ns = _compare(model)
   return top1_c, mse_c, top1_ns, mse_ns
-
-
-if __name__ == "__main__":
-  test_delphi_m1_gates()

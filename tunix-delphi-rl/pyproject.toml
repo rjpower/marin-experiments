@@ -17,7 +17,17 @@ dependencies = [
 tpu = ["google-tunix[prod]; sys_platform == 'linux'"]
 
 [dependency-groups]
-dev = []
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The default run is fast + CPU-only. Anything that loads Delphi weights or runs
+# a JAX training loop is marked ``slow`` and excluded here; run those explicitly
+# with ``-m slow`` on a host that has the model / accelerator.
+addopts = "-m 'not slow'"
+markers = [
+    "slow: tests that download/load model weights or run a JAX training loop (TPU/model required; excluded by default)",
+]
 
 [tool.uv]
 fork-strategy = "fewest"

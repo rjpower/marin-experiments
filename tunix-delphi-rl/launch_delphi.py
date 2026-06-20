@@ -32,7 +32,7 @@ import os
 import jax
 from huggingface_hub import snapshot_download
 
-from train_delphi import train_delphi_arithmetic
+from training.train_delphi import train_delphi_arithmetic
 
 DELPHI_REPO = "marin-community/delphi-3e18-447Mparams-1.2Btokens"
 

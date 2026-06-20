@@ -35,7 +35,7 @@ from tunix.models.qwen3 import params as qp
 from tunix.utils.torch_utils import torch_key_to_jax_key
 from transformers import AutoTokenizer
 
-from delphi_patch import patch_tunix_rope_for_delphi
+from models.delphi_patch import patch_tunix_rope_for_delphi
 
 
 # Delphi vocabulary special tokens (Llama-3 tokenizer, from config.json).

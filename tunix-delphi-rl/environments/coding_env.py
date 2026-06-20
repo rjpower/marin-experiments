@@ -47,7 +47,7 @@ from typing import Any, Callable, Dict, List, Tuple
 import grain.python as grain
 import numpy as np
 
-import micropython
+import environments.micropython as micropython
 
 # Step budgets for the interpreter. Training programs are tiny but a buggy model
 # program can loop, so the reward grader caps low (most failures are instant
@@ -1119,7 +1119,7 @@ def greedy_completions(
   """
   from tunix.generate import sampler as sampler_lib  # lazy: tunix only at eval
 
-  from delphi_qwen3 import DELPHI_EOS_ID
+  from models.delphi_qwen3 import DELPHI_EOS_ID
 
   cache_config = sampler_lib.CacheConfig(
       cache_size=max_prompt_length + max_new_tokens + 8,
@@ -1171,53 +1171,3 @@ def evaluate_tasks(
   )
   return evaluate_completions(tasks, completions)
 
-
-if __name__ == "__main__":
-  # CPU self-check: every family produces a valid bounded program; the parser,
-  # reward, metric and hint-stripper behave on synthetic completions.
-  import coding_tasks
-
-  rng = random.Random(0)
-  all_tiers = (0, 1, 2, 3, 4, 5)
-  bad = 0
-  for fam in FAMILIES:
-    for _ in range(20):
-      prompt, solution = fam.sample(rng)
-      res = micropython.run(solution, max_steps=_EVAL_MAX_STEPS)
-      if not res.ok or not res.stdout:
-        bad += 1
-        print(f"[FAIL] {fam.id}: {res.error!r} prompt={prompt!r}")
-  assert bad == 0, f"{bad} family sample(s) produced an invalid program"
-  print(f"families: {len(FAMILIES)} ok across {len(FAMILIES) * 20} samples")
-
-  # sample_task works per-tier (including the new hard tier 5) and the sampled
-  # solution runs to a non-empty gold the grader can compare against.
-  for tier in all_tiers:
-    for _ in range(20):
-      prompt, solution, gold = sample_task(rng, (tier,))
-      assert gold, f"tier {tier}: empty gold for prompt={prompt!r}"
-      assert micropython.run(solution, max_steps=_EVAL_MAX_STEPS).ok
-
-  # Parser + reward on a synthetic 'good' completion.
-  good = "print(6 * 7)\nEND\nTask: something else\n"
-  assert extract_program(good) == "print(6 * 7)"
-  assert code_reward(["p"], [good], ["42\n"])[0] == 2.0
-  assert code_metric_fn(["p"], [good], None, None, ["42\n"])["coding/solve_ratio"][0] == 1.0
-  # A close-but-wrong program earns partial but not solve.
-  near = "print(41)\nEND\n"
-  r_near = code_reward(["p"], [near], ["42\n"])[0]
-  assert 0.4 <= r_near < 1.3, r_near
-  assert code_metric_fn(["p"], [near], None, None, ["42\n"])["coding/solve_ratio"][0] == 0.0
-
-  # Hint stripping keeps input/clarifying parens, drops output-leaking ones.
-  assert strip_answer_hint("Print fib(10). (The answer is 55.)", "55\n") == "Print fib(10)."
-  assert strip_answer_hint(
-      "Print the sum from 1 to 100 (inclusive).", "5050\n"
-  ) == "Print the sum from 1 to 100 (inclusive)."
-
-  # Eval prompts build + grade cleanly against the reference solutions (oracle).
-  tasks = coding_tasks.load_tasks()
-  oracle = evaluate_completions(tasks, [t.solution + "\nEND" for t in tasks])
-  print("oracle (reference solutions):", oracle.summary().replace("\n", " | "))
-  assert oracle.solved == oracle.total, "reference solutions must all solve"
-  print("coding_env self-check OK")

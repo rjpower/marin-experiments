@@ -43,13 +43,13 @@ files (see ``AGENTS.md``). Use this script to:
 
   * inspect the plan (no TPU, no model download)::
 
-        uv run python pipeline.py --dry-run --experiment coding
-        uv run python pipeline.py --dry-run --experiment multiturn
+        uv run python -m training.pipeline --dry-run --experiment coding
+        uv run python -m training.pipeline --dry-run --experiment multiturn
 
   * run one stage on a host with a TPU + Delphi weights at ``DELPHI_MODEL_DIR``::
 
-        uv run python pipeline.py --experiment coding --stage sft1000
-        uv run python pipeline.py --experiment multiturn --all
+        uv run python -m training.pipeline --experiment coding --stage sft1000
+        uv run python -m training.pipeline --experiment multiturn --all
 
 ``--dry-run`` works on CPU: it imports nothing that needs a TPU and only prints
 the plan (which stages would run vs are already done).
@@ -164,13 +164,13 @@ def _experiment_specs() -> Dict[str, Dict[str, Any]]:
 
 
 def _coding_train_fn(model_dir: str, kwargs: Dict[str, Any]):
-  from train_coding import train_coding
+  from training.train_coding import train_coding
 
   return train_coding(model_dir=model_dir, **kwargs)
 
 
 def _multiturn_train_fn(model_dir: str, kwargs: Dict[str, Any]):
-  from train_multiturn import train_multiturn
+  from training.train_multiturn import train_multiturn
 
   return train_multiturn(model_dir=model_dir, **kwargs)
 

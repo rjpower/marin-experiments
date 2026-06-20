@@ -228,7 +228,7 @@ support) — both diagnostic, see §6.
 
 **Effort.** Low (~0.5 day) — pure data work in `coding_env.FAMILIES`, the exact
 mechanism `AGENTS.md` "How to add a coding task / family" describes; the CPU
-self-check (`uv run python coding_env.py`) already gates oracle-solvability.
+self-check (`uv run pytest tests/test_coding_env.py`) already gates oracle-solvability.
 
 ### R3 — Measure (pass@1, pass@k) explicitly; make it the headline metric
 

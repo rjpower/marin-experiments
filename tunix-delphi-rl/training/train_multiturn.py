@@ -48,10 +48,10 @@ from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.agentic.agentic_grpo_learner import GRPOConfig, GRPOLearner
 from tunix.rl.rollout import base_rollout
 
-from agentic_common import DelphiRawTextChatParser, clipped_adamw
-from agentic_sft import run_sft_warmup
-from agentic_tools import install_per_call_rollout_seed
-from coding_agent_env import (
+from training.agentic_common import DelphiRawTextChatParser, clipped_adamw
+from training.agentic_sft import run_sft_warmup
+from environments.agentic_tools import install_per_call_rollout_seed
+from environments.coding_agent_env import (
     CODE_AGENT_SYSTEM_PROMPT,
     MultiTurnEvalResult,
     PassKResult,
@@ -65,8 +65,8 @@ from coding_agent_env import (
     evaluate_tasks_multiturn,
     program_terminal_eos_tokens,
 )
-from coding_tasks import load_tasks
-from delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
+from problems.coding_tasks import load_tasks
+from models.delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
 
 
 @dataclasses.dataclass

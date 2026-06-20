@@ -1,13 +1,9 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the :mod:`micropython` sandboxed interpreter.
+"""Unit tests for the :mod:`environments.micropython` sandboxed interpreter.
 
-Runnable two ways:
-
-  * ``uv run python -m pytest test_micropython.py -q`` (pytest), and
-  * ``uv run python test_micropython.py`` (self-contained: the ``__main__``
-    block runs every ``test_*`` function as plain asserts).
+Run with ``uv run pytest tests/test_micropython.py -q``.
 
 The tests cover the language subset (literals, arithmetic, precedence, control
 flow, recursion, comprehensions, list/string methods, f-strings, ``print``
@@ -19,7 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from micropython import ExecResult, run
+from environments.micropython import ExecResult, run
 
 
 # --- helpers -------------------------------------------------------------------
@@ -586,24 +582,3 @@ def test_result_is_frozen_dataclass():
 def test_steps_counted_on_success():
   result = run("print(1)")
   assert result.ok and result.steps > 0
-
-
-# --- self-contained runner -----------------------------------------------------
-
-
-def _run_all() -> None:
-  """Run every ``test_*`` function in this module as plain asserts."""
-  tests = sorted(
-      (name, obj)
-      for name, obj in globals().items()
-      if name.startswith("test_") and callable(obj)
-  )
-  passed = 0
-  for name, fn in tests:
-    fn()
-    passed += 1
-  print(f"{passed} passed")
-
-
-if __name__ == "__main__":
-  _run_all()

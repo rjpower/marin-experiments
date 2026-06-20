@@ -16,16 +16,16 @@ required (they are independent):
           advances across decode steps (the cache path is threaded, not a
           full-sequence re-forward).
 
-Run with::
+Marked ``slow`` (runs an 80-step JAX GRPO loop); excluded from the default
+``uv run pytest`` run. Invoke explicitly with::
 
-    JAX_PLATFORMS=cpu python test_smoke_cats.py
-
-or under pytest (``test_smoke_cats`` is discoverable).
+    JAX_PLATFORMS=cpu uv run pytest tests/test_smoke_cats.py -m slow
 """
 
 import numpy as np
+import pytest
 
-import toy_cats
+import examples.toy_cats as toy_cats
 
 
 # Window size for the start-vs-end reward comparison (the LEARNS gate).
@@ -133,10 +133,7 @@ def _run_gates() -> toy_cats.ToyResult:
   return result
 
 
+@pytest.mark.slow
 def test_smoke_cats() -> None:
   """Pytest entry point: runs the toy GRPO loop and asserts both M2 gates."""
-  _run_gates()
-
-
-if __name__ == "__main__":
   _run_gates()

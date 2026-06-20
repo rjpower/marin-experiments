@@ -31,14 +31,14 @@ from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.grpo import grpo_learner as grpo_lib
 from tunix.rl.rollout import base_rollout
 
-from arithmetic import (
+from problems.arithmetic import (
     answer_reward,
     build_arithmetic_dataset,
     format_reward,
     metric_fn,
     proximity_reward,
 )
-from delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
+from models.delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
 
 
 @dataclasses.dataclass

@@ -49,7 +49,7 @@ logits, cache = model(toks, positions, None, causal_mask)   # -> (1,8,256) finit
 
 **grug** is marin's hand-rolled, explicit Levanter training template (`marin/experiments/grug/base/model.py`): an `equinox.Module` transformer over **raw `jax.Array`s** (not haliax NamedArrays — haliax only supplies a `named_call` profiling decorator) with explicit `PartitionSpec`/`reshard` sharding. It exposes **only** `__call__`, `.logits()`, `.next_token_loss()` — **no generate, no KV-cache, no position-offset RoPE.** Its philosophy is copy-first (`.agents/skills/change-grug/SKILL.md`): a new behavior is a new variant directory edited by copy-paste, not an abstraction. The `delayed-gradient-pp` experiment is one such variant (a QB-routed MoE) and is *just an example* of grug, not the target.
 
-**iris** is marin's cluster/job manager (`marin/lib/iris`, with the `fray` submission layer). A job runs in a bare `python:3.12-slim` container; the worker installs **all** Python deps at launch via `uv sync --all-packages --no-group dev --extra <X>` against the experiment's own committed `pyproject.toml` + `uv.lock`. Nothing is pre-baked. Submission: `iris --cluster=marin job run --tpu <variant> --enable-extra-resources --extra tpu --region <r> -- python launch.py`, or the `fray` `JobRequest`/`current_client().submit` API. On TPU the worker injects `TPU_*`/`JAX_COORDINATOR_*` env and iris calls bare `jax.distributed.initialize()`.
+**iris** is marin's cluster/job manager (`marin/lib/iris`, with the `fray` submission layer). A job runs in a bare `python:3.12-slim` container; the worker installs **all** Python deps at launch via `uv sync --all-packages --no-group dev --extra <X>` against the experiment's own committed `pyproject.toml` + `uv.lock`. Nothing is pre-baked. Submission: `iris --cluster=marin job run --tpu <variant> --enable-extra-resources --extra tpu --region <r> -- python examples/launch.py`, or the `fray` `JobRequest`/`current_client().submit` API. On TPU the worker injects `TPU_*`/`JAX_COORDINATOR_*` env and iris calls bare `jax.distributed.initialize()`.
 
 **Delphi** (`marin-community/delphi-3e18-447Mparams-1.2Btokens`) is the compute-optimal point of the smallest (3e18 FLOP) budget in marin's open IsoFLOP scaling suite (88 base models, 3e18 → 1e23 FLOPs). It is a **dense Qwen3**, 447M params: 11 layers, hidden 1024, 8 attention heads, 8 KV heads (**no GQA**), head_dim 128, intermediate 4096 (SwiGLU), vocab 128256, ctx 4096, `rope_theta=500000`, `rms_norm_eps=1e-5`, untied embeddings, Qwen3 QK-norm. Tokenizer is the **Llama-3 128k tokenizer**, `bos=128000`, `eos=128001`, **`pad_token_id=null`** (must set pad=eos). Base LM, **no chat template**. Ships one `model.safetensors` shard in F32.
 
@@ -113,7 +113,7 @@ role_to_mesh = {Role.ACTOR: mesh, Role.REFERENCE: mesh, Role.ROLLOUT: mesh}
 uv run iris --cluster=marin job run --no-wait \
   --tpu v6e-4 --enable-extra-resources --extra tpu --region europe-west4 \
   --cpu 32 --memory 128GB --disk 100GB --max-retries 3 \
-  -e WANDB_API_KEY "$WANDB_API_KEY" -e HF_TOKEN "$HF_TOKEN" -- python launch.py
+  -e WANDB_API_KEY "$WANDB_API_KEY" -e HF_TOKEN "$HF_TOKEN" -- python examples/launch.py
 ```
 
 ---

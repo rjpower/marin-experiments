@@ -28,7 +28,7 @@ import os
 
 import jax
 
-from toy_cats import probe_cache_advances, train_toy
+from examples.toy_cats import probe_cache_advances, train_toy
 
 # Margins kept generous so transient sampling noise can't fail the job; the
 # local M2 run improves by ~+0.8, far above this floor.

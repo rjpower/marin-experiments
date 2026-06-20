@@ -52,8 +52,8 @@ import numpy as np
 from tunix.sft import utils as sft_utils
 from tunix.sft.peft_trainer import PeftTrainer, TrainingConfig
 
-from agentic_common import clipped_adamw
-from delphi_qwen3 import DELPHI_BOS_ID, DELPHI_EOS_ID
+from training.agentic_common import clipped_adamw
+from models.delphi_qwen3 import DELPHI_BOS_ID, DELPHI_EOS_ID
 
 # A transcript is a list of (text, train_on_it?) segments. Mask 1 == the model's
 # own turns (the tool calls + the copied answer); mask 0 == context the model

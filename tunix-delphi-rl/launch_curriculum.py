@@ -35,7 +35,7 @@ import os
 import jax
 from huggingface_hub import snapshot_download
 
-from train_curriculum import train_curriculum
+from training.train_curriculum import train_curriculum
 
 DELPHI_REPO = "marin-community/delphi-3e18-447Mparams-1.2Btokens"
 

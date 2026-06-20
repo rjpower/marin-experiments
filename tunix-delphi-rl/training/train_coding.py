@@ -41,9 +41,9 @@ from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.grpo.drgrpo_learner import DrGRPOConfig, DrGRPOLearner
 from tunix.rl.rollout import base_rollout
 
-from agentic_common import clipped_adamw
-from agentic_sft import run_sft_warmup
-from coding_env import (
+from training.agentic_common import clipped_adamw
+from training.agentic_sft import run_sft_warmup
+from environments.coding_env import (
     CODE_FEWSHOT,
     CodingEvalResult,
     build_code_dataset,
@@ -52,8 +52,8 @@ from coding_env import (
     code_segments,
     evaluate_tasks,
 )
-from coding_tasks import load_tasks
-from delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
+from problems.coding_tasks import load_tasks
+from models.delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
 
 
 @dataclasses.dataclass

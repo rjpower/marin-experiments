@@ -49,7 +49,7 @@ import os
 import jax
 from huggingface_hub import snapshot_download
 
-from train_agentic import (
+from training.train_agentic import (
     train_agentic_port,
     train_agentic_t0,
     train_agentic_t1,

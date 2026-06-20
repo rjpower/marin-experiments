@@ -55,9 +55,9 @@ from tunix.rl.agentic.agents.model_agent import ModelAgent
 from tunix.rl.agentic.environments.task_environment import TaskEnvironment
 from tunix.rl.rollout import base_rollout
 
-from agentic_common import DelphiRawTextChatParser, clipped_adamw
-from agentic_sft import run_sft_warmup, t0_segments, t1_segments, t2_segments
-from agentic_tools import (
+from training.agentic_common import DelphiRawTextChatParser, clipped_adamw
+from training.agentic_sft import run_sft_warmup, t0_segments, t1_segments, t2_segments
+from environments.agentic_tools import (
     CalcToolEnvironment,
     DelphiToolAgent,
     T0_SYSTEM_PROMPT,
@@ -72,13 +72,13 @@ from agentic_tools import (
     newline_terminal_eos_tokens,
     t0_metric_fn,
 )
-from arithmetic import (
+from problems.arithmetic import (
     answer_reward,
     build_arithmetic_dataset,
     format_reward,
     metric_fn,
 )
-from delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
+from models.delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
 
 
 @dataclasses.dataclass

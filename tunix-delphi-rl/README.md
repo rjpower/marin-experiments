@@ -54,7 +54,7 @@ in three conceptual stages, ordered by what each one teaches:
    operands; the SFT warm-up is what makes the *copy/chain* learnable.
 
 **How the code realizes the stages.** In the current code, stages **1 and 2 are
-merged** into a single SFT warm-up (`run_sft_warmup` in `agentic_sft.py`): one
+merged** into a single SFT warm-up (`run_sft_warmup` in `training/agentic_sft.py`): one
 synthetic transcript per stage carries both the line format *and* the
 `CALC`/copy surface, trained together with per-turn masking. That is the right
 default here (the format and the surface are taught by the same transcript). You
@@ -62,7 +62,7 @@ would **split** them if the token format and the tool surface needed to be
 learned from different data — e.g. a large generic format/transcript corpus
 (stage 1) followed by a small tool-specific corpus (stage 2), or when adding a
 second tool whose surface differs. The RL curriculum (stage 3) is
-`train_agentic_t0/t1/t2` in `train_agentic.py`, each calling the shared
+`train_agentic_t0/t1/t2` in `training/train_agentic.py`, each calling the shared
 `_train_agentic_calc` with a per-stage `depth`.
 
 ---
@@ -117,9 +117,9 @@ A CPU run is for **compile/import/unit checks only** — never validate a traini
 claim on CPU:
 
 ```bash
-uv sync --frozen --no-group dev
 JAX_PLATFORMS=cpu uv run python -c \
-  "import agentic_common, agentic_sft, agentic_tools, train_agentic, launch_agentic"
+  "import training.agentic_common, training.agentic_sft, environments.agentic_tools, training.train_agentic, launch_agentic"
+JAX_PLATFORMS=cpu uv run pytest -q   # fast CPU unit suite (slow/model tests deselected)
 ```
 
 ---
@@ -135,8 +135,9 @@ JAX_PLATFORMS=cpu uv run python -c \
   Delphi *writes Python* graded by a purely-functional `micropython` interpreter,
   going **few-shot 3/50 → SFT warm-up 50/50** on a 5-tier ladder (constant print →
   recursion). Here the lesson *inverts* §9 — **SFT does the work, Dr.GRPO is
-  marginal** (the target is fully demonstrable by SFT). Files: `micropython.py` /
-  `coding_tasks.py` / `coding_env.py` / `train_coding.py` / `launch_coding.py`.
+  marginal** (the target is fully demonstrable by SFT). Files:
+  `environments/micropython.py` / `problems/coding_tasks.py` /
+  `environments/coding_env.py` / `training/train_coding.py` / `launch_coding.py`.
 - **[`DESIGN.md`](DESIGN.md)** — the up-front design + A/B/C strategy trade study
   (port grug to nnx vs load Delphi-as-Qwen3 vs keep equinox) and the rollout plan.
 - **[`AGENTS.md`](AGENTS.md)** — how to work in this directory: the file map, the

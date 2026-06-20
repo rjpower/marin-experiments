@@ -49,9 +49,9 @@ Dropped from the design table relative to ``CURRICULUM_DESIGN.md``:
 
 No family was dropped outright; every level keeps 3-4 families.
 
-Run ``JAX_PLATFORMS=cpu uv run python coding_problems.py`` to validate that every
-reference passes all its own tests, that the tests discriminate against wrong and
-empty programs, and that partial credit produces a strictly-interior reward.
+Run ``JAX_PLATFORMS=cpu uv run pytest tests/test_coding_problems.py`` to validate
+that every reference passes all its own tests, that the tests discriminate against
+wrong and empty programs, and that partial credit produces a strictly-interior reward.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ import dataclasses
 import random
 from typing import Callable
 
-import micropython
+import environments.micropython as micropython
 
 NUM_LEVELS = 6
 
@@ -895,143 +895,3 @@ def format_test_feedback(
     body = body[: _MAX_FEEDBACK_CHARS - 14] + "...(truncated)"
   return body
 
-
-# ---------------------------------------------------------------------------
-# CPU self-check (no TPU): every reference passes its tests; the tests
-# discriminate against wrong / empty / partial programs; the public API holds.
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-  # 1. Every family at every level: the reference solves ALL its tests.
-  assert set(_FAMILIES_BY_LEVEL) == set(range(1, NUM_LEVELS + 1)), (
-      _FAMILIES_BY_LEVEL.keys()
-  )
-  for level in range(1, NUM_LEVELS + 1):
-    fams = _FAMILIES_BY_LEVEL[level]
-    assert 3 <= len(fams) <= 4, f"level {level} has {len(fams)} families"
-    for family in fams:
-      rng = random.Random(12345 + family.level)
-      problem = _build_problem(family, rng)
-      assert problem.level == level
-      assert problem.family == family.key
-      # Minimum public/hidden counts.
-      assert len(problem.public_tests) <= _N_PUBLIC
-      assert len(problem.hidden_tests) >= _MIN_HIDDEN, (
-          family.key,
-          len(problem.hidden_tests),
-      )
-      # The reference passes every one of its own tests, exactly.
-      grade = grade_problem(family.reference, problem)
-      assert grade["frac_passed"] == 1.0, (family.key, grade)
-      assert grade["exact"] == 1.0, (family.key, grade)
-      assert grade["ran_ok"] == 1.0, (family.key, grade)
-      assert abs(problem_reward(grade) - 1.0) < 1e-9, (family.key, grade)
-
-  # 2. A trivially-wrong program scores frac_passed < 1.0 on MOST problems and
-  #    still registers has_code == 1. (micropython rejects ``def solve(*a)``, so
-  #    the spec's "return 0" program is written with fixed-arity defaults that
-  #    accept the 0/1/2-arg call shapes across all families.)
-  wrong_program = "def solve(a=0, b=0, c=0):\n  return 0"
-  n_discriminated = 0
-  n_checked = 0
-  rng = random.Random(7)
-  for level in range(1, NUM_LEVELS + 1):
-    for _ in range(4):
-      problem = sample_problem(rng, level)
-      grade = grade_problem(wrong_program, problem)
-      assert grade["has_code"] == 1.0, (problem.family, grade)
-      n_checked += 1
-      if grade["frac_passed"] < 1.0:
-        n_discriminated += 1
-  assert n_discriminated >= int(0.9 * n_checked), (
-      f"constant program passed too often: {n_discriminated}/{n_checked}"
-  )
-
-  # 3. An empty program scores all-zero components and zero reward.
-  empty_problem = sample_problem(random.Random(0), 1)
-  empty_grade = grade_problem("", empty_problem)
-  assert empty_grade["has_code"] == 0.0
-  assert empty_grade["ran_ok"] == 0.0
-  assert empty_grade["frac_passed"] == 0.0
-  assert empty_grade["exact"] == 0.0
-  assert problem_reward(empty_grade) == 0.0
-
-  # 4. Partial credit: a program that passes some-but-not-all tests scores a
-  #    reward strictly between 0 and 1 (the gradient the whole design needs).
-  #    sum_1_to_n with an off-by-one upper bound passes for n<=1 (where both
-  #    give 0/1) but fails for larger n -> a genuine partial.
-  partial_problem = None
-  partial_rng = random.Random(99)
-  for _ in range(200):
-    cand = sample_problem(partial_rng, 2)
-    if cand.family == "l2_sum_1_to_n":
-      partial_problem = cand
-      break
-  assert partial_problem is not None, "could not sample l2_sum_1_to_n"
-  buggy = "def solve(n):\n  total = 0\n  for i in range(1, n):\n    total += i\n  return total"
-  partial_grade = grade_problem(buggy, partial_problem)
-  partial_reward = problem_reward(partial_grade)
-  assert partial_grade["has_code"] == 1.0
-  assert 0.0 < partial_grade["frac_passed"] < 1.0, partial_grade
-  assert 0.0 < partial_reward < 1.0, partial_reward
-
-  # 5. sample_problem / load_eval_problems return valid Problems for every level;
-  #    load_eval_problems is deterministic for a fixed seed, and a different seed
-  #    yields a different held-out set (checked in aggregate across all levels so
-  #    the test is robust to a coincidental per-level collision).
-  ids_seed_a: list[str] = []
-  ids_seed_b: list[str] = []
-  for level in range(1, NUM_LEVELS + 1):
-    p = sample_problem(random.Random(level), level)
-    assert isinstance(p, Problem) and p.level == level
-    assert len(p.public_tests) + len(p.hidden_tests) >= _MIN_TESTS
-
-    evA = load_eval_problems(level, 8, seed=2024)
-    evB = load_eval_problems(level, 8, seed=2024)
-    assert len(evA) == 8
-    assert [x.id for x in evA] == [x.id for x in evB], "eval set not deterministic"
-    assert all(x.level == level for x in evA)
-    assert all(len(x.hidden_tests) >= _MIN_HIDDEN for x in evA)
-    ids_seed_a.extend(x.id for x in evA)
-    ids_seed_b.extend(x.id for x in load_eval_problems(level, 8, seed=777))
-  assert ids_seed_a != ids_seed_b, "different seeds gave an identical eval set"
-
-  # 6. Prompt mentions solve and ends with the END instruction. Feedback stays
-  #    within the char budget and never reveals a hidden test's full example
-  #    line (its `solve(args) -> ...` call): the only structurally-safe leak
-  #    check, since short scalar outputs can coincidentally appear as substrings.
-  #    Checked across every level and a wrong (so non-trivial feedback) program.
-  fb_rng = random.Random(5)
-  prob5 = sample_problem(fb_rng, 5)
-  assert "solve" in prob5.prompt
-  assert prob5.prompt.rstrip().endswith("END.")
-  wrong = "def solve(a=0, b=0, c=0):\n  return 0"
-  for level in range(1, NUM_LEVELS + 1):
-    for _ in range(3):
-      prob = sample_problem(fb_rng, level)
-      for graded in (_family_for(prob.family).reference, wrong):
-        fb = format_test_feedback(graded, prob)
-        assert len(fb) <= _MAX_FEEDBACK_CHARS, (prob.family, len(fb))
-        # The feedback references only public-test calls; no hidden call line.
-        for args, _expected in prob.hidden_tests:
-          call = "solve(" + ", ".join(repr(a) for a in args) + ")"
-          public_calls = {
-              "solve(" + ", ".join(repr(a) for a in pa) + ")"
-              for (pa, _pe) in prob.public_tests
-          }
-          if call not in public_calls:
-            assert call not in fb, ("hidden call leaked", prob.family, call)
-
-  # An example partial-credit reward value for the report.
-  print(
-      f"example partial: l2_sum_1_to_n off-by-one -> "
-      f"frac_passed={partial_grade['frac_passed']:.3f} reward={partial_reward:.3f}"
-  )
-
-  # Family roster summary.
-  print("families per level:")
-  for level in range(1, NUM_LEVELS + 1):
-    keys = [f.key for f in _FAMILIES_BY_LEVEL[level]]
-    print(f"  L{level}: {', '.join(keys)}")
-
-  print("coding_problems self-check OK")

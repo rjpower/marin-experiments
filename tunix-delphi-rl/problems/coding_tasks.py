@@ -35,8 +35,8 @@ The tasks form a six-tier difficulty curriculum:
     cases are easy to get subtly wrong -- so a write->run->revise loop and RL
     have real headroom over SFT here, unlike the saturated tiers 0--4.
 
-Run ``uv run python coding_tasks.py`` to validate every task against the
-interpreter.
+Run ``uv run pytest tests/test_coding_tasks.py`` to validate every task against
+the interpreter.
 """
 
 from __future__ import annotations
@@ -999,50 +999,3 @@ TASKS: list[Task] = [
 def load_tasks() -> list[Task]:
   """Return the full task list (tiers 0--5)."""
   return TASKS
-
-
-if __name__ == "__main__":
-  import micropython
-
-  tasks = load_tasks()
-
-  # Structural invariants.
-  assert len(tasks) == 68, f"expected 68 tasks, got {len(tasks)}"
-  ids = [t.id for t in tasks]
-  assert len(set(ids)) == len(ids), "task ids are not unique"
-
-  # Every solution must run cleanly and reproduce its gold answer exactly.
-  failures = 0
-  for t in tasks:
-    r = micropython.run(t.solution)
-    if not r.ok:
-      print(f"[FAIL] {t.id}: solution errored: {r.error}")
-      failures += 1
-      continue
-    if r.stdout != t.answer:
-      print(
-          f"[FAIL] {t.id}: stdout mismatch\n"
-          f"  expected: {t.answer!r}\n"
-          f"  actual:   {r.stdout!r}"
-      )
-      failures += 1
-  assert failures == 0, f"{failures} task(s) failed validation"
-
-  # Per-tier histogram.
-  hist: dict[int, int] = {}
-  for t in tasks:
-    hist[t.tier] = hist.get(t.tier, 0) + 1
-  print("Per-tier histogram:")
-  for tier in sorted(hist):
-    print(f"  tier {tier}: {hist[tier]} tasks")
-
-  # A few sample (prompt -> answer) lines, one per tier.
-  print("\nSample tasks (one per tier):")
-  seen: set[int] = set()
-  for t in tasks:
-    if t.tier not in seen:
-      seen.add(t.tier)
-      preview = t.answer.replace("\n", "\\n")
-      print(f"  [{t.id}] {t.prompt}  ->  {preview!r}")
-
-  print(f"\nAll {len(tasks)} tasks valid.")
