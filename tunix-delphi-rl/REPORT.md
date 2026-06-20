@@ -20,7 +20,7 @@ From there we escalated through five milestones, each a real run on TPU v6e:
 
 **The one negative that mattered everywhere:** multi-turn GRPO without gradient clipping does not wobble, it **crashes** — `inf`/`NaN` grads surface as a libtpu `SIGSEGV` that loses all progress. Clipping is load-bearing infrastructure, not a tuning knob.
 
-We are now escalating once more, to a **multi-turn coding agent** (write → run → revise over several rounds, Dr.GRPO, on a harder problem set where SFT is insufficient). That work is in progress; its hypothesis and a clearly-marked stub are at the end (§11). No results are claimed for it.
+We then escalated once more — a **multi-turn coding agent** with a **test-case-graded reward and a difficulty curriculum**, built specifically to predict that Dr.GRPO would *finally beat SFT* (§11). It did not (§12), and the negative is the sharpest result here: the redesign **fixed the representation** (SFT now reaches pass@1 = 1.0 on every held-out level, vs. ~1/18 before), but RL still moved held-out pass@1 by **exactly zero** — because the 447M policy is **bimodal per problem** (pass@1 = pass@k at every level, even at temperature 1.5), so RLVR has **no pass@k-to-pass@1 gap to compress**. A clear RL win at this scale needs *compositional* problems that manufacture that gap, or a larger base model — not more RL tuning.
 
 > **What "grug-style model into tunix" meant in practice.** We read it as "bring a marin model into tunix," and the cheapest correct path is tunix's native NNX model zoo + a weight loader — **not** porting grug's `equinox.Module`. For Delphi this is exact and free. A *genuinely* grug-only architecture (e.g. an MoE GatedNorm/XSA variant with no HF equivalent) would still need the equinox→nnx port + KV-cache + RoPE-offset (Strategy A in `DESIGN.md`); we scope that as a separate follow-on.
 
@@ -271,14 +271,45 @@ The two follow-ons are the same recipe (SFT warm-up → RL on the same in-memory
 
 ---
 
-## 11. Next: multi-turn coding (in progress)
+## 11. The multi-turn prediction we set out to test (#8)
 
-§9's coder is **single-turn**: write once, get graded, done — which is exactly why SFT saturated it and Dr.GRPO had nothing to do. We are now escalating to a **multi-turn coding agent**: up to **5 rounds** of write → run → revise, where the model sees the interpreter's execution feedback (stdout, errors, step traces) and edits its program, trained with Dr.GRPO on a **harder problem set** where SFT alone is insufficient.
+§9's coder is **single-turn**: write once, get graded, done — which is exactly why SFT saturated it and Dr.GRPO had nothing to do. So we escalated to a **multi-turn coding agent**: write → run → revise over several rounds, the model seeing the grader's execution feedback and editing its program, trained with Dr.GRPO on a problem set rebuilt so SFT alone is insufficient.
 
-**Hypothesis.** On tasks hard enough that the first-attempt solve rate is *low* even after SFT, the gain has to come from **iterating on execution feedback** — a behavior SFT can demonstrate the *form* of but cannot supply the *policy* for (which fix to try given which error), because the right next action depends on the observed failure. That is precisely the narrow-behavior-amplified-from-feedback regime where §8 showed RL is essential. So we expect the §9 result to *flip back*: multi-turn, hard-task coding should be the case where **Dr.GRPO finally beats SFT**, by learning to recover from failures the single-turn policy cannot.
+**The prediction.** On tasks hard enough that the first-attempt solve rate is *low* even after SFT, the gain has to come from **iterating on execution feedback** — a behavior SFT can demonstrate the *form* of but not the *policy* for (which fix to try given which error). That is the narrow-behavior-amplified-from-feedback regime where §8 showed RL is essential, so we expected §9 to *flip back*: multi-turn, hard-task coding should be where **Dr.GRPO finally beats SFT**.
 
-This work is **in progress; no results yet.** The hypothesis above is a prediction, not a finding — it will be confirmed or refuted in a follow-up.
+We built the whole apparatus to test it — and the prediction was **wrong**, in a way that turned out to be the most precise result in the project. §12 is that result.
 
 ---
 
-Full design + A/B/C strategy trade study: [`DESIGN.md`](DESIGN.md). How to work in this directory (file map, invariants, gotchas): [`AGENTS.md`](AGENTS.md). Per-milestone working logs: `.agents/logs/tunix-iris/`. Tracked as weaver issues #229 (feasibility), #5 (tool use), #7 (coding).
+## 12. The result: a test-case curriculum, and why RL *still* doesn't beat SFT at 447M (#8)
+
+To give RL a real chance we rebuilt the task three ways (design: [`CURRICULUM_DESIGN.md`](CURRICULUM_DESIGN.md); literature-grounded rationale: [`RL_HEADROOM.md`](RL_HEADROOM.md)):
+
+1. **Test-case-graded reward.** Instead of one canonical-output match, the model writes `def solve(...)` and is scored on the **fraction of N hidden tests passed** — a *continuous* reward, so a group of samples has reward *variance* and Dr.GRPO has a gradient. (The old binary reward gave all-pass-or-all-fail groups → zero advantage → no gradient.)
+2. **Six graded difficulty levels + a curriculum** (frontier-biased sampling, fixed cadence + a mastery gate, borrowed from `lib/marin/src/marin/rl/curriculum.py`): L1 arithmetic → L6 `nth_prime`/`collatz`/word problems.
+3. **Multi-turn + CoT exploration**: reason-as-comment, `def solve`, see the public-test result, revise — up to a few rounds.
+
+**What this fixed: the representation.** It is a real improvement over §9. SFT on **all six levels** now reaches **pass@1 = 1.000 on every held-out level** — and saturates in **under 30 SFT steps**. (The old stdout representation left held-out *families* stuck at ~1/18; the `def solve` + test-case framing makes the 447M model fully capable and parameter-generalizing across all six levels.) So the families are well-formed and learnable; the wall is not the task surface.
+
+**The clean RL test.** SFT on levels **1–3 only**, then curriculum Dr.GRPO over levels 1–4, measuring **per-level pass@k on held-out instances before vs. after RL**. A win = held-out L4 pass@1 climbing from 0. Replicated at two rollout shapes (num_gen 8 × batch 4, and 16 × batch 2):
+
+| tier | after-SFT pass@1 | **after-RL pass@1** |
+|---|---|---|
+| 1–3 (in SFT) | 1.000 | **1.000** |
+| 4–6 (held-out) | 0.000 | **0.000** |
+
+**Byte-identical, both runs.** RL moved nothing on the held-out levels — and this is *not* the §9 "no headroom" story (there SFT had already won; here SFT never saw L4–6) nor gradient starvation: the **training reward is a healthy partial-credit signal** (level-4 steps sit at reward ≈ 0.3–0.5 — programs that *run* and pass ~13–50 % of tests). The gradient exists. RL simply cannot convert "passes some tests with a hacky program" into the actual algorithm on a family SFT never demonstrated.
+
+**Why — the mechanism, and it is exact.** Every evaluation shows **pass@1 = pass@2 = pass@4 = pass@8 = pass@16**, at every tier, at every SFT amount (15/20/30/60/250 steps), at temperature **1.0 *and* 1.5**. Zero sampling variance: the 447M policy is **bimodal per problem** — it either always emits a correct program or always fails, with nothing in between, and raising temperature to 1.5 changes neither the spread (still none) nor the outcomes. RLVR's entire win mechanism is **compressing pass@k into pass@1** — sharpening unreliable-but-sometimes-right into reliable. A policy with *no* pass@k spread gives RL **nothing to compress**. (Corollary, also observed: `best_solve == first_solve` every step — the multi-turn feedback is unused, because when round 1 succeeds there is nothing to fix and when it fails the model cannot fix it. The same bimodality kills the iterate-on-feedback channel §8 relied on.)
+
+This **empirically confirms** the risk flagged up front in [`RL_HEADROOM.md`](RL_HEADROOM.md) §1.1/§6: at sub-2B scale, on templated single-function problems, there may be *no* reachable regime where RL beats SFT — and there isn't.
+
+**So the §10 deciding rule sharpens.** RL needs not just a *narrow behavior amplified from rare samples* (§8) but, concretely, a **`pass@k > pass@1 > 0` regime** — tasks the model solves *sometimes but unreliably*. Our algorithmic templates never produce one at 447M: they are either learned (→ deterministic 1.0) or not (→ deterministic 0.0).
+
+**What would actually give a clear win** (the prescription, not yet run): manufacture the sampling gap with **compositional / multi-step problems** — longer programs that chain 2–3 operations, where the SFT'd model's first attempt is often buggy but *occasionally* correct (pass@1 < pass@k), which is also where the unused multi-turn-feedback channel would finally pay off — **or** move to a **larger base model** above the sub-2B floor. Temperature is *not* a lever (tested: 1.5 opens no gap).
+
+> **Integration note (worth logging).** The test-case grader runs the `micropython` interpreter ~9× per program per round (N hidden tests + public-test feedback) vs. 1× in §9. At rollout concurrency 32 this blew host RAM and the container was OOM-killed at 64 GB; the runs only completed at **150 GB**. The TPU/HBM and iris plumbing were never the constraint — host-side grading cost was.
+
+---
+
+Full design + A/B/C strategy trade study: [`DESIGN.md`](DESIGN.md). How to work in this directory (file map, invariants, gotchas): [`AGENTS.md`](AGENTS.md). Per-milestone working logs: `.agents/logs/tunix-iris/`. Tracked as weaver issues #229 (feasibility), #5 (tool use), #7 (coding), #8 (test-case curriculum / RL headroom).
