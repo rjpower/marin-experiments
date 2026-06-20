@@ -49,15 +49,13 @@ from typing import Any, Dict
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.agentic.agentic_grpo_learner import GRPOConfig, GRPOLearner
 from tunix.rl.agentic.agents.model_agent import ModelAgent
 from tunix.rl.agentic.environments.task_environment import TaskEnvironment
-from tunix.rl.agentic.environments.tool_environment import ToolEnvironment
 from tunix.rl.rollout import base_rollout
 
-from agentic_common import DelphiRawTextChatParser
+from agentic_common import DelphiRawTextChatParser, clipped_adamw
 from agentic_sft import run_sft_warmup, t0_segments, t1_segments, t2_segments
 from agentic_tools import (
     CalcToolEnvironment,
@@ -394,19 +392,10 @@ def train_agentic_port(
       rollout_engine="vanilla",
       offload_to_cpu=False,
       training_config=rl_cluster_lib.RLTrainingConfig(
-          # Gradient clipping is load-bearing for the multi-turn tool stage: an
-          # occasional exploding update (more frequent at higher lr) produced
-          # inf/NaN that crashed the TPU run with a libtpu SIGSEGV mid-training
-          # (e.g. lr=2e-5 crashed ~step 3, lr=1e-5 ~step 99) and a restart loses
-          # all progress. Clipping the global norm bounds the update and keeps
-          # runs alive long enough to converge (solve_ratio was already climbing
-          # to ~8% in the first steps before the crash). Harmless for M-port.
-          actor_optimizer=optax.chain(
-              optax.clip_by_global_norm(1.0),
-              optax.adamw(
-                  learning_rate=learning_rate, b1=0.9, b2=0.99, weight_decay=0.0
-              ),
-          ),
+          # Global-norm-clipped AdamW: clipping is load-bearing (unclipped
+          # multi-turn GRPO crashes the TPU with a libtpu SIGSEGV on inf/NaN
+          # grads). See agentic_common.clipped_adamw for the full rationale.
+          actor_optimizer=clipped_adamw(learning_rate),
           eval_every_n_steps=eval_every_n_steps,
           max_steps=steps,
       ),
@@ -628,19 +617,10 @@ def _train_agentic_calc(
       rollout_engine="vanilla",
       offload_to_cpu=False,
       training_config=rl_cluster_lib.RLTrainingConfig(
-          # Gradient clipping is load-bearing for the multi-turn tool stage: an
-          # occasional exploding update (more frequent at higher lr) produced
-          # inf/NaN that crashed the TPU run with a libtpu SIGSEGV mid-training
-          # (e.g. lr=2e-5 crashed ~step 3, lr=1e-5 ~step 99) and a restart loses
-          # all progress. Clipping the global norm bounds the update and keeps
-          # runs alive long enough to converge (solve_ratio was already climbing
-          # to ~8% in the first steps before the crash). Harmless for M-port.
-          actor_optimizer=optax.chain(
-              optax.clip_by_global_norm(1.0),
-              optax.adamw(
-                  learning_rate=learning_rate, b1=0.9, b2=0.99, weight_decay=0.0
-              ),
-          ),
+          # Global-norm-clipped AdamW: clipping is load-bearing (unclipped
+          # multi-turn GRPO crashes the TPU with a libtpu SIGSEGV on inf/NaN
+          # grads). See agentic_common.clipped_adamw for the full rationale.
+          actor_optimizer=clipped_adamw(learning_rate),
           eval_every_n_steps=eval_every_n_steps,
           max_steps=steps,
       ),

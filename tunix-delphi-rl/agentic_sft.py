@@ -1,4 +1,4 @@
-"""Supervised warm-up for the Delphi agentic tool stages (T0 / T1).
+"""Supervised warm-up for the Delphi agentic tool stages (T0 / T1 / T2).
 
 RL masters the tool CALL + operands but cannot bootstrap the COPY behaviors that
 ground a multi-turn tool episode -- copying the injected ``Tool result: X`` into
@@ -48,11 +48,11 @@ from typing import Any, Callable, Dict, List, Tuple
 import grain.python as grain
 import jax
 import numpy as np
-import optax
 
 from tunix.sft import utils as sft_utils
 from tunix.sft.peft_trainer import PeftTrainer, TrainingConfig
 
+from agentic_common import clipped_adamw
 from delphi_qwen3 import DELPHI_BOS_ID, DELPHI_EOS_ID
 
 # A transcript is a list of (text, train_on_it?) segments. Mask 1 == the model's
@@ -62,65 +62,67 @@ Segments = List[Tuple[str, int]]
 SegmentFn = Callable[[random.Random], Segments]
 
 
+def chain_segments(rng: random.Random, depth: int) -> Segments:
+  """One ``depth``-call chained-multiply transcript (the per-stage SFT example).
+
+  A ``depth``-chain multiplies ``depth + 1`` operands ``a0 * a1 * ... * a{depth}``
+  with ``depth`` calculator calls, each call consuming the running product:
+  ``CALC(a0 * a1)`` -> ``CALC(<a0*a1> * a2)`` -> ... -> the final answer. Every
+  call after the first carries the PREVIOUS tool result as an argument, so the
+  warm-up teaches chaining (copy the tool output into the next call), not just
+  independent calls. ``depth==1`` is the single-call T0 case (no copy-forward).
+
+  The mask is per turn: the ``Q:`` line and the ``Tool result:`` lines are
+  context (mask 0 -- the env emits those at RL time and the model must learn to
+  COPY them, not produce them); every ``CALC(...)`` call and the final answer are
+  the model's own turns (mask 1).
+
+  Args:
+    rng: a seeded ``random.Random`` for reproducibility.
+    depth: number of calculator calls (1 = T0, 2 = T1, 3 = T2). Each operand is
+      2-digit (``[11, 99]``); the running product grows ~2 digits per step.
+
+  Returns:
+    The transcript as a list of ``(text, train_flag)`` segments.
+  """
+  operands = [rng.randint(11, 99) for _ in range(depth + 1)]
+  question = " * ".join(str(x) for x in operands)
+  segments: Segments = [(f"Q: {question}\n", 0)]
+  running = operands[0]
+  for next_operand in operands[1:]:
+    # Each call multiplies the running product by the next operand; after the
+    # first the left arg is the PRIOR tool result (the copy-forward we teach).
+    segments.append((f"CALC({running} * {next_operand})\n", 1))
+    running *= next_operand
+    segments.append((f"Tool result: {running}\n", 0))
+  # The final running product is the gold answer the model must copy out.
+  segments.append((f"{running}\n", 1))
+  return segments
+
+
 def t0_segments(rng: random.Random) -> Segments:
-  """One single-call ``a * b`` transcript (T0)."""
-  a = rng.randint(11, 99)
-  b = rng.randint(11, 99)
-  gold = a * b
-  return [
-      (f"Q: {a} * {b}\n", 0),
-      (f"CALC({a} * {b})\n", 1),
-      (f"Tool result: {gold}\n", 0),
-      (f"{gold}\n", 1),
-  ]
+  """One single-call ``a * b`` transcript (T0; ``chain_segments`` depth 1)."""
+  return chain_segments(rng, depth=1)
 
 
 def t1_segments(rng: random.Random) -> Segments:
-  """One chained two-call ``a * b * c`` transcript (T1).
+  """One chained two-call ``a * b * c`` transcript (T1; depth 2).
 
   The second call ``CALC(<a*b> * c)`` carries the turn-1 RESULT as an argument,
   so the warm-up teaches chaining (copy the tool output into the next call), not
   just two independent calls.
   """
-  a = rng.randint(11, 99)
-  b = rng.randint(11, 99)
-  c = rng.randint(11, 99)
-  ab = a * b
-  gold = ab * c
-  return [
-      (f"Q: {a} * {b} * {c}\n", 0),
-      (f"CALC({a} * {b})\n", 1),
-      (f"Tool result: {ab}\n", 0),
-      (f"CALC({ab} * {c})\n", 1),
-      (f"Tool result: {gold}\n", 0),
-      (f"{gold}\n", 1),
-  ]
+  return chain_segments(rng, depth=2)
 
 
 def t2_segments(rng: random.Random) -> Segments:
-  """One chained THREE-call ``a * b * c * d`` transcript (T2).
+  """One chained THREE-call ``a * b * c * d`` transcript (T2; depth 3).
 
   Three dependent calls -- ``CALC(a*b)`` -> ``CALC(<a*b>*c)`` -> ``CALC(<a*b*c>*d)``
   -- so the warm-up teaches a deeper chain (two intermediate copies forward, up
   to ~6 digits, then a final copy up to ~8 digits).
   """
-  a = rng.randint(11, 99)
-  b = rng.randint(11, 99)
-  c = rng.randint(11, 99)
-  d = rng.randint(11, 99)
-  ab = a * b
-  abc = ab * c
-  gold = abc * d
-  return [
-      (f"Q: {a} * {b} * {c} * {d}\n", 0),
-      (f"CALC({a} * {b})\n", 1),
-      (f"Tool result: {ab}\n", 0),
-      (f"CALC({ab} * {c})\n", 1),
-      (f"Tool result: {abc}\n", 0),
-      (f"CALC({abc} * {d})\n", 1),
-      (f"Tool result: {gold}\n", 0),
-      (f"{gold}\n", 1),
-  ]
+  return chain_segments(rng, depth=3)
 
 
 def _encode_segments(
@@ -279,10 +281,7 @@ def run_sft_warmup(
       segment_fn=segment_fn,
       prompt_prefix=prompt_prefix,
   )
-  optimizer = optax.chain(
-      optax.clip_by_global_norm(1.0),
-      optax.adamw(learning_rate=learning_rate, b1=0.9, b2=0.99, weight_decay=0.0),
-  )
+  optimizer = clipped_adamw(learning_rate)
   trainer = PeftTrainer(
       model=model,
       optimizer=optimizer,

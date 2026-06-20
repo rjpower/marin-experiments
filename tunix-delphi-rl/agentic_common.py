@@ -30,10 +30,36 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List
 
+import optax
+
 # Temporary diagnostic: when DELPHI_T0_DEBUG=1, print the rendered MULTI-TURN
 # rollout prompt (the one containing a tool result) so we can see exactly what
 # the model is asked to continue on turn 2.
 _DEBUG = os.environ.get("DELPHI_T0_DEBUG", "0") == "1"
+
+
+def clipped_adamw(learning_rate: float) -> optax.GradientTransformation:
+  """Builds the global-norm-clipped AdamW used by every Delphi training phase.
+
+  Gradient clipping is LOAD-BEARING for the multi-turn tool stages, not just a
+  stability nicety: an occasional exploding update (more frequent at higher lr)
+  produced ``inf``/``NaN`` gradients that crashed the TPU run with a libtpu
+  ``SIGSEGV`` mid-training (e.g. lr=2e-5 crashed ~step 3, lr=1e-5 ~step 99),
+  losing all progress. Clipping the global norm to 1.0 bounds the update, keeps
+  the run alive long enough to converge, and is harmless for the single-turn
+  M-port. Both the SFT warm-up (:func:`agentic_sft.run_sft_warmup`) and the RL
+  phase (:func:`train_agentic._train_agentic_calc`) use this same optimizer.
+
+  Args:
+    learning_rate: the AdamW learning rate.
+
+  Returns:
+    ``optax.chain(clip_by_global_norm(1.0), adamw(lr, b1=0.9, b2=0.99, wd=0.0))``.
+  """
+  return optax.chain(
+      optax.clip_by_global_norm(1.0),
+      optax.adamw(learning_rate=learning_rate, b1=0.9, b2=0.99, weight_decay=0.0),
+  )
 
 
 class DelphiRawTextChatParser:

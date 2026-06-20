@@ -1,7 +1,14 @@
-"""T0 tool-calling GRPO components for Delphi on tunix (single calculator call).
+"""Tool-calling GRPO components for the Delphi CALC curriculum (T0 / T1 / T2).
 
-Milestone **T0**: 2-digit x 2-digit multiplication via a single calculator tool
-call. The episode is two turns (``max_steps=2``):
+These are the shared pieces for the chained-multiply tool stages -- T0 (single
+call ``a * b``), T1 (two chained calls ``a * b * c``) and T2 (three chained
+calls ``a * b * c * d``). The stages differ ONLY in chain depth, so the
+dataset/problem builders are parameterized by ``depth`` (see
+:func:`build_chain_dataset`); everything else (the CALC parser, the tool agent,
+the copy-aware env, the rewards and metrics) is depth-agnostic and shared.
+
+The canonical stage is **T0**: 2-digit x 2-digit multiplication via a single
+calculator tool call. The episode is two turns (``max_steps=2``):
 
   * turn 1 -- the model emits ``CALC(A * B)``; the :class:`CalcTextToolParser`
     turns that into a calculator :class:`ToolCall`, the env executes the stock
@@ -24,9 +31,10 @@ loader, mesh, ``RLCluster``, ``GRPOConfig``, ``DelphiRawTextChatParser``,
   * :data:`T0_SYSTEM_PROMPT` -- few-shot tool-use transcripts that make the
     Delphi base LM emit a ``CALC(a * b)`` call from cold; what is learnable is
     OPERAND-COPY (``arg_acc~=0.10`` cold).
-  * :func:`build_t0_dataset` -- a grain dataset with ``prompts`` / ``a`` / ``b``
-    / ``answer`` columns (M-port grain shape), so ``a``, ``b``, ``answer`` reach
-    the learner reward fns as kwargs (they flow through the trajectory's
+  * :func:`build_chain_dataset` (+ the ``build_t{0,1,2}_dataset`` wrappers) -- a
+    grain dataset with ``prompts`` / operand (``a`` / ``b`` / ...) / ``answer``
+    columns (M-port grain shape), so the operands and ``answer`` reach the
+    learner reward fns as kwargs (they flow through the trajectory's
     ``original_input`` == the env task dict; verified against
     ``agentic_grpo_learner._process_results``).
   * :class:`CalcTextToolParser` -- parses ``CALC(a * b)`` into a calculator
@@ -369,167 +377,126 @@ def _coerce_int(value: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _make_t0_problem(rng: random.Random) -> tuple[str, int, int, str]:
-  """Generates one 2-digit x 2-digit multiply problem.
+# Operand column names in order; a ``depth``-chain (``depth + 1`` operands) uses
+# the first ``depth + 1`` of these. The turn-1 ``CALC(a * b)`` always uses ``a`` /
+# ``b``, so those two feed :func:`arg_reward` / :func:`t0_metric_fn`; the rest
+# ride along as unused reward kwargs. (Depths beyond 4 would need more names.)
+_OPERAND_NAMES = ("a", "b", "c", "d")
 
-  Both operands are drawn from ``[11, 99]`` so the product is wide enough that
-  Delphi's internal multiply is ~0% (forcing genuine tool use) while the result
-  stays short enough to copy reliably.
+
+def _make_chain_problem(rng: random.Random, depth: int) -> tuple:
+  """Generates one chained-multiply problem of the given ``depth``.
+
+  A ``depth``-chain multiplies ``depth + 1`` 2-digit operands with ``depth``
+  dependent calculator calls: ``CALC(a*b)`` -> ``CALC(<a*b>*c)`` -> ... Each call
+  after the first COPIES the prior tool result forward, so the agent exercises
+  true chaining (the prior tool OUTPUT becomes the next call's ARGUMENT), not
+  independent calls. Operands are drawn from ``[11, 99]`` so the product is wide
+  enough that Delphi's internal multiply is ~0% (forcing genuine tool use) while
+  each intermediate stays short enough to copy reliably.
 
   Args:
     rng: a seeded ``random.Random`` for reproducibility.
+    depth: number of calculator calls (1 = T0 single call, 2 = T1, 3 = T2).
 
   Returns:
-    ``(prompt, a, b, answer)`` where ``prompt`` is the user-turn text
-    (``"Q: a * b"``), ``a`` / ``b`` are the operands and ``answer`` is
-    ``str(a*b)``.
+    A flat tuple ``(prompt, op0, op1, ..., op{depth}, answer)`` where ``prompt``
+    is the user-turn text (``"Q: a * b * ..."``) and ``answer`` is the product
+    string. The operand ordering matches :data:`_OPERAND_NAMES`.
   """
-  a = rng.randint(11, 99)
-  b = rng.randint(11, 99)
-  return f"Q: {a} * {b}", a, b, str(a * b)
+  operands = [rng.randint(11, 99) for _ in range(depth + 1)]
+  prompt = "Q: " + " * ".join(str(x) for x in operands)
+  product = 1
+  for value in operands:
+    product *= value
+  return (prompt, *operands, str(product))
 
 
-class _T0Source(grain.RandomAccessDataSource):
-  """A grain source of ``(prompt, a, b, answer)`` T0 rows (deterministic)."""
+class _ChainSource(grain.RandomAccessDataSource):
+  """A grain source of deterministic ``depth``-chain problem rows.
 
-  def __init__(self, n: int, seed: int):
+  Each row is a flat ``(prompt, op0, ..., op{depth}, answer)`` tuple from
+  :func:`_make_chain_problem`. ``depth`` selects the curriculum stage (1 = T0,
+  2 = T1, 3 = T2).
+  """
+
+  def __init__(self, n: int, seed: int, depth: int):
     rng = random.Random(seed)
-    self._rows = [_make_t0_problem(rng) for _ in range(n)]
+    self._rows = [_make_chain_problem(rng, depth) for _ in range(n)]
 
   def __len__(self) -> int:
     return len(self._rows)
 
-  def __getitem__(self, idx: int) -> tuple[str, int, int, str]:
+  def __getitem__(self, idx: int) -> tuple:
     return self._rows[idx]
 
 
-def build_t0_dataset(n: int, seed: int, batch_size: int) -> grain.MapDataset:
-  """Builds a batched grain dataset of T0 multiply problems for GRPO.
+def build_chain_dataset(
+    n: int, seed: int, batch_size: int, depth: int
+) -> grain.MapDataset:
+  """Builds a batched grain dataset of ``depth``-chain multiply problems for GRPO.
 
-  Emits rows with ``prompts`` (user-turn strings), ``a`` / ``b`` (operands) and
-  ``answer`` (gold product string) columns, using the M-port grain shape so each
-  batched column is a single numpy-array leaf (HF ``datasets.batch`` instead
-  yields per-column Python lists, which tunix's ``tree_map`` corrupts). The
-  non-``prompts`` columns flow to the learner reward fns / metric fn as kwargs
-  via the trajectory's ``original_input`` (== the env task dict).
+  Emits rows with ``prompts`` (user-turn strings), one column per operand
+  (``a`` / ``b`` / ... per :data:`_OPERAND_NAMES`, ``depth + 1`` of them) and
+  ``answer`` (gold product string). The M-port grain shape keeps each batched
+  column a single numpy-array leaf (HF ``datasets.batch`` instead yields
+  per-column Python lists, which tunix's ``tree_map`` corrupts). The
+  non-``prompts`` columns flow to the learner reward fns / metric fn as kwargs via
+  the trajectory's ``original_input`` (== the env task dict): ``a`` / ``b`` feed
+  the turn-1 :func:`arg_reward` / :func:`t0_metric_fn` (the first call is always
+  ``CALC(a * b)``), any further operands ride along unused, and ``answer`` is the
+  gold the :class:`CalcToolEnvironment` scores against.
 
   Args:
     n: number of distinct problems to generate.
     seed: PRNG seed for the problem set.
     batch_size: prompts per global step.
+    depth: number of calculator calls (1 = T0, 2 = T1, 3 = T2).
 
   Returns:
-    A batched ``grain.MapDataset`` with ``prompts`` / ``a`` / ``b`` / ``answer``
+    A batched ``grain.MapDataset`` with ``prompts`` / operand / ``answer``
     columns.
   """
-  source = _T0Source(n, seed)
+  source = _ChainSource(n, seed, depth)
+  operand_names = _OPERAND_NAMES[: depth + 1]
 
   def _to_columns(batch):
-    # grain's .batch collates the 4-tuple source rows field-wise into a 4-tuple
-    # of numpy arrays (each a single leaf).
-    prompts, a, b, answers = batch
-    return {"prompts": prompts, "a": a, "b": b, "answer": answers}
+    # grain's .batch collates the flat source tuples field-wise into a tuple of
+    # numpy arrays (each a single leaf): (prompts, op0, ..., op{depth}, answers).
+    prompts = batch[0]
+    answers = batch[-1]
+    columns = {"prompts": prompts}
+    for name, operand_column in zip(operand_names, batch[1:-1]):
+      columns[name] = operand_column
+    columns["answer"] = answers
+    return columns
 
   return grain.MapDataset.source(source).batch(batch_size).map(_to_columns)
 
 
-def _make_t1_problem(rng: random.Random) -> tuple[str, int, int, int, str]:
-  """Generates one CHAINED ``a * b * c`` problem (T1: two dependent calls).
+def build_t0_dataset(n: int, seed: int, batch_size: int) -> grain.MapDataset:
+  """Builds a T0 dataset: single-call ``a * b`` (``build_chain_dataset`` depth 1).
 
-  The agent must compute ``a*b`` (turn 1), COPY that ~4-digit intermediate into
-  a second ``CALC(<a*b> * c)`` (turn 2), then copy the final product (turn 3) --
-  so the turn-2 call exercises true chaining (using turn-1's tool output as an
-  argument), not just two independent calls. All operands are 2-digit ``[11,99]``.
-
-  Returns:
-    ``(prompt, a, b, c, answer)`` where ``prompt`` is ``"Q: a * b * c"`` and
-    ``answer`` is ``str(a*b*c)``.
+  Columns: ``prompts`` / ``a`` / ``b`` / ``answer`` (``str(a*b)``).
   """
-  a = rng.randint(11, 99)
-  b = rng.randint(11, 99)
-  c = rng.randint(11, 99)
-  return f"Q: {a} * {b} * {c}", a, b, c, str(a * b * c)
-
-
-class _T1Source(grain.RandomAccessDataSource):
-  """A grain source of ``(prompt, a, b, c, answer)`` T1 rows (deterministic)."""
-
-  def __init__(self, n: int, seed: int):
-    rng = random.Random(seed)
-    self._rows = [_make_t1_problem(rng) for _ in range(n)]
-
-  def __len__(self) -> int:
-    return len(self._rows)
-
-  def __getitem__(self, idx: int) -> tuple[str, int, int, int, str]:
-    return self._rows[idx]
+  return build_chain_dataset(n, seed, batch_size, depth=1)
 
 
 def build_t1_dataset(n: int, seed: int, batch_size: int) -> grain.MapDataset:
-  """Builds a batched grain dataset of chained ``a * b * c`` problems for GRPO.
+  """Builds a T1 dataset: chained ``a * b * c`` (depth 2).
 
-  Emits ``prompts`` / ``a`` / ``b`` / ``c`` / ``answer`` columns. ``a`` / ``b``
-  feed the turn-1 :func:`arg_reward` / :func:`t0_metric_fn` (the first call is
-  ``CALC(a * b)``); ``c`` rides along as an unused reward kwarg; ``answer``
-  (``str(a*b*c)``) is the gold the :class:`CalcToolEnvironment` scores against.
+  Columns: ``prompts`` / ``a`` / ``b`` / ``c`` / ``answer`` (``str(a*b*c)``).
   """
-  source = _T1Source(n, seed)
-
-  def _to_columns(batch):
-    prompts, a, b, c, answers = batch
-    return {"prompts": prompts, "a": a, "b": b, "c": c, "answer": answers}
-
-  return grain.MapDataset.source(source).batch(batch_size).map(_to_columns)
-
-
-def _make_t2_problem(rng: random.Random) -> tuple[str, int, int, int, int, str]:
-  """Generates one CHAINED ``a * b * c * d`` problem (T2: three dependent calls).
-
-  The agent must compute ``a*b`` (turn 1), COPY it into ``CALC(<a*b> * c)``
-  (turn 2), COPY that ~6-digit intermediate into ``CALC(<a*b*c> * d)`` (turn 3),
-  then copy the final ~8-digit product -- a deeper chain than T1. All operands
-  are 2-digit ``[11,99]``.
-
-  Returns:
-    ``(prompt, a, b, c, d, answer)`` where ``prompt`` is ``"Q: a * b * c * d"``
-    and ``answer`` is ``str(a*b*c*d)``.
-  """
-  a = rng.randint(11, 99)
-  b = rng.randint(11, 99)
-  c = rng.randint(11, 99)
-  d = rng.randint(11, 99)
-  return f"Q: {a} * {b} * {c} * {d}", a, b, c, d, str(a * b * c * d)
-
-
-class _T2Source(grain.RandomAccessDataSource):
-  """A grain source of ``(prompt, a, b, c, d, answer)`` T2 rows (deterministic)."""
-
-  def __init__(self, n: int, seed: int):
-    rng = random.Random(seed)
-    self._rows = [_make_t2_problem(rng) for _ in range(n)]
-
-  def __len__(self) -> int:
-    return len(self._rows)
-
-  def __getitem__(self, idx: int) -> tuple[str, int, int, int, int, str]:
-    return self._rows[idx]
+  return build_chain_dataset(n, seed, batch_size, depth=2)
 
 
 def build_t2_dataset(n: int, seed: int, batch_size: int) -> grain.MapDataset:
-  """Builds a batched grain dataset of chained ``a * b * c * d`` problems.
+  """Builds a T2 dataset: chained ``a * b * c * d`` (depth 3).
 
-  Emits ``prompts`` / ``a`` / ``b`` / ``c`` / ``d`` / ``answer`` columns. ``a`` /
-  ``b`` feed the turn-1 :func:`arg_reward` / :func:`t0_metric_fn` (the first call
-  is ``CALC(a * b)``); ``c`` / ``d`` ride along as unused reward kwargs;
-  ``answer`` (``str(a*b*c*d)``) is the gold the env scores against.
+  Columns: ``prompts`` / ``a`` / ``b`` / ``c`` / ``d`` / ``answer``
+  (``str(a*b*c*d)``).
   """
-  source = _T2Source(n, seed)
-
-  def _to_columns(batch):
-    prompts, a, b, c, d, answers = batch
-    return {"prompts": prompts, "a": a, "b": b, "c": c, "d": d, "answer": answers}
-
-  return grain.MapDataset.source(source).batch(batch_size).map(_to_columns)
+  return build_chain_dataset(n, seed, batch_size, depth=3)
 
 
 # ---------------------------------------------------------------------------
