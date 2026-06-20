@@ -1,73 +1,62 @@
 #!/usr/bin/env bash
-# Submit a sparsity sweep to the shared marin cluster. One iris job per arm.
+# Submit a sparsity sweep on the real marin nemotron mixture. One iris job per arm.
 #
 # Usage:
-#   ./sweep.sh baseline                  # fixed-K arms: K in {1,2,4,8} at E=128
-#   ./sweep.sh aggressive                # adaptive arms: K_max=8, K_min=0, vary penalty lambda
-#   SP_STEPS=5000 SP_TPU=v6e-8 ./sweep.sh baseline
+#   SP_TOKENS=10e9  ./sweep.sh frontier        # fixed-K: K in {1,2,4,8,16,40} at E=1024
+#   SP_TOKENS=100e9 SP_TPU=v6e-32 ./sweep.sh frontier
+#   SP_TOKENS=100e9 SP_TPU=v6e-32 ./sweep.sh adapt   # adaptive variable-k (K_max=16, K_min=1, penalty sweep)
 #
-# No --region / MARIN_PREFIX: the worker derives its own region bucket from VM
-# metadata and the FineWeb-Edu cache (HF-backed) downloads there, so arms schedule
-# wherever v6e capacity is. Every arm is iso-token (same batch/steps/LR); only the
-# routing sparsity varies.
+# E=1024 reaches 1/1024 (0.098%) active at K=1 and 1/25.6 (3.9%) at K=40 -- the 1/1000..1/25
+# sparsity range. Every arm is iso-token: batch/steps/LR are sized once from SP_TOKENS, so the
+# only variable across arms is routing sparsity.
+#
+# Region: unlike the earlier FineWeb-Edu phase (HF-backed, per-region download, region-agnostic),
+# the nemotron caches are pre-built in GCS and replicated across regions. We pin BOTH the run
+# (--region) and the data region (SP_DATA_REGION) to us-east5 (verified complete set) so every
+# read is same-region. Override with SP_REGION to use another region that holds the caches.
 set -euo pipefail
 
-MODE="${1:?usage: sweep.sh <baseline|aggressive|kmin1>}"
+MODE="${1:?usage: sweep.sh <frontier|adapt>}"
 TPU="${SP_TPU:-v6e-8}"
-GROUP="${SP_GROUP:-adaptive-sparsity-$MODE}"
-STEPS_ENV=()
-[ -n "${SP_STEPS:-}" ] && STEPS_ENV=(-e SP_STEPS "$SP_STEPS")
-
-# Optional region pin. Unpinned by default (arms take v6e anywhere). The FineWeb-Edu
-# cache is HF-backed and built per-region on first use; when many arms land together in
-# a region that has NOT built it yet they race on the build and the losers see an empty
-# dataset. For a large concurrent sweep, pin SP_REGION to a region that already holds a
-# complete cache (e.g. us-east5) so every arm just reads it — no build, no race.
-REGION_ARG=()
-[ -n "${SP_REGION:-}" ] && REGION_ARG=(--region "$SP_REGION")
+TOKENS="${SP_TOKENS:?set SP_TOKENS, e.g. SP_TOKENS=10e9}"
+REGION="${SP_REGION:-us-east5}"
+EXPERTS="${SP_EXPERTS:-1024}"
+HIDDEN="${SP_HIDDEN:-512}"
+GROUP="${SP_GROUP:-sparsity-$MODE-E$EXPERTS-t$TOKENS}"
 
 submit() {
   # submit <tag> <KEY VALUE>...
   local tag="$1"; shift
-  echo ">>> submitting arm: $tag"
-  # max-retries 0: on a preemptible v6e a retry restarts the run and trips the
-  # MixtureDataset RESTART_STRATEGY empty-finite-dataset path; cleaner to let a
-  # preempted arm fail and re-submit it than to retry into that error.
+  echo ">>> submitting arm: $tag  (tokens=$TOKENS tpu=$TPU region=$REGION)"
+  # max-retries 0: on a preemptible v6e a retry restarts the run from scratch; cleaner to let
+  # a preempted arm fail and re-submit it.
   uv run iris --cluster=marin job run --no-wait \
-    --tpu "$TPU" --enable-extra-resources --extra marin-core:tpu "${REGION_ARG[@]}" \
+    --tpu "$TPU" --enable-extra-resources --extra marin-core:tpu --region "$REGION" \
     --max-retries 0 --cpu 32 --memory 128GB --disk 50GB \
     -e WANDB_API_KEY "$WANDB_API_KEY" \
-    -e SP_TPU "$TPU" -e SP_GROUP "$GROUP" "${STEPS_ENV[@]}" "$@" \
+    -e SP_TPU "$TPU" -e SP_GROUP "$GROUP" -e SP_TOKENS "$TOKENS" \
+    -e SP_DATA nemotron -e SP_DATA_REGION "$REGION" \
+    -e SP_HIDDEN "$HIDDEN" -e SP_EXPERTS "$EXPERTS" "$@" \
     -- python launch.py 2>&1 | grep -E 'Job submitted|Dashboard' || true
 }
 
 case "$MODE" in
-  baseline)
-    # Fixed top-K sweep at E=128: active fraction 0.78% -> 6.25%.
-    for K in 1 2 4 8; do
-      submit "fixed-E128-k$K" -e SPARSITY_MODE fixed -e SP_EXPERTS 128 -e SP_TOPK "$K"
+  frontier)
+    # Fixed top-K frontier at E=1024: active fraction 1/1024 (0.098%) -> 1/25.6 (3.9%).
+    for K in 1 2 4 8 16 40; do
+      submit "fixed-E${EXPERTS}-k$K" -e SPARSITY_MODE fixed -e SP_TOPK "$K"
     done
     ;;
-  aggressive)
-    # Adaptive variable-k, NO floor (K_min=0): a token may keep zero routed experts and
-    # fall back to the shared expert alone. Sweep the penalty lambda over a wide geometric
-    # range. This is the "how far can a blunt penalty push" probe; it tends to collapse.
-    for C in 0 4 16 64 256; do
-      submit "adapt-E128-k8-c$C" \
-        -e SPARSITY_MODE adaptive -e SP_EXPERTS 128 -e SP_TOPK 8 -e SP_MIN_K 0 -e SP_COEF "$C"
-    done
-    ;;
-  kmin1)
-    # Adaptive variable-k WITH a one-expert floor (K_min=1): every token keeps >=1 routed
-    # expert (0.78% floor) and the penalty only trims the other 7 slots. This isolates the
-    # "spend more experts on hard tokens, fewer on easy ones" question against the fixed-K
-    # frontier, without the total-collapse failure mode of K_min=0.
-    for C in 0 1 4 16; do
-      submit "adapt-E128-k8-min1-c$C" \
-        -e SPARSITY_MODE adaptive -e SP_EXPERTS 128 -e SP_TOPK 8 -e SP_MIN_K 1 -e SP_COEF "$C"
+  adapt)
+    # Adaptive variable-k with a one-expert floor (K_min=1): every token keeps >=1 routed
+    # expert (1/1024 floor) and the penalty trims the rest of the K_max=16 budget. Isolates
+    # "spend more experts on hard tokens, fewer on easy ones" against the fixed-K frontier.
+    for C in 0 0.25 1 4; do
+      submit "adapt-E${EXPERTS}-k16-min1-c$C" \
+        -e SPARSITY_MODE adaptive -e SP_TOPK 16 -e SP_MIN_K 1 -e SP_COEF "$C"
     done
     ;;
   *)
-    echo "unknown mode: $MODE (expected baseline|aggressive|kmin1)"; exit 1;;
+    echo "unknown mode: $MODE (expected frontier|adapt)"; exit 1;;
 esac
-echo "all $MODE arms submitted to group=$GROUP tpu=$TPU"
+echo "all $MODE arms submitted to group=$GROUP tpu=$TPU region=$REGION tokens=$TOKENS"

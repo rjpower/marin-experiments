@@ -11,15 +11,19 @@ heuristic LR depends only on hidden dim / tokens, not on the expert geometry), s
 the only thing that varies across arms is the routing sparsity.
 
     SPARSITY_MODE   fixed | adaptive               (default fixed)
-    SP_HIDDEN       model hidden dim               (default 768  -> ~1.1B total at E=128)
-    SP_EXPERTS      number of experts E            (default 128)
+    SP_HIDDEN       model hidden dim               (default 512 -> ~2.6B total at E=1024)
+    SP_EXPERTS      number of experts E            (default 1024; E=1024 reaches 1/1024 active at K=1)
     SP_TOPK         top-k routing width K          (default 4; the K_max capacity in adaptive mode)
     SP_MIN_K        adaptive per-token floor        (default 0; 0 lets a token use the shared expert alone)
     SP_COEF         sparsity penalty weight λ       (default 0.0; only meaningful when SPARSITY_MODE=adaptive)
     SP_TEMP         soft keep-gate temperature      (default 1.0)
-    SP_BUDGET       compute budget for sizing/LR    (default 1.7e18 -> d768 row, ~2.7B tokens)
-    SP_STEPS        override train steps            (default: heuristic value for the budget)
-    SP_BATCH        override batch size (sequences) (default: heuristic value for the budget)
+    SP_TOKENS       target token budget             (e.g. 10e9, 100e9; sets batch/steps/LR via the heuristic)
+    SP_REF_TOPK     reference K for token sizing    (default 4; iso-token sizing uses this fixed K)
+    SP_BUDGET       compute budget (if SP_TOKENS unset) (default 1.7e18)
+    SP_STEPS        override train steps            (default: heuristic value; overriding desyncs LR)
+    SP_BATCH        override batch size (sequences) (default: heuristic value; overriding desyncs LR)
+    SP_DATA         nemotron | fineweb              (default nemotron; the real marin MoE mixture)
+    SP_DATA_REGION  GCS region for nemotron caches  (default us-east5; match the run's --region)
     SP_SEED         seed                            (default 0)
     SP_TPU          TPU type                        (default v6e-16)
     SP_GROUP        wandb group                     (default adaptive-sparsity)
@@ -57,18 +61,10 @@ from marin.execution.executor import executor_main
 from marin.execution.types import ExecutorStep, this_output_path, versioned
 from marin.training.training import temporary_checkpoint_base_path
 
-from data import build_fineweb_edu_mix
-from heuristic import MoeAdamHHeuristic, build_from_heuristic
+from data import build_fineweb_edu_mix, build_nemotron_mix
+from heuristic import MoeAdamHHeuristic, build_from_heuristic, compute_flops_per_token
 from model import GrugModelConfig
 from train import GrugRunConfig, GrugTrainerConfig, _run_grug_local
-
-# Reference expert geometry used to fix the token budget and learning rate across all
-# arms. The AdamH LR depends only on hidden dim / tokens, and we want every arm to
-# train on the *same* token budget (iso-token) so the only variable is sparsity, so
-# we size batch / steps / optimizer once from this reference rather than per-arm
-# (the per-arm flops-per-token, which depends on K, would otherwise shift the budget).
-_REF_EXPERTS = 128
-_REF_TOP_K = 4
 
 
 @dataclass(frozen=True)
@@ -139,27 +135,43 @@ def _env(key: str, default: str) -> str:
 
 def _make_step() -> ExecutorStep:
     mode = _env("SPARSITY_MODE", "fixed")
-    hidden = int(_env("SP_HIDDEN", "768"))
-    num_experts = int(_env("SP_EXPERTS", "128"))
+    hidden = int(_env("SP_HIDDEN", "512"))
+    num_experts = int(_env("SP_EXPERTS", "1024"))
     top_k = int(_env("SP_TOPK", "4"))
     min_k = int(_env("SP_MIN_K", "0"))
     coef = float(_env("SP_COEF", "0.0"))
     temp = float(_env("SP_TEMP", "1.0"))
-    budget = float(_env("SP_BUDGET", "1.7e18"))
+    ref_top_k = int(_env("SP_REF_TOPK", "4"))
+    target_tokens = _env("SP_TOKENS", "")
     seed = int(_env("SP_SEED", "0"))
     tpu = _env("SP_TPU", "v6e-16")
     group = _env("SP_GROUP", "adaptive-sparsity")
+    data_kind = _env("SP_DATA", "nemotron")
+    data_region = _env("SP_DATA_REGION", "us-east5")
     smoke = _env("SP_SMOKE", "0") == "1"
 
     if mode not in ("fixed", "adaptive"):
         raise ValueError(f"SPARSITY_MODE must be 'fixed' or 'adaptive', got {mode!r}")
     adaptive = mode == "adaptive"
 
-    # Fixed reference: token budget + AdamH LR, identical for every arm (iso-token).
-    _ref_model, optimizer, ref_batch, ref_steps = build_from_heuristic(
+    # Token budget + AdamH LR are fixed once from a reference geometry (this expert pool at
+    # SP_REF_TOPK) and applied identically to every arm (iso-token), so the only variable
+    # across arms is routing sparsity. When SP_TOKENS is given we hit that exact token count
+    # by converting it to a compute budget through the reference FLOPs/token (the heuristic
+    # then derives the same token count back, sizing batch/steps/LR consistently). The LR
+    # itself depends only on hidden dim / tokens / batch — not on K or E — so it is identical
+    # across arms regardless of the reference K.
+    _ref_model = MoeAdamHHeuristic().build_model_config(
+        hidden, num_experts=num_experts, num_experts_per_token=ref_top_k
+    )
+    if target_tokens:
+        budget = 3.0 * compute_flops_per_token(_ref_model) * float(target_tokens)
+    else:
+        budget = float(_env("SP_BUDGET", "1.7e18"))
+    _ref_model2, optimizer, ref_batch, ref_steps = build_from_heuristic(
         budget=budget,
         hidden_dim=hidden,
-        model_overrides=dict(num_experts=_REF_EXPERTS, num_experts_per_token=_REF_TOP_K),
+        model_overrides=dict(num_experts=num_experts, num_experts_per_token=ref_top_k),
     )
     # This arm's model carries its own expert geometry / routing mode.
     model = MoeAdamHHeuristic().build_model_config(
@@ -181,9 +193,16 @@ def _make_step() -> ExecutorStep:
         arm = f"fixed-d{hidden}-E{num_experts}-k{top_k}"
     run_id = f"sparsity-{arm}-s{seed}-st{steps}"
 
+    if smoke or data_kind == "fineweb":
+        data = build_fineweb_edu_mix(smoke=smoke)
+    elif data_kind == "nemotron":
+        data = build_nemotron_mix(region=data_region)
+    else:
+        raise ValueError(f"SP_DATA must be 'nemotron' or 'fineweb', got {data_kind!r}")
+
     launch = GrugMoeLaunchConfig(
         model=versioned(model),
-        data=build_fineweb_edu_mix(smoke=smoke),
+        data=data,
         output_path=this_output_path(),
         run_id=run_id,
         resources=versioned(ResourceConfig.with_tpu(tpu)),
@@ -202,10 +221,11 @@ def _make_step() -> ExecutorStep:
         grug_trainer=versioned(GrugTrainerConfig(z_loss_weight=1e-4, ema_beta=None, log_every=1)),
     )
 
+    tokens = batch * steps * 4096
     print(
         f"[arm] {run_id}  mode={mode} E={num_experts} k={top_k} min_k={min_k} "
         f"coef={coef} nominal_active_frac={active_frac:.4%} batch={batch} steps={steps} "
-        f"layers={model.num_layers} budget={budget:g}"
+        f"tokens={tokens/1e9:.1f}B layers={model.num_layers} data={data_kind} budget={budget:g}"
     )
     return ExecutorStep(name=f"grug/sparsity/{run_id}", fn=run_inline, config=launch)
 
