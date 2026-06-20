@@ -28,11 +28,12 @@ submit() {
   # submit <tag> <KEY VALUE>...
   local tag="$1"; shift
   echo ">>> submitting arm: $tag  (tokens=$TOKENS tpu=$TPU region=$REGION)"
-  # max-retries 0: on a preemptible v6e a retry restarts the run from scratch; cleaner to let
-  # a preempted arm fail and re-submit it.
+  # max-retries 3: these runs checkpoint every 30 min (launch.py) and the nemotron caches are
+  # pre-built (no per-region build race), so an auto-retry after preemption RESUMES from the
+  # latest checkpoint instead of restarting -- essential for the multi-hour 10B-100B arms.
   uv run iris --cluster=marin job run --no-wait \
     --tpu "$TPU" --enable-extra-resources --extra marin-core:tpu --region "$REGION" \
-    --max-retries 0 --cpu 32 --memory 128GB --disk 50GB \
+    --max-retries 3 --cpu 32 --memory 128GB --disk 100GB \
     -e WANDB_API_KEY "$WANDB_API_KEY" \
     -e SP_TPU "$TPU" -e SP_GROUP "$GROUP" -e SP_TOKENS "$TOKENS" \
     -e SP_DATA nemotron -e SP_DATA_REGION "$REGION" \

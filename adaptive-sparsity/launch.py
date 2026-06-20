@@ -111,7 +111,13 @@ def run_inline(config: GrugMoeLaunchConfig) -> None:
             base_path=os.path.join(config.output_path, "checkpoints"),
             temporary_base_path=temporary_checkpoint_base_path(config.output_path),
             append_run_id_to_base_path=False,
-            save_interval=timedelta(hours=24),
+            # Long (10B-100B token) runs on preemptible v6e need to survive preemption: save
+            # often and keep the last couple of rolling checkpoints so an iris auto-retry (or
+            # a manual re-submit of the same run_id) resumes from the latest step instead of
+            # restarting from zero. The nemotron caches are pre-built, so a retry just reads
+            # them and resumes -- there is no per-region build race to re-trip.
+            save_interval=timedelta(minutes=30),
+            keep_last_temporary_checkpoints=2,
             keep=None,
         ),
     )
