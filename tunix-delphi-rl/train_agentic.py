@@ -58,16 +58,18 @@ from tunix.rl.agentic.environments.tool_environment import ToolEnvironment
 from tunix.rl.rollout import base_rollout
 
 from agentic_common import DelphiRawTextChatParser
-from agentic_sft import run_sft_warmup, t0_segments, t1_segments
+from agentic_sft import run_sft_warmup, t0_segments, t1_segments, t2_segments
 from agentic_tools import (
     CalcToolEnvironment,
     DelphiToolAgent,
     T0_SYSTEM_PROMPT,
     T0_TOOL_MAP,
     T1_SYSTEM_PROMPT,
+    T2_SYSTEM_PROMPT,
     arg_reward as t0_arg_reward,
     build_t0_dataset,
     build_t1_dataset,
+    build_t2_dataset,
     install_per_call_rollout_seed,
     newline_terminal_eos_tokens,
     t0_metric_fn,
@@ -763,6 +765,42 @@ def train_agentic_t1(
       sft_prompt_prefix=T1_SYSTEM_PROMPT,
       sft_max_seq_len=256,
       env_max_steps=3,
+      max_prompt_length=max_prompt_length,
+      max_tokens_to_generate=max_tokens_to_generate,
+      **kwargs,
+  )
+
+
+def train_agentic_t2(
+    *,
+    max_prompt_length: int = 1024,
+    max_tokens_to_generate: int = 192,
+    **kwargs,
+) -> T0TrainResult:
+  """T2: THREE CHAINED calculator calls (``a * b * c * d``).
+
+  A deeper chain than T1: the model must ``CALC(a * b)``, COPY it into
+  ``CALC(<a*b> * c)``, COPY that ~6-digit intermediate into ``CALC(<a*b*c> * d)``,
+  then copy the final ~8-digit product. ``env_max_steps=4`` admits the third tool
+  turn; everything else is identical to T1 (same env/reward/metrics, gold is the
+  precomputed ``answer`` = ``a*b*c*d``, ``arg_acc`` scores the turn-1 operands).
+  The SFT warm-up uses :func:`agentic_sft.t2_segments` and -- as for T1 -- the
+  few-shot prompt is prepended (masked) so the SFT context == the RL prompt; a
+  larger ``sft_max_seq_len`` covers the longer demo + 4-turn transcript. The
+  prompt/response budgets are larger to fit the extra turn and longer numbers.
+
+  Args:
+    max_prompt_length: max accumulated prompt length (system + up to 4 turns).
+    max_tokens_to_generate: per-EPISODE budget across all 4 turns.
+    **kwargs: forwarded to :func:`_train_agentic_calc`.
+  """
+  return _train_agentic_calc(
+      dataset_builder=build_t2_dataset,
+      sft_segment_fn=t2_segments,
+      system_prompt=T2_SYSTEM_PROMPT,
+      sft_prompt_prefix=T2_SYSTEM_PROMPT,
+      sft_max_seq_len=384,
+      env_max_steps=4,
       max_prompt_length=max_prompt_length,
       max_tokens_to_generate=max_tokens_to_generate,
       **kwargs,

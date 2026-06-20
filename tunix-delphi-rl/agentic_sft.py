@@ -97,6 +97,32 @@ def t1_segments(rng: random.Random) -> Segments:
   ]
 
 
+def t2_segments(rng: random.Random) -> Segments:
+  """One chained THREE-call ``a * b * c * d`` transcript (T2).
+
+  Three dependent calls -- ``CALC(a*b)`` -> ``CALC(<a*b>*c)`` -> ``CALC(<a*b*c>*d)``
+  -- so the warm-up teaches a deeper chain (two intermediate copies forward, up
+  to ~6 digits, then a final copy up to ~8 digits).
+  """
+  a = rng.randint(11, 99)
+  b = rng.randint(11, 99)
+  c = rng.randint(11, 99)
+  d = rng.randint(11, 99)
+  ab = a * b
+  abc = ab * c
+  gold = abc * d
+  return [
+      (f"Q: {a} * {b} * {c} * {d}\n", 0),
+      (f"CALC({a} * {b})\n", 1),
+      (f"Tool result: {ab}\n", 0),
+      (f"CALC({ab} * {c})\n", 1),
+      (f"Tool result: {abc}\n", 0),
+      (f"CALC({abc} * {d})\n", 1),
+      (f"Tool result: {gold}\n", 0),
+      (f"{gold}\n", 1),
+  ]
+
+
 def _encode_segments(
     tokenizer, segments: Segments, max_seq_len: int
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

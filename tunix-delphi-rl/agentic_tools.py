@@ -203,6 +203,33 @@ T1_SYSTEM_PROMPT = (
 )
 
 
+# T2 (three chained calls): a deeper chain a * b * c * d -- the demos show TWO
+# intermediate copies forward (turn-1 result into call 2, turn-2 result into
+# call 3) before the final copy.
+T2_SYSTEM_PROMPT = (
+    "You are a calculator-using assistant. Use the calculator ONE step at a "
+    "time: write CALC(...) for the first product, read the tool result, use it "
+    "in the next CALC(...), keep going until all numbers are multiplied, then "
+    "give the final number.\n"
+    "Q: 12 * 13 * 14 * 15\n"
+    "CALC(12 * 13)\n"
+    "Tool result: 156\n"
+    "CALC(156 * 14)\n"
+    "Tool result: 2184\n"
+    "CALC(2184 * 15)\n"
+    "Tool result: 32760\n"
+    "32760\n"
+    "Q: 24 * 31 * 17 * 13\n"
+    "CALC(24 * 31)\n"
+    "Tool result: 744\n"
+    "CALC(744 * 17)\n"
+    "Tool result: 12648\n"
+    "CALC(12648 * 13)\n"
+    "Tool result: 164424\n"
+    "164424"
+)
+
+
 # A genuine end-of-line for a T0 turn ends in a digit (the final numeric answer)
 # or ``')'`` (the close of a ``CALC(a * b)`` call). A trailing-newline BPE token
 # is a valid turn stop ONLY if the char before the newline is one of these (or
@@ -451,6 +478,56 @@ def build_t1_dataset(n: int, seed: int, batch_size: int) -> grain.MapDataset:
   def _to_columns(batch):
     prompts, a, b, c, answers = batch
     return {"prompts": prompts, "a": a, "b": b, "c": c, "answer": answers}
+
+  return grain.MapDataset.source(source).batch(batch_size).map(_to_columns)
+
+
+def _make_t2_problem(rng: random.Random) -> tuple[str, int, int, int, int, str]:
+  """Generates one CHAINED ``a * b * c * d`` problem (T2: three dependent calls).
+
+  The agent must compute ``a*b`` (turn 1), COPY it into ``CALC(<a*b> * c)``
+  (turn 2), COPY that ~6-digit intermediate into ``CALC(<a*b*c> * d)`` (turn 3),
+  then copy the final ~8-digit product -- a deeper chain than T1. All operands
+  are 2-digit ``[11,99]``.
+
+  Returns:
+    ``(prompt, a, b, c, d, answer)`` where ``prompt`` is ``"Q: a * b * c * d"``
+    and ``answer`` is ``str(a*b*c*d)``.
+  """
+  a = rng.randint(11, 99)
+  b = rng.randint(11, 99)
+  c = rng.randint(11, 99)
+  d = rng.randint(11, 99)
+  return f"Q: {a} * {b} * {c} * {d}", a, b, c, d, str(a * b * c * d)
+
+
+class _T2Source(grain.RandomAccessDataSource):
+  """A grain source of ``(prompt, a, b, c, d, answer)`` T2 rows (deterministic)."""
+
+  def __init__(self, n: int, seed: int):
+    rng = random.Random(seed)
+    self._rows = [_make_t2_problem(rng) for _ in range(n)]
+
+  def __len__(self) -> int:
+    return len(self._rows)
+
+  def __getitem__(self, idx: int) -> tuple[str, int, int, int, int, str]:
+    return self._rows[idx]
+
+
+def build_t2_dataset(n: int, seed: int, batch_size: int) -> grain.MapDataset:
+  """Builds a batched grain dataset of chained ``a * b * c * d`` problems.
+
+  Emits ``prompts`` / ``a`` / ``b`` / ``c`` / ``d`` / ``answer`` columns. ``a`` /
+  ``b`` feed the turn-1 :func:`arg_reward` / :func:`t0_metric_fn` (the first call
+  is ``CALC(a * b)``); ``c`` / ``d`` ride along as unused reward kwargs;
+  ``answer`` (``str(a*b*c*d)``) is the gold the env scores against.
+  """
+  source = _T2Source(n, seed)
+
+  def _to_columns(batch):
+    prompts, a, b, c, d, answers = batch
+    return {"prompts": prompts, "a": a, "b": b, "c": c, "d": d, "answer": answers}
 
   return grain.MapDataset.source(source).batch(batch_size).map(_to_columns)
 

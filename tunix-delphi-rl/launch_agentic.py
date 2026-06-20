@@ -53,6 +53,7 @@ from train_agentic import (
     train_agentic_port,
     train_agentic_t0,
     train_agentic_t1,
+    train_agentic_t2,
 )
 
 DELPHI_REPO = "marin-community/delphi-3e18-447Mparams-1.2Btokens"
@@ -171,11 +172,11 @@ def main() -> None:
   sft_learning_rate = float(os.environ.get("DELPHI_SFT_LR", "1e-4"))
   model_dir = os.environ.get("DELPHI_MODEL_DIR", "./delphi")
 
-  if mode not in ("port", "t0", "t1"):
+  if mode not in ("port", "t0", "t1", "t2"):
     raise ValueError(
         f"DELPHI_AGENT_MODE={mode!r} is not supported. Supported modes: "
-        "'port' (single-turn no-tool M-port), 't0' (single calculator call) "
-        "and 't1' (two chained calculator calls)."
+        "'port' (single-turn no-tool M-port), 't0' (single calculator call), "
+        "'t1' (two chained calculator calls) and 't2' (three chained calls)."
     )
 
   print(f"[launch] jax {jax.__version__} devices={jax.devices()}", flush=True)
@@ -200,9 +201,14 @@ def main() -> None:
         learning_rate=learning_rate,
         use_rollout_logps=use_rollout_logps,
     )
-  else:  # mode in ("t0", "t1")
+  else:  # mode in ("t0", "t1", "t2")
+    _tool_train_fns = {
+        "t0": train_agentic_t0,
+        "t1": train_agentic_t1,
+        "t2": train_agentic_t2,
+    }
     _run_tool_stage(
-        train_fn=train_agentic_t1 if mode == "t1" else train_agentic_t0,
+        train_fn=_tool_train_fns[mode],
         label=mode.upper(),
         model_dir=model_dir,
         steps=steps,
