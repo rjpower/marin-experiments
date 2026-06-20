@@ -70,6 +70,24 @@ def _print_tier_table(label_a, eval_a, label_b, eval_b) -> None:
   )
 
 
+def _print_misses(result) -> None:
+  """Prints every UNSOLVED task in the final eval (id, tier, output vs gold)."""
+  final = result.eval_after_rl or result.eval_after_sft
+  if final is None:
+    return
+  tasks_by_id = {t.id: t for t in load_tasks()}
+  misses = [r for r in final.rows if not r.solved]
+  print(f"[coding] UNSOLVED ({len(misses)}/{final.total}):", flush=True)
+  for row in sorted(misses, key=lambda r: (r.tier, r.task_id)):
+    gold = tasks_by_id[row.task_id].answer
+    prog = row.program.replace("\n", " ; ")
+    print(
+        f"[coding]   XX [t{row.tier} {row.task_id}] ran_ok={row.ran_ok} "
+        f"out={row.output!r} gold={gold!r} prog={prog[:90]!r}",
+        flush=True,
+    )
+
+
 def _print_examples(result, n_per_tier: int = 2) -> None:
   """Prints a few (task -> program -> output) examples from the after-RL eval."""
   final = result.eval_after_rl or result.eval_after_sft
@@ -77,15 +95,18 @@ def _print_examples(result, n_per_tier: int = 2) -> None:
     return
   tasks_by_id = {t.id: t for t in load_tasks()}
   print("[coding] SAMPLE PROGRAMS (after-rl):", flush=True)
-  shown: dict[int, int] = {}
-  # Prefer solved rows, then a couple of failures, spread across tiers.
+  # Show up to n_per_tier solved AND n_per_tier failed per tier (separate quotas
+  # so failures are not crowded out by solved rows).
+  shown_ok: dict[int, int] = {}
+  shown_xx: dict[int, int] = {}
   for want_solved in (True, False):
+    bucket = shown_ok if want_solved else shown_xx
     for row in final.rows:
       if row.solved != want_solved:
         continue
-      if shown.get(row.tier, 0) >= n_per_tier:
+      if bucket.get(row.tier, 0) >= n_per_tier:
         continue
-      shown[row.tier] = shown.get(row.tier, 0) + 1
+      bucket[row.tier] = bucket.get(row.tier, 0) + 1
       task = tasks_by_id[row.task_id]
       prompt = strip_answer_hint(task.prompt, task.answer)
       mark = "OK " if row.solved else "XX "
@@ -157,6 +178,7 @@ def main() -> None:
     _print_tier_table(
         baseline_label, result.eval_after_sft, "after-rl", result.eval_after_rl
     )
+    _print_misses(result)
     _print_examples(result)
 
   print(f"[coding] CODING COMPLETE (RL steps={result.steps_ran}, tiers={tiers})", flush=True)
