@@ -701,6 +701,149 @@ def evaluate_tasks_multiturn(
   return MultiTurnEvalResult(rows=rows)
 
 
+# ---------------------------------------------------------------------------
+# pass@k: the exploration-gap instrument (issue #8 / RL_HEADROOM.md R3).
+# ---------------------------------------------------------------------------
+#
+# Greedy first-attempt solve (evaluate_tasks_multiturn) hides the quantity RL
+# actually moves: RL operates at temperature>0, so the relevant baseline is the
+# SAMPLED first-attempt pass@1, which can sit far below the argmax. If sampled
+# pass@1 << pass@k the correct program is in the policy's support but unreliable
+# -- the regime where RLVR earns its keep (it concentrates mass onto modes the
+# base/SFT model already samples; cf. RL_HEADROOM.md). If pass@1 ~= pass@k there
+# is no exploration gap and RL cannot help, whatever the difficulty. This is the
+# diagnostic that decides whether any task refinement is worth running.
+
+
+@dataclasses.dataclass
+class PassKTaskRow:
+  """pass@k sampling outcome for one task: ``n_correct`` of ``k`` first attempts."""
+
+  task_id: str
+  tier: int
+  n_correct: int
+  k: int
+
+
+@dataclasses.dataclass
+class PassKResult:
+  """Aggregate first-attempt pass@k with the unbiased Chen et al. estimator."""
+
+  rows: List["PassKTaskRow"]
+  k: int
+  temperature: float
+
+  @property
+  def total(self) -> int:
+    return len(self.rows)
+
+  @staticmethod
+  def _pass_at_m_one(k: int, c: int, m: int) -> float:
+    """Unbiased P(at least one of m draws solves) for a task with c/k correct."""
+    from math import comb
+
+    if m > k:
+      m = k
+    if k - c < m:  # fewer than m wrong draws => every m-subset hits a correct one
+      return 1.0
+    return 1.0 - comb(k - c, m) / comb(k, m)
+
+  def pass_at(self, m: int) -> float:
+    if not self.rows:
+      return 0.0
+    return float(np.mean([self._pass_at_m_one(r.k, r.n_correct, m) for r in self.rows]))
+
+  def per_tier_pass_at(self, m: int) -> Dict[int, Tuple[float, int]]:
+    """tier -> (pass@m, n_tasks)."""
+    by_tier: Dict[int, List[float]] = {}
+    for r in self.rows:
+      by_tier.setdefault(r.tier, []).append(self._pass_at_m_one(r.k, r.n_correct, m))
+    return {t: (float(np.mean(v)), len(v)) for t, v in by_tier.items()}
+
+  def summary(self, ms: Tuple[int, ...] = (1, 2, 4, 8, 16)) -> str:
+    ms = tuple(m for m in ms if m <= self.k) or (1, self.k)
+    head = "  ".join(f"pass@{m}={self.pass_at(m):.3f}" for m in ms)
+    lines = [f"k={self.k} temp={self.temperature} ({self.total} tasks): {head}"]
+    for tier in sorted({r.tier for r in self.rows}):
+      cells = []
+      for m in ms:
+        p, n = self.per_tier_pass_at(m)[tier]
+        cells.append(f"@{m}={p:.3f}")
+      n = self.per_tier_pass_at(ms[0])[tier][1]
+      lines.append(f"  tier {tier} (n={n}): " + " ".join(cells))
+    return "\n".join(lines)
+
+
+def evaluate_passk(
+    model,
+    tokenizer,
+    tasks,
+    *,
+    k: int = 16,
+    max_new_tokens: int = 192,
+    max_prompt_length: int = 512,
+    temperature: float = 1.0,
+    cache_size: int | None = None,
+    mesh=None,
+    seed: int = 0,
+) -> PassKResult:
+  """First-attempt pass@k: sample ``k`` round-1 programs per task and grade each.
+
+  Uses the SAME round-1 prompt as the rollout/greedy eval (few-shot + the
+  hint-stripped task), sampling at ``temperature`` with a distinct seed per draw
+  so the ``k`` samples differ. Returns per-task ``n_correct``/``k``; the unbiased
+  estimator on :class:`PassKResult` then gives the pass@1..pass@k curve. Purely a
+  measurement -- no training, no multi-turn iteration.
+  """
+  import contextlib
+
+  from tunix.generate import sampler as sampler_lib
+
+  if cache_size is None:
+    cache_size = max_prompt_length + max_new_tokens + 16
+  cache_config = sampler_lib.CacheConfig(
+      cache_size=cache_size,
+      num_layers=model.config.num_layers,
+      num_kv_heads=model.config.num_kv_heads,
+      head_dim=model.config.head_dim,
+  )
+  sampler = sampler_lib.Sampler(
+      transformer=model, tokenizer=tokenizer, cache_config=cache_config
+  )
+  eos_tokens = sorted(set([DELPHI_EOS_ID]) | set(program_terminal_eos_tokens(tokenizer)))
+
+  prompts = [build_agent_prompt(strip_answer_hint(t.prompt, t.answer)) for t in tasks]
+  golds = [t.answer for t in tasks]
+  n_correct = [0] * len(tasks)
+
+  ctx = mesh if mesh is not None else contextlib.nullcontext()
+  with ctx:
+    for draw in range(k):
+      texts: List[str] = []
+      chunk = 16
+      for s in range(0, len(prompts), chunk):
+        out = sampler(
+            input_strings=prompts[s : s + chunk],
+            max_generation_steps=max_new_tokens,
+            max_prompt_length=cache_size - max_new_tokens - 4,
+            echo=False,
+            eos_tokens=eos_tokens,
+            temperature=temperature,
+            seed=seed + draw,
+        )
+        texts.extend(out.text)
+      for i, completion in enumerate(texts):
+        result = micropython.run(extract_program(completion), max_steps=_EVAL_MAX_STEPS)
+        if result.ok and result.stdout == golds[i]:
+          n_correct[i] += 1
+
+  rows = [
+      PassKTaskRow(task_id=t.id, tier=t.tier, n_correct=n_correct[i], k=k)
+      for i, t in enumerate(tasks)
+  ]
+  return PassKResult(rows=rows, k=k, temperature=temperature)
+
+
 if __name__ == "__main__":
   # Dependency-light CPU self-check (no TPU): parser, env grading over rounds,
   # the SFT segments, and the round-prompt builder.
@@ -775,5 +918,23 @@ if __name__ == "__main__":
   tasks = load_tasks()
   ep = build_agent_prompt(strip_answer_hint(tasks[0].prompt, tasks[0].answer))
   assert ep.startswith(CODE_AGENT_SYSTEM_PROMPT)
+
+  # pass@k unbiased estimator: monotone non-decreasing in m, exact at the corners.
+  pk = PassKResult(
+      rows=[
+          PassKTaskRow("a", 5, n_correct=0, k=8),   # never solved
+          PassKTaskRow("b", 5, n_correct=8, k=8),   # always solved
+          PassKTaskRow("c", 5, n_correct=1, k=8),   # rare-but-present (the RL regime)
+      ],
+      k=8,
+      temperature=1.0,
+  )
+  assert abs(pk.pass_at(1) - (0.0 + 1.0 + 1 / 8) / 3) < 1e-9, pk.pass_at(1)
+  assert abs(pk.pass_at(8) - (0.0 + 1.0 + 1.0) / 3) < 1e-9, pk.pass_at(8)
+  assert pk.pass_at(1) <= pk.pass_at(2) <= pk.pass_at(4) <= pk.pass_at(8)
+  # Task "c" is the headline gap: solvable, but a single sample rarely lands it.
+  assert PassKResult._pass_at_m_one(8, 1, 1) == 0.125
+  assert PassKResult._pass_at_m_one(8, 1, 8) == 1.0
+  assert "pass@1=" in pk.summary() and "tier 5" in pk.summary()
 
   print("coding_agent_env self-check OK")

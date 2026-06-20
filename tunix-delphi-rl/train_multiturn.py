@@ -54,11 +54,13 @@ from agentic_tools import install_per_call_rollout_seed
 from coding_agent_env import (
     CODE_AGENT_SYSTEM_PROMPT,
     MultiTurnEvalResult,
+    PassKResult,
     CodeRunEnvironment,
     RunCodeAgent,
     build_code_agent_dataset,
     code_agent_metric_fn,
     code_agent_segments,
+    evaluate_passk,
     evaluate_tasks_multiturn,
     program_terminal_eos_tokens,
 )
@@ -76,6 +78,8 @@ class MultiTurnTrainResult:
   steps_ran: int
   eval_after_sft: MultiTurnEvalResult | None
   eval_after_rl: MultiTurnEvalResult | None
+  passk_after_sft: PassKResult | None = None
+  passk_after_rl: PassKResult | None = None
 
 
 class _MultiTurnMetricsCapture:
@@ -163,6 +167,21 @@ def _eval(actor, tokenizer, tasks, *, max_rounds, max_new_tokens, max_prompt_len
   return result
 
 
+def _passk(actor, tokenizer, tasks, *, k, temperature, max_new_tokens, max_prompt_length, mesh, label):
+  result = evaluate_passk(
+      actor,
+      tokenizer,
+      tasks,
+      k=k,
+      temperature=temperature,
+      max_new_tokens=max_new_tokens,
+      max_prompt_length=max_prompt_length,
+      mesh=mesh,
+  )
+  print(f"[mt-coding] PASS@K {label}: {result.summary()}", flush=True)
+  return result
+
+
 def train_multiturn(
     *,
     model_dir: str,
@@ -186,6 +205,8 @@ def train_multiturn(
     eval_max_new_tokens: int = 192,
     eval_tiers: tuple[int, ...] | None = None,
     do_eval: bool = True,
+    passk: int = 0,
+    passk_temperature: float = 1.0,
     mesh: jax.sharding.Mesh | None = None,
 ) -> MultiTurnTrainResult:
   """Runs the Delphi multi-turn coding SFT warm-up + Dr.GRPO RL and evaluates.
@@ -262,6 +283,21 @@ def train_multiturn(
         label="after-sft" if sft_steps > 0 else "few-shot",
     )
 
+  passk_label = "after-sft" if sft_steps > 0 else "few-shot"
+  passk_after_sft = None
+  if passk > 0:
+    passk_after_sft = _passk(
+        actor,
+        tokenizer,
+        eval_task_list,
+        k=passk,
+        temperature=passk_temperature,
+        max_new_tokens=eval_max_new_tokens,
+        max_prompt_length=max_prompt_length,
+        mesh=mesh,
+        label=passk_label,
+    )
+
   if steps <= 0:
     return MultiTurnTrainResult(
         solve_ratio_history=[],
@@ -270,6 +306,8 @@ def train_multiturn(
         steps_ran=0,
         eval_after_sft=eval_after_sft,
         eval_after_rl=None,
+        passk_after_sft=passk_after_sft,
+        passk_after_rl=None,
     )
 
   # Stage 3: Dr.GRPO RL on the multi-turn rollout. Per-turn END stop (multi-line
@@ -373,6 +411,20 @@ def train_multiturn(
         label="after-rl",
     )
 
+  passk_after_rl = None
+  if passk > 0:
+    passk_after_rl = _passk(
+        rl_cluster.actor_trainer.model,
+        tokenizer,
+        eval_task_list,
+        k=passk,
+        temperature=passk_temperature,
+        max_new_tokens=eval_max_new_tokens,
+        max_prompt_length=max_prompt_length,
+        mesh=mesh,
+        label="after-rl",
+    )
+
   return MultiTurnTrainResult(
       solve_ratio_history=capture.solve_ratio_history,
       first_solve_history=capture.first_solve_history,
@@ -380,4 +432,6 @@ def train_multiturn(
       steps_ran=len(capture.reward_history),
       eval_after_sft=eval_after_sft,
       eval_after_rl=eval_after_rl,
+      passk_after_sft=passk_after_sft,
+      passk_after_rl=passk_after_rl,
   )
