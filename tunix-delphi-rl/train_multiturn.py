@@ -61,6 +61,7 @@ from coding_agent_env import (
     code_agent_metric_fn,
     code_agent_segments,
     evaluate_passk,
+    evaluate_repair_passk,
     evaluate_tasks_multiturn,
     program_terminal_eos_tokens,
 )
@@ -80,6 +81,7 @@ class MultiTurnTrainResult:
   eval_after_rl: MultiTurnEvalResult | None
   passk_after_sft: PassKResult | None = None
   passk_after_rl: PassKResult | None = None
+  repair_passk: tuple[PassKResult, PassKResult] | None = None
 
 
 class _MultiTurnMetricsCapture:
@@ -207,6 +209,7 @@ def train_multiturn(
     do_eval: bool = True,
     passk: int = 0,
     passk_temperature: float = 1.0,
+    repair_passk: int = 0,
     mesh: jax.sharding.Mesh | None = None,
 ) -> MultiTurnTrainResult:
   """Runs the Delphi multi-turn coding SFT warm-up + Dr.GRPO RL and evaluates.
@@ -298,6 +301,23 @@ def train_multiturn(
         label=passk_label,
     )
 
+  repair_passk_result = None
+  if repair_passk > 0:
+    synth_pk, repair_pk = evaluate_repair_passk(
+        actor,
+        tokenizer,
+        tiers=eval_tiers,
+        k=repair_passk,
+        temperature=passk_temperature,
+        max_new_tokens=eval_max_new_tokens,
+        max_prompt_length=max_prompt_length,
+        mesh=mesh,
+        seed=seed,
+    )
+    print(f"[mt-coding] REPAIR-PASSK synth : {synth_pk.summary()}", flush=True)
+    print(f"[mt-coding] REPAIR-PASSK repair: {repair_pk.summary()}", flush=True)
+    repair_passk_result = (synth_pk, repair_pk)
+
   if steps <= 0:
     return MultiTurnTrainResult(
         solve_ratio_history=[],
@@ -308,6 +328,7 @@ def train_multiturn(
         eval_after_rl=None,
         passk_after_sft=passk_after_sft,
         passk_after_rl=None,
+        repair_passk=repair_passk_result,
     )
 
   # Stage 3: Dr.GRPO RL on the multi-turn rollout. Per-turn END stop (multi-line
@@ -434,4 +455,5 @@ def train_multiturn(
       eval_after_rl=eval_after_rl,
       passk_after_sft=passk_after_sft,
       passk_after_rl=passk_after_rl,
+      repair_passk=repair_passk_result,
   )

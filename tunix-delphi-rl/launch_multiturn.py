@@ -109,6 +109,7 @@ def main() -> None:
   eval_tokens = int(os.environ.get("MT_EVAL_TOKENS", "192"))
   passk = int(os.environ.get("MT_PASSK", "0"))
   passk_temp = float(os.environ.get("MT_PASSK_TEMP", "1.0"))
+  repair_passk = int(os.environ.get("MT_REPAIR_PASSK", "0"))
   seed = int(os.environ.get("MT_SEED", "0"))
   model_dir = os.environ.get("DELPHI_MODEL_DIR", "./delphi")
 
@@ -118,7 +119,8 @@ def main() -> None:
       f"steps={steps} sft_steps={sft_steps} sft_fix_prob={sft_fix_prob} "
       f"lr={learning_rate} sft_lr={sft_lr} num_generations={num_generations} "
       f"batch_size={batch_size} temp={temperature} max_prompt={max_prompt} "
-      f"max_response={max_response} passk={passk} passk_temp={passk_temp}",
+      f"max_response={max_response} passk={passk} passk_temp={passk_temp} "
+      f"repair_passk={repair_passk}",
       flush=True,
   )
 
@@ -144,6 +146,7 @@ def main() -> None:
       eval_max_new_tokens=eval_tokens,
       passk=passk,
       passk_temperature=passk_temp,
+      repair_passk=repair_passk,
   )
 
   for i in range(result.steps_ran):

@@ -844,6 +844,113 @@ def evaluate_passk(
   return PassKResult(rows=rows, k=k, temperature=temperature)
 
 
+def evaluate_repair_passk(
+    model,
+    tokenizer,
+    *,
+    tiers: Tuple[int, ...],
+    n_tasks: int = 24,
+    k: int = 16,
+    max_new_tokens: int = 192,
+    max_prompt_length: int = 1280,
+    temperature: float = 1.0,
+    cache_size: int | None = None,
+    mesh=None,
+    seed: int = 0,
+) -> Tuple["PassKResult", "PassKResult"]:
+  """Repair vs synthesis pass@k on the SAME instances (issue #8 / RL_HEADROOM.md R5).
+
+  Synthesis-from-scratch hits the empty-program wall held-out (pass@k ~= pass@1).
+  Repair scaffolds the model PAST that wall: it is shown a nearly-correct buggy
+  program + its wrong output and must emit a fix -- the feedback-conditioned
+  "which edit for which error" behavior that is closest to the CALC tool-result
+  copy (issue #5), the one place RL was essential. The question is whether that
+  scaffold unlocks ability the from-scratch policy cannot sample, and whether
+  fixing is rare-but-present (repair pass@1 << repair pass@k) -- the only signature
+  that would give Dr.GRPO a gradient on this model. We measure BOTH on the same
+  sampled family instances so the comparison is within-instance.
+
+  Returns ``(synth, repair)`` :class:`PassKResult`. The repair prompt is exactly
+  round-2 of the rollout with round-1 seeded by the GIVEN buggy program (via
+  :func:`_build_round_prompt`), so it matches the multi-turn fix format the model
+  saw in SFT/few-shot.
+  """
+  import contextlib
+
+  from tunix.generate import sampler as sampler_lib
+
+  rng = random.Random(seed)
+  insts: List[Tuple[str, str, str, str]] = []  # (clean_prompt, gold, buggy_src, feedback)
+  attempts = 0
+  while len(insts) < n_tasks and attempts < n_tasks * 50:
+    attempts += 1
+    prompt, solution, gold = sample_task(rng, tiers)
+    bug = _mutate_to_bug(rng, solution, gold)
+    if bug is None:
+      continue
+    insts.append((strip_answer_hint(prompt, gold), gold, bug[0], bug[1]))
+
+  if cache_size is None:
+    cache_size = max_prompt_length + max_new_tokens + 16
+  cache_config = sampler_lib.CacheConfig(
+      cache_size=cache_size,
+      num_layers=model.config.num_layers,
+      num_kv_heads=model.config.num_kv_heads,
+      head_dim=model.config.head_dim,
+  )
+  sampler = sampler_lib.Sampler(
+      transformer=model, tokenizer=tokenizer, cache_config=cache_config
+  )
+  eos_tokens = sorted(set([DELPHI_EOS_ID]) | set(program_terminal_eos_tokens(tokenizer)))
+
+  golds = [g for (_p, g, _b, _f) in insts]
+  synth_prompts = [build_agent_prompt(p) for (p, _g, _b, _f) in insts]
+  repair_prompts = [
+      _build_round_prompt(CODE_AGENT_SYSTEM_PROMPT, p, [(b, f)])
+      for (p, _g, b, f) in insts
+  ]
+  synth_correct = [0] * len(insts)
+  repair_correct = [0] * len(insts)
+
+  def _sample(prompts: List[str], draw_seed: int) -> List[str]:
+    texts: List[str] = []
+    chunk = 16
+    for s in range(0, len(prompts), chunk):
+      out = sampler(
+          input_strings=prompts[s : s + chunk],
+          max_generation_steps=max_new_tokens,
+          max_prompt_length=cache_size - max_new_tokens - 4,
+          echo=False,
+          eos_tokens=eos_tokens,
+          temperature=temperature,
+          seed=draw_seed,
+      )
+      texts.extend(out.text)
+    return texts
+
+  ctx = mesh if mesh is not None else contextlib.nullcontext()
+  with ctx:
+    for draw in range(k):
+      for prompts, counts in ((synth_prompts, synth_correct), (repair_prompts, repair_correct)):
+        for i, completion in enumerate(_sample(prompts, seed + draw)):
+          result = micropython.run(extract_program(completion), max_steps=_EVAL_MAX_STEPS)
+          if result.ok and result.stdout == golds[i]:
+            counts[i] += 1
+
+  tier = tiers[-1] if tiers else 0
+  synth = PassKResult(
+      rows=[PassKTaskRow(f"synth_{i}", tier, synth_correct[i], k) for i in range(len(insts))],
+      k=k,
+      temperature=temperature,
+  )
+  repair = PassKResult(
+      rows=[PassKTaskRow(f"repair_{i}", tier, repair_correct[i], k) for i in range(len(insts))],
+      k=k,
+      temperature=temperature,
+  )
+  return synth, repair
+
+
 if __name__ == "__main__":
   # Dependency-light CPU self-check (no TPU): parser, env grading over rounds,
   # the SFT segments, and the round-prompt builder.
