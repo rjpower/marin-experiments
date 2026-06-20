@@ -358,7 +358,8 @@ def evaluate_problems_passk(
             echo=False,
             eos_tokens=eos_tokens,
             temperature=temperature,
-            seed=seed + draw,
+            top_p=1.0,  # REQUIRED: without top_p the tunix Sampler decodes GREEDILY
+            seed=seed + draw,  # (ignoring temperature/seed) -> every draw identical -> pass@1==pass@k artifact
         )
         texts.extend(out.text)
       for i, completion in enumerate(texts):

@@ -829,6 +829,7 @@ def evaluate_passk(
             echo=False,
             eos_tokens=eos_tokens,
             temperature=temperature,
+            top_p=1.0,  # without top_p the tunix Sampler is GREEDY (ignores temp/seed)
             seed=seed + draw,
         )
         texts.extend(out.text)
@@ -923,6 +924,7 @@ def evaluate_repair_passk(
           echo=False,
           eos_tokens=eos_tokens,
           temperature=temperature,
+          top_p=1.0,  # without top_p the tunix Sampler is GREEDY (ignores temp/seed)
           seed=draw_seed,
       )
       texts.extend(out.text)
