@@ -19,6 +19,7 @@ experiment README and ``MoEMLP._adaptive_gate``.
 """
 
 import dataclasses
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -373,6 +374,13 @@ def _summarize_router_metrics(router_metrics: dict[str, jax.Array]) -> dict[str,
     return out
 
 
+# wandb caps a histogram at 512 buckets; with a large expert pool (e.g. E=1024) the raw
+# per-expert load histogram overflows and the whole log update is dropped. Coarsen to at
+# most this many contiguous bins so the load diagnostic still logs (scalar stats below are
+# always computed over the full pool, so min/max/mean/rms are unaffected).
+_MAX_HIST_BUCKETS = 256
+
+
 def _histogram_from_expert_counts(expert_counts: jax.Array) -> SummaryStats:
     counts = jnp.asarray(expert_counts, dtype=jnp.float32)
     num_experts = counts.shape[0]
@@ -385,8 +393,17 @@ def _histogram_from_expert_counts(expert_counts: jax.Array) -> SummaryStats:
     max_value = jnp.where(nonzero, expert_ids, -jnp.inf).max()
     min_value = jnp.where(num > 0, min_value, 0.0)
     max_value = jnp.where(num > 0, max_value, 0.0)
-    bucket_limits = jnp.arange(num_experts + 1, dtype=jnp.float32)
-    histogram = Histogram(bucket_limits=bucket_limits, bucket_counts=counts)
+    if num_experts > _MAX_HIST_BUCKETS:
+        group = math.ceil(num_experts / _MAX_HIST_BUCKETS)
+        pad = (-num_experts) % group
+        hist_counts = jnp.concatenate([counts, jnp.zeros(pad, counts.dtype)]) if pad else counts
+        n_bins = hist_counts.shape[0] // group
+        hist_counts = hist_counts.reshape(n_bins, group).sum(axis=1)
+        bucket_limits = jnp.arange(n_bins + 1, dtype=jnp.float32) * group
+    else:
+        hist_counts = counts
+        bucket_limits = jnp.arange(num_experts + 1, dtype=jnp.float32)
+    histogram = Histogram(bucket_limits=bucket_limits, bucket_counts=hist_counts)
     return SummaryStats.from_reduced_values(
         min=min_value,
         max=max_value,
