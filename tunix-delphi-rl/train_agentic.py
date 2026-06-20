@@ -58,6 +58,7 @@ from tunix.rl.agentic.environments.tool_environment import ToolEnvironment
 from tunix.rl.rollout import base_rollout
 
 from agentic_common import DelphiRawTextChatParser
+from agentic_sft import run_sft_warmup
 from agentic_tools import (
     CalcToolEnvironment,
     DelphiToolAgent,
@@ -479,6 +480,9 @@ def train_agentic_t0(
     eval_every_n_steps: int = 10**9,
     use_rollout_logps: bool = False,
     stop_on_newline: bool = True,
+    sft_steps: int = 0,
+    sft_batch_size: int = 16,
+    sft_learning_rate: float = 1e-4,
     mesh: jax.sharding.Mesh | None = None,
 ) -> T0TrainResult:
   """Runs Delphi T0 single-calculator-call GRPO through the AGENTIC tool stack.
@@ -532,6 +536,12 @@ def train_agentic_t0(
       context-limit check discards it (empty completions, zero reward). The
       chat parser's ``generation_suffix="\\n"`` ensures the model emits content
       BEFORE the first newline (so the stop does not fire on an empty turn).
+    sft_steps: if > 0, run that many SUPERVISED warm-up steps on synthetic CALC
+      transcripts (via :func:`agentic_sft.run_sft_warmup`) on the same actor
+      before RL -- makes the answer-COPY in-distribution so GRPO can amplify it
+      (RL alone cannot bootstrap a behavior the base LM never samples). 0 skips.
+    sft_batch_size: transcripts per SFT step.
+    sft_learning_rate: AdamW lr for the SFT warm-up (clipped at global-norm 1.0).
     mesh: optional device mesh; defaults to a colocated ``(ndev, 1)`` mesh.
 
   Returns:
@@ -540,11 +550,38 @@ def train_agentic_t0(
   """
   tokenizer = load_tokenizer(model_dir)
 
-  actor = load_delphi(model_dir, dtype=jnp.float32)
-  reference = None if beta == 0.0 else load_delphi(model_dir, dtype=jnp.bfloat16)
-
   if mesh is None:
     mesh = _build_mesh()
+
+  # When an SFT warm-up will run, the actor must be FSDP-sharded across the mesh
+  # BEFORE SFT: PeftTrainer shards the optimizer state to the full mesh, and an
+  # unsharded device-0 model trips "Received incompatible devices ... [0] vs
+  # [0,1,2,3]". load_delphi shards at load time when given the mesh. The RL-only
+  # path keeps loading unsharded (RLCluster reshards internally), unchanged.
+  load_mesh = mesh if sft_steps > 0 else None
+  actor = load_delphi(model_dir, dtype=jnp.float32, mesh=load_mesh)
+  reference = (
+      None
+      if beta == 0.0
+      else load_delphi(model_dir, dtype=jnp.bfloat16, mesh=load_mesh)
+  )
+
+  # Optional SFT warm-up (in-memory, same actor object). T0 RL masters the tool
+  # CALL + operands but cannot bootstrap the final-answer COPY -- copying the
+  # injected tool result is OOD for the base LM, so it is sampled too rarely for
+  # GRPO to amplify (solve_ratio peaks ~0.1 then collapses). A few hundred SFT
+  # steps on clean CALC transcripts put call+copy in-distribution; the warmed
+  # actor flows straight into the RLCluster below. See agentic_sft.
+  if sft_steps > 0:
+    actor = run_sft_warmup(
+        actor,
+        tokenizer,
+        steps=sft_steps,
+        batch_size=sft_batch_size,
+        learning_rate=sft_learning_rate,
+        mesh=mesh,
+        seed=seed,
+    )
 
   # Robust newline-stop: a base LM never emits real EOS, so each single-line
   # turn must stop at its newline. The Llama-3 BPE FUSES a newline with the

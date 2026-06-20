@@ -22,6 +22,8 @@ Run config is read from env vars so the coordinator can size the TPU run:
   * ``DELPHI_BATCH_SIZE`` (default 8)
   * ``DELPHI_LR`` (default 1e-5)
   * ``DELPHI_USE_ROLLOUT_LOGPS`` (default 0; set 1 to log the logp_diff canary)
+  * ``DELPHI_SFT_STEPS`` (default 0; ``t0`` only -- supervised CALC-transcript
+    warm-up steps before RL, to make the answer-copy in-distribution)
   * ``DELPHI_MODEL_DIR`` (default ``./delphi`` on the worker)
 
 Submit on a single-host TPU (the coordinator submits; do NOT submit from here):
@@ -112,7 +114,7 @@ def _run_port(*, model_dir, steps, stage, num_generations, batch_size,
 
 
 def _run_t0(*, model_dir, steps, num_generations, batch_size,
-            learning_rate, use_rollout_logps) -> None:
+            learning_rate, use_rollout_logps, sft_steps) -> None:
   """Runs and reports the single-calculator-call T0 tool path."""
   result = train_agentic_t0(
       model_dir=model_dir,
@@ -121,6 +123,7 @@ def _run_t0(*, model_dir, steps, num_generations, batch_size,
       batch_size=batch_size,
       learning_rate=learning_rate,
       use_rollout_logps=use_rollout_logps,
+      sft_steps=sft_steps,
   )
 
   if not result.reward_history:
@@ -158,6 +161,7 @@ def main() -> None:
   batch_size = int(os.environ.get("DELPHI_BATCH_SIZE", "8"))
   learning_rate = float(os.environ.get("DELPHI_LR", "1e-5"))
   use_rollout_logps = os.environ.get("DELPHI_USE_ROLLOUT_LOGPS", "0") == "1"
+  sft_steps = int(os.environ.get("DELPHI_SFT_STEPS", "0"))
   model_dir = os.environ.get("DELPHI_MODEL_DIR", "./delphi")
 
   if mode not in ("port", "t0"):
@@ -170,7 +174,8 @@ def main() -> None:
   print(
       f"[launch] mode={mode} steps={steps} stage={stage} "
       f"num_generations={num_generations} batch_size={batch_size} "
-      f"lr={learning_rate} use_rollout_logps={use_rollout_logps}",
+      f"lr={learning_rate} use_rollout_logps={use_rollout_logps} "
+      f"sft_steps={sft_steps}",
       flush=True,
   )
 
@@ -195,6 +200,7 @@ def main() -> None:
         batch_size=batch_size,
         learning_rate=learning_rate,
         use_rollout_logps=use_rollout_logps,
+        sft_steps=sft_steps,
     )
 
 
