@@ -13,7 +13,7 @@ Weaver issue #229 · 2026-06-19 · Author: weaver agent run
 1. **It installs and runs** — `google-tunix` + `marin-iris`/`marin-fray` resolve in one `uv` venv (164 packages, no `marin-levanter`), and a tunix GRPO job runs on an iris worker that `uv sync`s the experiment's own lock.
 2. **A marin model loads natively** — the target model **Delphi** turned out to be a stock **Qwen3**, so it loads into tunix's native `flax.nnx` Qwen3 with **exact HF-logit parity** (top-1 100%, logit MSE 7e-12) after one rope fix. **No equinox→nnx bridge was needed.**
 3. **The RL loop learns on TPU, up to basic algebra** — a toy GRPO task learns end-to-end on both a CPU and a **v6e-4 TPU** iris job; then **Delphi learned single-digit addition (6% → ~65% solve rate in ~4 min on v6e-4)** and, the stretch goal, **basic linear algebra — `solve for x: a·x+b=c` — from 4.7% to ~37%**, with no calculator tool, under a plain exact-match reward.
-4. **And genuine *agentic tool use* works too (follow-on, issue #5)** — on tunix's agentic stack, Delphi learns to **call an external calculator and chain it**: single call (T0) and two-deep chained calls (T1, where one tool's output is the next tool's argument) both reach **100% solve** on `v6e-4`. The enabler is a distribution-matched SFT warm-up; RL alone provably cannot bootstrap the result-copy. See **§9**.
+4. **And genuine *agentic tool use* works too (follow-on, issue #5)** — on tunix's agentic stack, Delphi learns to **call an external calculator and chain it**: single (T0), two-deep (T1), and **three-deep chained calls (T2)** — where each tool's output is the next tool's argument — all reach **~100% solve** on `v6e-4`. The enabler is a distribution-matched SFT warm-up; RL alone provably cannot bootstrap the result-copy. See **§9**.
 
 The headline engineering finding: **the hard part the task anticipated (grug has no generate/KV-cache path, the "RL-rollout gap") did not need to be solved by hand.** Delphi is a Qwen3 on disk, and tunix already ships a complete native Qwen3 with a working KV-cache sampler and an HF-safetensors loader. The integration collapsed from "port an equinox model into a new framework" (weeks) to "a config + a one-line-class bug fix + a calculator environment" (days).
 
@@ -179,7 +179,7 @@ A custom `CalcTextToolParser` exposes a **`CALC(a * b)`** tool surface (not tuni
 |---|---|---|---|---|
 | **T0** | `a * b` (2-digit) | 1 | emit one grounded `CALC`, copy the result | **solve 1.0**, arg_acc 1.0, tool_call_rate 1.0 (held to step 149) |
 | **T1** | `a * b * c` | 2 chained | **copy a tool OUTPUT into the next call's ARGS** | **solve 1.0**, arg_acc 1.0, tool_call_rate 1.0 (robust at SFT=150 *and* 250) |
-| **T2** | `a * b * c * d` | 3 chained | a deeper chain — two ~6-digit intermediate copies forward | *(validation in progress; see §9.4)* |
+| **T2** | `a * b * c * d` | 3 chained | a deeper chain — two ~6-digit intermediate copies forward | **solve 1.0** (SFT=250, sustained to step 98), ~0.97–0.98 (SFT=150); arg_acc 1.0, tool_call_rate 1.0 |
 
 All on one `v6e-4`, minutes per stage. T0 → a6e67dc, T1 → d1c4c2f, T2 → c820a73.
 
@@ -196,11 +196,11 @@ Plain GRPO on T0 drove the tool **call** to near-perfect (`arg_acc` → 0.99) bu
 
 ### 9.4 The recipe, and what it proves
 
-The robust recipe across all stages: **prefix-aligned SFT warm-up (~150 transcripts, gradient-clipped) → gradient-clipped GRPO** on tunix's agentic learner, all on the same in-memory actor. With it, a 447M base model does **single (T0) and two-deep chained (T1) tool use at 100% solve**, where the chaining is genuine — turn *N+1* consumes turn *N*'s tool output as an argument. The binding constraint is never the RL or the iris/TPU plumbing (both work unchanged from the arithmetic runs); it is the **base LM's format/copy priors**, and prefix-aligned SFT is exactly the lever that fixes them.
+The robust recipe across all stages: **prefix-aligned SFT warm-up (~150–250 transcripts, gradient-clipped) → gradient-clipped GRPO** on tunix's agentic learner, all on the same in-memory actor. With it, a 447M base model does **single (T0), two-deep (T1), and three-deep chained (T2) tool use at ~100% solve**, where the chaining is genuine — turn *N+1* consumes turn *N*'s tool output as an argument. The binding constraint is never the RL or the iris/TPU plumbing (both work unchanged from the arithmetic runs); it is the **base LM's format/copy priors**, and prefix-aligned SFT is exactly the lever that fixes them.
 
-> **T2 status.** The three-call extension (`a*b*c*d`, `env_max_steps=4`) is a pure config-level addition on the same framework (`t2_segments` + `T2_SYSTEM_PROMPT` + `build_t2_dataset`); TPU validation is running at the time of writing. *(Result to be filled: `solve_ratio`, sustained-or-not.)*
+**T2 confirmed the recipe generalizes with depth.** The three-call extension (`a*b*c*d`, `env_max_steps=4`) was a pure config-level addition on the same framework (`t2_segments` + `T2_SYSTEM_PROMPT` + `build_t2_dataset`, ~30 LOC). It reached `solve_ratio` **1.0 (SFT=250, sustained ~100 steps)** / ~0.97–0.98 (SFT=150) with `tool_call_rate` and `arg_acc` at 1.0 — i.e. a small base model reliably executing a *three-step* tool plan and threading two intermediate (~6-digit) results forward. The only depth cost observed is the slightly higher SFT budget and a small residual error rate at the lighter warm-up, both consistent with copies of longer numbers being marginally harder.
 
-**Verdict for the follow-on: yes — tunix's agentic stack runs on iris and a small marin base model learns real multi-step tool use, given a distribution-matched SFT warm-up.** Reproduce a stage with `DELPHI_AGENT_MODE={t0,t1,t2}` + `DELPHI_SFT_STEPS=150` (see `launch_agentic.py`).
+**Verdict for the follow-on: yes — tunix's agentic stack runs on iris and a small marin base model learns real multi-step (up to 3-deep) tool use, given a distribution-matched SFT warm-up.** Reproduce a stage with `DELPHI_AGENT_MODE={t0,t1,t2}` + `DELPHI_SFT_STEPS={150,250}` (see `launch_agentic.py`).
 
 ---
 
