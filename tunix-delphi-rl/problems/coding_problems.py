@@ -15,11 +15,16 @@ which is exactly the gradient the old binary reward starved.
 
 The pieces:
 
-  * :class:`Problem` -- one graded instance: an ``id``, a ``level`` (1..6), a
+  * :class:`Problem` -- one graded instance: an ``id``, a ``level`` (1..9), a
     ``family`` key, a human ``prompt``, a small set of ``public_tests`` shown to
     the agent, and a larger set of graded ``hidden_tests``.
   * The **leveled families** -- procedurally parameterised ``solve`` tasks of
-    increasing composition depth (3-4 per level, 6 levels). Each family ships a
+    increasing composition depth (3-4 per level, 9 levels). Levels 7-9 are the
+    multi-stage (compositional) families: each ``solve`` computes an intermediate
+    result (primes <= n, a deduped/sorted set, per-word counts, a factorial, a
+    parsed expression, a Collatz trajectory) and then reduces or transforms it,
+    so an unreliable first attempt tends to be partially right (a non-trivial
+    pass@k > pass@1 gap for RL to sharpen). Each family ships a
     ``reference`` (a correct ``def solve(...)`` program *valid under
     micropython*) and a ``gen(rng)`` instance generator that produces varied
     inputs including edge cases (empty list, ``n=0/1``, negatives, duplicates,
@@ -62,7 +67,7 @@ from typing import Callable
 
 import environments.micropython as micropython
 
-NUM_LEVELS = 6
+NUM_LEVELS = 9
 
 # Step budget for grading a single test execution. The heaviest references are
 # the L6 nth-prime / collatz searches, which take ~2000 AST steps on the largest
@@ -141,7 +146,8 @@ class _Family:
 
 
 # ---------------------------------------------------------------------------
-# The leveled families (3-4 per level, 6 levels of increasing depth).
+# The leveled families (3-4 per level, 9 levels of increasing depth; levels 7-9
+# are the multi-stage / compositional families).
 #
 # Each ``reference`` was verified to run cleanly under micropython (see the
 # module docstring / the CPU self-check below). Generators deliberately include
@@ -543,6 +549,311 @@ _FAMILIES: list[_Family] = [
         ),
         gen=lambda rng: (_rand_palindrome_candidate(rng),),
     ),
+    # --- Level 7: multi-stage (compositional) -----------------------------
+    # Two clearly separate stages: produce an intermediate (primes / distinct
+    # set / per-word counts / a factorial) and then reduce or transform it.
+    _Family(
+        key="l7_sum_primes",
+        level=7,
+        signature="solve(n)",
+        description=(
+            "Return the sum of all prime numbers that are <= n "
+            "(so solve(10) is 2+3+5+7 = 17; return 0 when n < 2)."
+        ),
+        # Stage 1: test each m in 2..n for primality. Stage 2: accumulate the sum.
+        reference=(
+            "def solve(n):\n"
+            "  total = 0\n"
+            "  m = 2\n"
+            "  while m <= n:\n"
+            "    is_p = True\n"
+            "    d = 2\n"
+            "    while d * d <= m:\n"
+            "      if m % d == 0:\n"
+            "        is_p = False\n"
+            "        break\n"
+            "      d += 1\n"
+            "    if is_p:\n"
+            "      total += m\n"
+            "    m += 1\n"
+            "  return total"
+        ),
+        # Bias toward n>=5 (and seed 2,3) so a constant 0 fails the hidden tests.
+        gen=lambda rng: (
+            rng.choice([2, 3, rng.randint(5, 60), rng.randint(5, 60), rng.randint(5, 60)]),
+        ),
+    ),
+    _Family(
+        key="l7_second_distinct_sq",
+        level=7,
+        signature="solve(xs)",
+        description=(
+            "From the list xs, find the second-largest DISTINCT value (ignore "
+            "duplicates), and return its square. xs has at least two distinct "
+            "values."
+        ),
+        # Stage 1: dedupe (preserving membership). Stage 2: sort. Stage 3: pick the
+        # second-from-top distinct value. Stage 4: square it.
+        reference=(
+            "def solve(xs):\n"
+            "  uniq = []\n"
+            "  for x in xs:\n"
+            "    if x not in uniq:\n"
+            "      uniq.append(x)\n"
+            "  uniq = sorted(uniq)\n"
+            "  v = uniq[-2]\n"
+            "  return v * v"
+        ),
+        gen=lambda rng: (_rand_dedup_list(rng, -9, 9),),
+    ),
+    _Family(
+        key="l7_most_vowels_word",
+        level=7,
+        signature="solve(s)",
+        description=(
+            "Split the space-separated sentence s into words, count the vowels "
+            "(a, e, i, o, u) in each word, and return the word with the most "
+            "vowels. On a tie, return the word that appears first."
+        ),
+        # Stage 1: split into words. Stage 2: per-word vowel count. Stage 3: argmax.
+        reference=(
+            "def solve(s):\n"
+            "  words = s.split(' ')\n"
+            "  best = words[0]\n"
+            "  best_c = -1\n"
+            "  for w in words:\n"
+            "    c = 0\n"
+            "    for ch in w:\n"
+            "      if ch in 'aeiou':\n"
+            "        c += 1\n"
+            "    if c > best_c:\n"
+            "      best_c = c\n"
+            "      best = w\n"
+            "  return best"
+        ),
+        gen=lambda rng: (_rand_vowel_sentence(rng),),
+    ),
+    _Family(
+        key="l7_fact_digit_sum",
+        level=7,
+        signature="solve(n)",
+        description=(
+            "Return the sum of the decimal digits of n factorial "
+            "(compute n! = 1*2*...*n, then add up its digits; 0! is 1)."
+        ),
+        # Stage 1: compute the factorial. Stage 2: digit-sum that (large) integer.
+        reference=(
+            "def solve(n):\n"
+            "  p = 1\n"
+            "  for i in range(1, n + 1):\n"
+            "    p *= i\n"
+            "  total = 0\n"
+            "  while p > 0:\n"
+            "    total += p % 10\n"
+            "    p //= 10\n"
+            "  return total"
+        ),
+        gen=lambda rng: (rng.choice([0, 1, rng.randint(2, 12)]),),
+    ),
+    # --- Level 8: deeper composition / light parsing ----------------------
+    _Family(
+        key="l8_rle_reversed",
+        level=8,
+        signature="solve(xs)",
+        description=(
+            "Run-length encode the list xs into a flat list [value, count, "
+            "value, count, ...] (one pair per maximal run of equal values), then "
+            "return that encoded list reversed. E.g. [4,4,2] -> encode [4,2,2,1] "
+            "-> reversed [1,2,2,4]."
+        ),
+        # Stage 1: run-length encode into a flat [v,k,v,k,...] list. Stage 2: reverse it.
+        reference=(
+            "def solve(xs):\n"
+            "  enc = []\n"
+            "  i = 0\n"
+            "  n = len(xs)\n"
+            "  while i < n:\n"
+            "    v = xs[i]\n"
+            "    k = 0\n"
+            "    while i < n and xs[i] == v:\n"
+            "      k += 1\n"
+            "      i += 1\n"
+            "    enc.append(v)\n"
+            "    enc.append(k)\n"
+            "  return enc[::-1]"
+        ),
+        gen=lambda rng: (_rand_run_list(rng),),
+    ),
+    _Family(
+        key="l8_top2_digitcount",
+        level=8,
+        signature="solve(xs)",
+        description=(
+            "Add together the two largest DISTINCT values of xs (ignore "
+            "duplicates), then return how many decimal digits that sum has. xs "
+            "has at least two distinct positive values."
+        ),
+        # Stage 1: dedupe. Stage 2: sort + add the top two. Stage 3: count digits.
+        reference=(
+            "def solve(xs):\n"
+            "  uniq = []\n"
+            "  for x in xs:\n"
+            "    if x not in uniq:\n"
+            "      uniq.append(x)\n"
+            "  uniq = sorted(uniq)\n"
+            "  total = uniq[-1] + uniq[-2]\n"
+            "  if total < 0:\n"
+            "    total = -total\n"
+            "  if total == 0:\n"
+            "    return 1\n"
+            "  c = 0\n"
+            "  while total > 0:\n"
+            "    c += 1\n"
+            "    total //= 10\n"
+            "  return c"
+        ),
+        gen=lambda rng: (_rand_dedup_list(rng, 1, 60),),
+    ),
+    _Family(
+        key="l8_eval_expr",
+        level=8,
+        signature="solve(s)",
+        description=(
+            "The string s is an arithmetic expression of the form 'a+b', 'a-b' "
+            "or 'a*b' where a and b are non-negative integers. Parse it and "
+            "return the integer result."
+        ),
+        # Stage 1: find the operator + parse the two integer operands. Stage 2:
+        # dispatch on the operator and compute.
+        reference=(
+            "def solve(s):\n"
+            "  for op in '+-*':\n"
+            "    i = s.find(op)\n"
+            "    if i > 0:\n"
+            "      a = int(s[:i])\n"
+            "      b = int(s[i+1:])\n"
+            "      if op == '+':\n"
+            "        return a + b\n"
+            "      if op == '-':\n"
+            "        return a - b\n"
+            "      return a * b\n"
+            "  return int(s)"
+        ),
+        gen=lambda rng: (_rand_arith_expr(rng),),
+    ),
+    _Family(
+        key="l8_collatz_max",
+        level=8,
+        signature="solve(n)",
+        description=(
+            "Run the Collatz process from the positive integer n (each step: "
+            "n -> n//2 if even, else n -> 3*n+1, stopping at 1) and return the "
+            "largest value reached anywhere along the way, including n itself."
+        ),
+        # Stage 1: generate the Collatz trajectory. Stage 2: track its running max.
+        reference=(
+            "def solve(n):\n"
+            "  best = n\n"
+            "  while n != 1:\n"
+            "    if n % 2 == 0:\n"
+            "      n //= 2\n"
+            "    else:\n"
+            "      n = 3 * n + 1\n"
+            "    if n > best:\n"
+            "      best = n\n"
+            "  return best"
+        ),
+        gen=lambda rng: (rng.choice([1, 2, rng.randint(3, 40)]),),
+    ),
+    # --- Level 9: hardest multi-stage -------------------------------------
+    _Family(
+        key="l9_prime_digitsum",
+        level=9,
+        signature="solve(n)",
+        description=(
+            "For every prime p with p <= n, compute the sum of p's decimal "
+            "digits, and return the total over all such primes (so for n=13 the "
+            "primes are 2,3,5,7,11,13 with digit sums 2,3,5,7,2,4 totalling 23). "
+            "Return 0 when n < 2."
+        ),
+        # Stage 1: enumerate primes <= n. Stage 2: per-prime digit sum. Stage 3:
+        # accumulate the grand total.
+        reference=(
+            "def solve(n):\n"
+            "  total = 0\n"
+            "  m = 2\n"
+            "  while m <= n:\n"
+            "    is_p = True\n"
+            "    d = 2\n"
+            "    while d * d <= m:\n"
+            "      if m % d == 0:\n"
+            "        is_p = False\n"
+            "        break\n"
+            "      d += 1\n"
+            "    if is_p:\n"
+            "      t = m\n"
+            "      while t > 0:\n"
+            "        total += t % 10\n"
+            "        t //= 10\n"
+            "    m += 1\n"
+            "  return total"
+        ),
+        # Bias toward n>=10 (and seed 2,3) so trivial constants fail.
+        gen=lambda rng: (
+            rng.choice([2, 3, rng.randint(10, 60), rng.randint(10, 60), rng.randint(10, 60)]),
+        ),
+    ),
+    _Family(
+        key="l9_top_scorer",
+        level=9,
+        signature="solve(s)",
+        description=(
+            "The string s holds space-separated 'name:score' entries (score is a "
+            "non-negative integer), e.g. 'amy:7 ben:3'. Parse them and return the "
+            "name with the highest score (the maximum score is unique)."
+        ),
+        # Stage 1: split into entries and parse each name:score pair. Stage 2:
+        # argmax over the parsed scores.
+        reference=(
+            "def solve(s):\n"
+            "  pairs = s.split(' ')\n"
+            "  best = ''\n"
+            "  best_score = -1\n"
+            "  for p in pairs:\n"
+            "    i = p.find(':')\n"
+            "    name = p[:i]\n"
+            "    score = int(p[i+1:])\n"
+            "    if score > best_score:\n"
+            "      best_score = score\n"
+            "      best = name\n"
+            "  return best"
+        ),
+        gen=lambda rng: (_rand_score_sentence(rng),),
+    ),
+    _Family(
+        key="l9_max_window3",
+        level=9,
+        signature="solve(xs)",
+        description=(
+            "Consider every window of 3 consecutive elements of xs, sum each "
+            "window, and return the largest window sum. xs has at least three "
+            "elements."
+        ),
+        # Stage 1: slide a width-3 window summing each. Stage 2: take the max sum.
+        reference=(
+            "def solve(xs):\n"
+            "  best = xs[0] + xs[1] + xs[2]\n"
+            "  i = 0\n"
+            "  n = len(xs)\n"
+            "  while i + 3 <= n:\n"
+            "    s = xs[i] + xs[i+1] + xs[i+2]\n"
+            "    if s > best:\n"
+            "      best = s\n"
+            "    i += 1\n"
+            "  return best"
+        ),
+        gen=lambda rng: (_rand_int_list(rng, 3, 8, -9, 9, allow_dups=True),),
+    ),
 ]
 
 _FAMILIES_BY_LEVEL: dict[int, list[_Family]] = {}
@@ -623,6 +934,75 @@ def _rand_palindrome_candidate(rng: random.Random) -> str:
     cut = rng.randint(1, len(full) - 1)
     full = full[:cut] + " " + full[cut:]
   return full
+
+
+# --- generators for the multi-stage levels 7-9 -------------------------------
+#
+# These deliberately bias away from the trivial small inputs (n<2, all-equal
+# lists) so the constant ``return 0`` / first-arg programs fail the hidden tests,
+# while still occasionally seeding the edge cases the references must handle.
+
+
+def _rand_dedup_list(rng: random.Random, lo_val: int, hi_val: int) -> list[int]:
+  """An int list of length 3-7 with >=2 distinct values and seeded duplicates.
+
+  Used by the "second-largest *distinct*" / "two-largest *distinct*" families,
+  where the dedupe stage only matters when the maximum is repeated -- so we force
+  a duplicate into the list ~60% of the time.
+  """
+  while True:
+    n = rng.randint(3, 7)
+    xs = [rng.randint(lo_val, hi_val) for _ in range(n)]
+    if rng.random() < 0.6:
+      src = rng.randrange(n)
+      dst = rng.randrange(n)
+      xs[dst] = xs[src]
+    if len(set(xs)) >= 2:
+      return xs
+
+
+def _rand_vowel_sentence(rng: random.Random) -> str:
+  """A space-separated sentence of random lowercase words (2-6 letters each)."""
+  n = rng.randint(2, 5)
+  return " ".join(_rand_word(rng, 2, 6) for _ in range(n))
+
+
+def _rand_run_list(rng: random.Random) -> list[int]:
+  """An int list built from a few runs of repeated values (for run-length encode)."""
+  out: list[int] = []
+  for _ in range(rng.randint(1, 4)):
+    v = rng.randint(0, 4)
+    out.extend([v] * rng.randint(1, 4))
+  return out
+
+
+def _rand_arith_expr(rng: random.Random) -> str:
+  """A string ``"a<op>b"`` with a single binary operator (op in ``+ - *``)."""
+  a = rng.randint(1, 99)
+  b = rng.randint(1, 99)
+  op = rng.choice(["+", "-", "*"])
+  return str(a) + op + str(b)
+
+
+def _rand_score_sentence(rng: random.Random) -> str:
+  """A ``"name:score name:score ..."`` string with a *unique* maximum score.
+
+  The unique max avoids tie ambiguity so the family has one well-defined answer.
+  """
+  n = rng.randint(2, 5)
+  names: list[str] = []
+  used: set = set()
+  while len(names) < n:
+    w = _rand_word(rng, 2, 4)
+    if w not in used:
+      used.add(w)
+      names.append(w)
+  while True:
+    scores = [rng.randint(0, 30) for _ in range(n)]
+    top = max(scores)
+    if scores.count(top) == 1:
+      break
+  return " ".join(names[i] + ":" + str(scores[i]) for i in range(n))
 
 
 # ---------------------------------------------------------------------------
