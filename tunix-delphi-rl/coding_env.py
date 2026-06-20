@@ -244,6 +244,10 @@ _PHRASES = (
     "Good morning", "I love Python", "red green blue", "open the door",
     "time to code", "keep it simple", "two plus two", "left and right",
     "up and down", "the answer", "make it work", "hello there friend",
+    # Mixed case + punctuation so exact-copy of capitalized/punctuated phrases is
+    # in distribution (no apostrophes -- they break the single-quoted literal).
+    "Hello there!", "Good Morning!", "Yes, indeed.", "Stop and go.",
+    "Up, up, away!", "Red, green, blue.", "Wow, nice!", "Keep going!",
 )
 
 _UPPERCASE = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -366,6 +370,15 @@ def _f3_count_lines(rng):
   return (
       f"Print the numbers 1 through {n} (inclusive), one per line.",
       f"for i in range(1, {n + 1}):\n  print(i)",
+  )
+
+
+def _f3_countdown(rng):
+  n = rng.randint(3, 9)
+  return (
+      f"Using a while loop, print the numbers {n}, {n - 1}, ..., 1 each on its "
+      "own line (counting down).",
+      f"n = {n}\nwhile n >= 1:\n  print(n)\n  n -= 1",
   )
 
 
@@ -642,6 +655,7 @@ FAMILIES: Tuple[Family, ...] = (
     Family("f2_grade", 2, _f2_grade),
     Family("f3_sum_to_n", 3, _f3_sum_to_n),
     Family("f3_count_lines", 3, _f3_count_lines),
+    Family("f3_countdown", 3, _f3_countdown),
     Family("f3_factorial_loop", 3, _f3_factorial_loop),
     Family("f3_sum_evens", 3, _f3_sum_evens),
     Family("f3_reverse", 3, _f3_reverse),
