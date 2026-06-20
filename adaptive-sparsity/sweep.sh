@@ -22,9 +22,12 @@ submit() {
   # submit <tag> <KEY VALUE>...
   local tag="$1"; shift
   echo ">>> submitting arm: $tag"
+  # max-retries 0: on a preemptible v6e a retry restarts the run and trips the
+  # MixtureDataset RESTART_STRATEGY empty-finite-dataset path; cleaner to let a
+  # preempted arm fail and re-submit it than to retry into that error.
   uv run iris --cluster=marin job run --no-wait \
     --tpu "$TPU" --enable-extra-resources --extra marin-core:tpu \
-    --max-retries 1 --cpu 32 --memory 128GB --disk 50GB \
+    --max-retries 0 --cpu 32 --memory 128GB --disk 50GB \
     -e WANDB_API_KEY "$WANDB_API_KEY" \
     -e SP_TPU "$TPU" -e SP_GROUP "$GROUP" "${STEPS_ENV[@]}" "$@" \
     -- python launch.py 2>&1 | grep -E 'Job submitted|Dashboard' || true
@@ -38,9 +41,10 @@ case "$MODE" in
     done
     ;;
   aggressive)
-    # Adaptive variable-k: K_max=8, K_min=0, sweep the sparsity penalty lambda.
-    # lambda=0 is the adaptive control (should track fixed K=8). Larger lambda -> sparser.
-    for C in 0 1 3 8 20; do
+    # Adaptive variable-k: K_max=8, K_min=0, sweep the sparsity penalty lambda over a
+    # wide geometric range to bracket where it bites. lambda=0 is the adaptive control
+    # (should track fixed K=8). Larger lambda -> sparser.
+    for C in 0 4 16 64 256; do
       submit "adapt-E128-k8-c$C" \
         -e SPARSITY_MODE adaptive -e SP_EXPERTS 128 -e SP_TOPK 8 -e SP_MIN_K 0 -e SP_COEF "$C"
     done
