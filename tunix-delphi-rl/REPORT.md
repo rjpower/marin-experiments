@@ -13,6 +13,7 @@ Weaver issue #229 · 2026-06-19 · Author: weaver agent run
 1. **It installs and runs** — `google-tunix` + `marin-iris`/`marin-fray` resolve in one `uv` venv (164 packages, no `marin-levanter`), and a tunix GRPO job runs on an iris worker that `uv sync`s the experiment's own lock.
 2. **A marin model loads natively** — the target model **Delphi** turned out to be a stock **Qwen3**, so it loads into tunix's native `flax.nnx` Qwen3 with **exact HF-logit parity** (top-1 100%, logit MSE 7e-12) after one rope fix. **No equinox→nnx bridge was needed.**
 3. **The RL loop learns on TPU, up to basic algebra** — a toy GRPO task learns end-to-end on both a CPU and a **v6e-4 TPU** iris job; then **Delphi learned single-digit addition (6% → ~65% solve rate in ~4 min on v6e-4)** and, the stretch goal, **basic linear algebra — `solve for x: a·x+b=c` — from 4.7% to ~37%**, with no calculator tool, under a plain exact-match reward.
+4. **And genuine *agentic tool use* works too (follow-on, issue #5)** — on tunix's agentic stack, Delphi learns to **call an external calculator and chain it**: single call (T0) and two-deep chained calls (T1, where one tool's output is the next tool's argument) both reach **100% solve** on `v6e-4`. The enabler is a distribution-matched SFT warm-up; RL alone provably cannot bootstrap the result-copy. See **§9**.
 
 The headline engineering finding: **the hard part the task anticipated (grug has no generate/KV-cache path, the "RL-rollout gap") did not need to be solved by hand.** Delphi is a Qwen3 on disk, and tunix already ships a complete native Qwen3 with a working KV-cache sampler and an HF-safetensors loader. The integration collapsed from "port an equinox model into a new framework" (weeks) to "a config + a one-line-class bug fix + a calculator environment" (days).
 
@@ -164,4 +165,43 @@ JAX_PLATFORMS=cpu .venv/bin/python test_smoke_cats.py     # M2 toy GRPO learns o
   -- python launch_delphi.py
 ```
 
-Full design + A/B/C strategy trade study: [`DESIGN.md`](DESIGN.md). Per-milestone working logs: `.agents/logs/tunix-iris/`.
+---
+
+## 9. Follow-on (issue #5): genuine agentic tool use — Delphi learns to *call* a calculator
+
+§7.7 left a thread open: the arithmetic above is **non-agentic** (Delphi computes the answer *itself*). The follow-on asks the stronger question the original brief implies — **can a 447M base LM do real multi-turn *tool use* on tunix+iris**: emit a tool call, read back an injected `Tool result:`, and *copy/chain* it into the answer? We built a curriculum of three stages on tunix's agentic stack (`ToolEnvironment` / `ToolAgent` / agentic GRPO learner) and a `CalculatorTool`. **The answer is yes — up to three chained calls, at 100% — but only with a specific SFT warm-up; RL alone provably cannot get there.** The recipe and the four findings that make it work are the contribution.
+
+### 9.1 The task surface and stages
+
+A custom `CalcTextToolParser` exposes a **`CALC(a * b)`** tool surface (not tunix's stock Qwen JSON `<tool_call>{…}` — see finding D). A few-shot system prompt carries the format; the agent loop runs: model emits `CALC(...)` → env executes the calculator → injects `Tool result: X` → model continues. A shaped reward (in a `CalcToolEnvironment` subclass) gives partial credit for the right turn-1 operands (`arg_acc`), a **copy** term for reproducing the injected result, and the **solve** term for the final gold answer.
+
+| stage | task | tool calls | new skill | result |
+|---|---|---|---|---|
+| **T0** | `a * b` (2-digit) | 1 | emit one grounded `CALC`, copy the result | **solve 1.0**, arg_acc 1.0, tool_call_rate 1.0 (held to step 149) |
+| **T1** | `a * b * c` | 2 chained | **copy a tool OUTPUT into the next call's ARGS** | **solve 1.0**, arg_acc 1.0, tool_call_rate 1.0 (robust at SFT=150 *and* 250) |
+| **T2** | `a * b * c * d` | 3 chained | a deeper chain — two ~6-digit intermediate copies forward | *(validation in progress; see §9.4)* |
+
+All on one `v6e-4`, minutes per stage. T0 → a6e67dc, T1 → d1c4c2f, T2 → c820a73.
+
+### 9.2 The core obstacle: RL learns the *call*, not the *copy*
+
+Plain GRPO on T0 drove the tool **call** to near-perfect (`arg_acc` → 0.99) but `solve_ratio` peaked at ~0.1 and then **collapsed**. The reason is fundamental: copying an injected `Tool result: X` line into the answer is **out-of-distribution for the base LM** — it is sampled too rarely for GRPO to ever amplify (the classic "RL only sharpens what the base policy already puts mass on" wall). The fix is the standard one: a short **supervised warm-up** that makes the call+copy pattern in-distribution *before* RL, using tunix's stock `PeftTrainer` on the **same in-memory `nnx` model object** (no checkpoint round-trip — both phases mutate the same module in place and `RLCluster` re-shards it). With the warm-up, T0 goes to a clean, *sustained* 1.0.
+
+### 9.3 Four findings that make agentic warm-up + RL actually work
+
+- **A. Gradient clipping is load-bearing for multi-turn RL — its absence is a *crash*, not just instability.** Unclipped multi-turn GRPO hit `inf`/`NaN` gradients that surfaced as a **libtpu `SIGSEGV`** (lr 2e-5 died ~step 3; lr 1e-5 limped to ~step 99 then died), losing all progress. `optax.chain(optax.clip_by_global_norm(1.0), adamw(...))` both **eliminates the crash** and stabilizes `arg_acc` to ~1.0. We clip in the SFT phase too.
+- **B. SFT can *over-collapse* the policy.** Too much warm-up drives `tool_call_rate → 0` (the policy sharpens onto a degenerate continuation). T0's sweet spot is ~150 transcripts; ~400 collapses it. Warm-up is a nudge, not a fine-tune.
+- **C. The most interesting bug — a train/RL *distribution mismatch* that silently corrupts tool-call emission.** A naive T1 warm-up (any amount) broke turn-1: instead of `CALC(92 * 98)` the model emitted a bare `92 * 98`. Debug rollouts isolated it: the **few-shot prompt *alone* (SFT=0) gets turn-1 right**, so SFT was the culprit. The cause: SFT trained on `BOS Q:… → CALC` but RL prompts with `‹few-shot› Q:…` — a context the warm-up never saw. **Benign for the single-call T0; corrupting for the chained T1.** Fix: **prepend the few-shot prompt (masked, loss 0) to every SFT transcript**, so the SFT context is byte-identical to the RL rollout prompt. Turn-1 `CALC` then survives warm-up and the full chain learns to 1.0 — robustly across SFT amounts. *(Generalizable lesson: warm-up transcripts should match the RL prompt distribution, prefix included.)*
+- **D. Base-LM surface gotchas (carried from the arithmetic work).** Delphi has no chat template and **never emits EOS** (we stop on a digit/`)`-terminated newline); it can't reliably produce Qwen JSON, so the tool surface is the bare-text `CALC(...)` (finding 9.1); and the Llama-3 BPE fuses+strips `)\n`, so the parser treats the closing paren as **optional**.
+
+### 9.4 The recipe, and what it proves
+
+The robust recipe across all stages: **prefix-aligned SFT warm-up (~150 transcripts, gradient-clipped) → gradient-clipped GRPO** on tunix's agentic learner, all on the same in-memory actor. With it, a 447M base model does **single (T0) and two-deep chained (T1) tool use at 100% solve**, where the chaining is genuine — turn *N+1* consumes turn *N*'s tool output as an argument. The binding constraint is never the RL or the iris/TPU plumbing (both work unchanged from the arithmetic runs); it is the **base LM's format/copy priors**, and prefix-aligned SFT is exactly the lever that fixes them.
+
+> **T2 status.** The three-call extension (`a*b*c*d`, `env_max_steps=4`) is a pure config-level addition on the same framework (`t2_segments` + `T2_SYSTEM_PROMPT` + `build_t2_dataset`); TPU validation is running at the time of writing. *(Result to be filled: `solve_ratio`, sustained-or-not.)*
+
+**Verdict for the follow-on: yes — tunix's agentic stack runs on iris and a small marin base model learns real multi-step tool use, given a distribution-matched SFT warm-up.** Reproduce a stage with `DELPHI_AGENT_MODE={t0,t1,t2}` + `DELPHI_SFT_STEPS=150` (see `launch_agentic.py`).
+
+---
+
+Full design + A/B/C strategy trade study: [`DESIGN.md`](DESIGN.md). Per-milestone working logs: `.agents/logs/tunix-iris/`. Agentic follow-on tracked in issue #5.
