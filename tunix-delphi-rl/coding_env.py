@@ -237,6 +237,26 @@ _WORDS = (
     "dragon", "castle", "winter", "summer", "pencil",
 )
 
+# Short lowercase words (no apostrophes) for building random sentences in the
+# tier-5 families that operate on whitespace-separated text (reverse-words,
+# most-common-word, ...). Kept lowercase + single-token so split(' ') / join
+# round-trips exactly and the gold stdout is unambiguous.
+_PHRASE_WORDS = (
+    "the", "quick", "brown", "fox", "lazy", "dog", "red", "blue", "green",
+    "sun", "moon", "star", "code", "runs", "fast", "slow", "tree", "bird",
+    "rain", "snow",
+)
+
+# Short words including several palindromes so the is-palindrome family yields a
+# mix of yes/no golds (a constant answer can't win the GRPO group).
+_PALINDROME_WORDS = (
+    "cat", "dog", "house", "table", "python", "river", "planet", "forest",
+    "level", "noon", "radar", "civic", "rotor", "kayak", "madam", "refer",
+    "racecar", "deed", "stats", "tenet",
+)
+
+_LOWERCASE = "abcdefghijklmnopqrstuvwxyz"
+
 # Multi-word phrases for the literal-print family (no apostrophes -- they would
 # break the single-quoted string literal). Disjoint from the eval phrases
 # ("Hello, World!" / "the quick brown fox"), so those stay held out.
@@ -630,6 +650,220 @@ def _f4_count_primes(rng):
   )
 
 
+# --- Tier 5: hard / compositional families -------------------------------------
+#
+# Multi-line, edge-case-heavy programs that compose several skills. The fixed
+# tier-5 eval tasks (coding_tasks.py) are saturated by SFT only if the model
+# nails every separator / edge case on a single greedy attempt; these randomized
+# families give RL the same compositional surface to train on (and a varying gold
+# so a constant can't win a group).
+
+
+def _f5_bubble_sort(rng):
+  k = rng.randint(4, 7)
+  nums = [rng.randint(1, 30) for _ in range(k)]
+  return (
+      f"Sort the list {nums} into ascending order using bubble sort (repeatedly "
+      "swap adjacent out-of-order pairs; do not use the built-in sorted), then "
+      "print the resulting list.",
+      f"nums = {nums}\nn = len(nums)\nfor i in range(n):\n"
+      "  for j in range(n - 1 - i):\n    if nums[j] > nums[j + 1]:\n"
+      "      nums[j], nums[j + 1] = nums[j + 1], nums[j]\nprint(nums)",
+  )
+
+
+def _f5_second_largest(rng):
+  # Distinct values so "second largest" is unambiguous.
+  nums = rng.sample(range(1, 60), rng.randint(4, 7))
+  return (
+      f"Given the list {nums}, print its second largest value.",
+      f"nums = {nums}\ns = sorted(nums)\nprint(s[-2])",
+  )
+
+
+def _f5_digital_root(rng):
+  n = rng.randint(100, 999999)
+  return (
+      f"Compute the digital root of {n}: repeatedly replace the number with the "
+      "sum of its decimal digits until a single digit remains, then print that "
+      "digit.",
+      f"n = {n}\nwhile n >= 10:\n  t = 0\n  while n > 0:\n    t += n % 10\n"
+      "    n //= 10\n  n = t\nprint(n)",
+  )
+
+
+def _f5_nth_prime(rng):
+  k = rng.randint(3, 20)
+  return (
+      f"Print the {k}th prime number (the 1st prime is 2, the 2nd is 3, and so "
+      "on).",
+      f"target = {k}\ncount = 0\nn = 1\nwhile count < target:\n  n += 1\n"
+      "  is_p = True\n  d = 2\n  while d * d <= n:\n    if n % d == 0:\n"
+      "      is_p = False\n      break\n    d += 1\n  if is_p:\n    count += 1\n"
+      "print(n)",
+  )
+
+
+def _f5_dec_to_binary(rng):
+  n = rng.randint(1, 255)
+  return (
+      f"Print the binary representation of {n} as a string of 0s and 1s, with no "
+      "leading zeros and no prefix (compute it manually with repeated division "
+      "by 2; do not use bin).",
+      f"n = {n}\nbits = ''\nif n == 0:\n  bits = '0'\nwhile n > 0:\n"
+      "  bits = str(n % 2) + bits\n  n //= 2\nprint(bits)",
+  )
+
+
+def _f5_reverse_words(rng):
+  k = rng.randint(3, 6)
+  s = " ".join(rng.choice(_PHRASE_WORDS) for _ in range(k))
+  return (
+      f"Reverse the order of the words in the sentence '{s}' and print the "
+      "result as a single space-separated line (the words themselves are not "
+      "reversed, only their order).",
+      f"s = '{s}'\nparts = s.split(' ')\nprint(' '.join(parts[::-1]))",
+  )
+
+
+def _f5_most_common_word(rng):
+  # A unique mode: one word repeated 3x, three others once each (in fixed slots
+  # so the winner is also first), guaranteeing an unambiguous gold.
+  pool = rng.sample(_PHRASE_WORDS, 4)
+  winner = pool[0]
+  words = [winner, pool[1], winner, pool[2], winner, pool[3]]
+  s = " ".join(words)
+  return (
+      f"In the sentence '{s}', find and print the word that appears the most "
+      "times (on a tie, print the one that appears first in the sentence).",
+      f"s = '{s}'\nwords = s.split(' ')\nbest = words[0]\nbest_count = 0\n"
+      "for w in words:\n  c = 0\n  for x in words:\n    if x == w:\n      c += 1\n"
+      "  if c > best_count:\n    best_count = c\n    best = w\nprint(best)",
+  )
+
+
+def _f5_run_length_encode(rng):
+  chars = rng.sample(_LOWERCASE, rng.randint(2, 4))
+  s = "".join(c * rng.randint(1, 4) for c in chars)
+  return (
+      f"Run-length encode the string '{s}' by replacing each run of a repeated "
+      "character with that character followed by the run length, and print the "
+      "result (for example 'aaabb' becomes 'a3b2').",
+      f"s = '{s}'\nout = ''\ni = 0\nn = len(s)\nwhile i < n:\n  c = s[i]\n"
+      "  k = 0\n  while i < n and s[i] == c:\n    k += 1\n    i += 1\n"
+      "  out += c + str(k)\nprint(out)",
+  )
+
+
+def _f5_caesar_shift(rng):
+  L = rng.randint(3, 6)
+  s = "".join(rng.choice(_LOWERCASE) for _ in range(L))
+  k = rng.randint(1, 25)
+  return (
+      f"Apply a Caesar cipher to the lowercase string '{s}', shifting each "
+      f"letter forward by {k} positions in the alphabet and wrapping around from "
+      "z back to a, then print the result.",
+      f"s = '{s}'\nk = {k}\nalpha = 'abcdefghijklmnopqrstuvwxyz'\nout = ''\n"
+      "for ch in s:\n  idx = alpha.find(ch)\n  out += alpha[(idx + k) % 26]\n"
+      "print(out)",
+  )
+
+
+def _f5_right_triangle(rng):
+  n = rng.randint(2, 7)
+  return (
+      f"Print a right triangle of asterisks with {n} rows: the first row has 1 "
+      f"asterisk, the second has 2, and so on up to {n} asterisks on the last "
+      "row, each row on its own line.",
+      f"n = {n}\nfor i in range(1, n + 1):\n  print('*' * i)",
+  )
+
+
+def _f5_mult_table_row(rng):
+  k = rng.randint(2, 12)
+  return (
+      f"Print the multiplication table row for {k}: the values {k}*1, {k}*2, "
+      f"..., {k}*10 on a single line separated by single spaces.",
+      f"k = {k}\nparts = []\nfor i in range(1, 11):\n  parts.append(str(k * i))\n"
+      "print(' '.join(parts))",
+  )
+
+
+def _f5_sum_of_squares(rng):
+  nums = [rng.randint(1, 12) for _ in range(rng.randint(3, 6))]
+  return (
+      f"Print the sum of the squares of the numbers in the list {nums} (that is, "
+      "each number multiplied by itself, all added together).",
+      f"nums = {nums}\ntotal = 0\nfor x in nums:\n  total += x * x\nprint(total)",
+  )
+
+
+def _f5_gcd_of_list(rng):
+  base = rng.randint(2, 9)
+  nums = [base * rng.randint(2, 9) for _ in range(rng.randint(2, 4))]
+  return (
+      "Define a function gcd(a, b) using the Euclidean algorithm, then use it to "
+      f"compute and print the greatest common divisor of every number in the "
+      f"list {nums}.",
+      "def gcd(a, b):\n  while b != 0:\n    a, b = b, a % b\n  return a\n"
+      f"nums = {nums}\ng = nums[0]\nfor x in nums:\n  g = gcd(g, x)\nprint(g)",
+  )
+
+
+def _f5_fib_list(rng):
+  n = rng.randint(5, 12)
+  return (
+      f"Print the first {n} Fibonacci numbers (starting from 0, 1) on a single "
+      "line separated by commas with no spaces.",
+      f"n = {n}\na, b = 0, 1\nparts = []\nfor i in range(n):\n"
+      "  parts.append(str(a))\n  a, b = b, a + b\nprint(','.join(parts))",
+  )
+
+
+def _f5_collatz_sequence(rng):
+  n = rng.randint(3, 27)
+  return (
+      f"Print the full Collatz sequence starting from {n} down to 1 on a single "
+      "line separated by commas with no spaces, where each step replaces n with "
+      f"n//2 if n is even or 3*n+1 if n is odd (include both the starting {n} and "
+      "the final 1).",
+      f"n = {n}\nparts = []\nwhile n != 1:\n  parts.append(str(n))\n"
+      "  if n % 2 == 0:\n    n //= 2\n  else:\n    n = 3 * n + 1\n"
+      "parts.append('1')\nprint(','.join(parts))",
+  )
+
+
+def _f5_integer_average(rng):
+  nums = [rng.randint(1, 99) for _ in range(rng.randint(3, 7))]
+  return (
+      f"Print the integer (floor) average of the numbers in the list {nums} "
+      "(their sum divided by their count using floor division).",
+      f"nums = {nums}\nprint(sum(nums) // len(nums))",
+  )
+
+
+def _f5_reverse_integer(rng):
+  # Leading digit nonzero so the reversed integer has no ambiguous trailing zero.
+  digits = [str(rng.randint(1, 9))] + [
+      str(rng.randint(0, 9)) for _ in range(rng.randint(2, 4))
+  ]
+  n = int("".join(digits))
+  return (
+      f"Reverse the digits of the integer {n} and print the resulting integer.",
+      f"n = {n}\nrev = 0\nwhile n > 0:\n  rev = rev * 10 + n % 10\n  n //= 10\n"
+      "print(rev)",
+  )
+
+
+def _f5_is_palindrome(rng):
+  w = rng.choice(_PALINDROME_WORDS)
+  return (
+      f"Print yes if the string '{w}' reads the same forwards and backwards, "
+      "otherwise print no.",
+      f"s = '{w}'\nif s == s[::-1]:\n  print('yes')\nelse:\n  print('no')",
+  )
+
+
 FAMILIES: Tuple[Family, ...] = (
     Family("f0_int", 0, _f0_int),
     Family("f0_word", 0, _f0_word),
@@ -672,6 +906,24 @@ FAMILIES: Tuple[Family, ...] = (
     Family("f4_triangular", 4, _f4_triangular),
     Family("f4_collatz", 4, _f4_collatz),
     Family("f4_count_primes", 4, _f4_count_primes),
+    Family("f5_bubble_sort", 5, _f5_bubble_sort),
+    Family("f5_second_largest", 5, _f5_second_largest),
+    Family("f5_digital_root", 5, _f5_digital_root),
+    Family("f5_nth_prime", 5, _f5_nth_prime),
+    Family("f5_dec_to_binary", 5, _f5_dec_to_binary),
+    Family("f5_reverse_words", 5, _f5_reverse_words),
+    Family("f5_most_common_word", 5, _f5_most_common_word),
+    Family("f5_run_length_encode", 5, _f5_run_length_encode),
+    Family("f5_caesar_shift", 5, _f5_caesar_shift),
+    Family("f5_right_triangle", 5, _f5_right_triangle),
+    Family("f5_mult_table_row", 5, _f5_mult_table_row),
+    Family("f5_sum_of_squares", 5, _f5_sum_of_squares),
+    Family("f5_gcd_of_list", 5, _f5_gcd_of_list),
+    Family("f5_fib_list", 5, _f5_fib_list),
+    Family("f5_collatz_sequence", 5, _f5_collatz_sequence),
+    Family("f5_integer_average", 5, _f5_integer_average),
+    Family("f5_reverse_integer", 5, _f5_reverse_integer),
+    Family("f5_is_palindrome", 5, _f5_is_palindrome),
 )
 
 
@@ -926,7 +1178,7 @@ if __name__ == "__main__":
   import coding_tasks
 
   rng = random.Random(0)
-  all_tiers = (0, 1, 2, 3, 4)
+  all_tiers = (0, 1, 2, 3, 4, 5)
   bad = 0
   for fam in FAMILIES:
     for _ in range(20):
@@ -937,6 +1189,14 @@ if __name__ == "__main__":
         print(f"[FAIL] {fam.id}: {res.error!r} prompt={prompt!r}")
   assert bad == 0, f"{bad} family sample(s) produced an invalid program"
   print(f"families: {len(FAMILIES)} ok across {len(FAMILIES) * 20} samples")
+
+  # sample_task works per-tier (including the new hard tier 5) and the sampled
+  # solution runs to a non-empty gold the grader can compare against.
+  for tier in all_tiers:
+    for _ in range(20):
+      prompt, solution, gold = sample_task(rng, (tier,))
+      assert gold, f"tier {tier}: empty gold for prompt={prompt!r}"
+      assert micropython.run(solution, max_steps=_EVAL_MAX_STEPS).ok
 
   # Parser + reward on a synthetic 'good' completion.
   good = "print(6 * 7)\nEND\nTask: something else\n"

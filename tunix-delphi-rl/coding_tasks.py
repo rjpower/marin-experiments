@@ -17,7 +17,7 @@ implicit trailing newline that ``print`` appends. Every solution stays strictly
 inside the interpreter's supported subset (no imports, classes, dicts/sets,
 ``with``/``try``, lambdas, or non-whitelisted builtins/methods).
 
-The 50 tasks form a five-tier difficulty curriculum (~10 tasks per tier):
+The tasks form a six-tier difficulty curriculum:
 
   * **Tier 0 -- constant output.** Print a literal (int, string, float, bool).
   * **Tier 1 -- one-step arithmetic.** Print one expression over constants,
@@ -28,6 +28,12 @@ The 50 tasks form a five-tier difficulty curriculum (~10 tasks per tier):
     sequence/string manipulation, with single- and multi-line outputs.
   * **Tier 4 -- functions & recursion.** ``def`` + ``return``, recursion, and
     small classic algorithms (fib, factorial, gcd, primality, ...).
+  * **Tier 5 -- hard / compositional.** Multi-line, edge-case-heavy programs
+    that compose several of the above (sorting, run-length encoding, base
+    conversion, caesar shift, nth prime, word-frequency, ...). These are
+    error-prone on a single greedy attempt -- the formatting/separators/edge
+    cases are easy to get subtly wrong -- so a write->run->revise loop and RL
+    have real headroom over SFT here, unlike the saturated tiers 0--4.
 
 Run ``uv run python coding_tasks.py`` to validate every task against the
 interpreter.
@@ -44,7 +50,7 @@ class Task:
 
   Attributes:
     id: Stable unique slug, e.g. ``"t1_03_six_times_seven"``.
-    tier: Curriculum/difficulty tier in ``0..4``.
+    tier: Curriculum/difficulty tier in ``0..5``.
     prompt: The natural-language instruction shown to the model.
     solution: A correct micropython program (the reference solution).
     answer: The gold stdout, equal to ``micropython.run(solution).stdout``.
@@ -628,11 +634,370 @@ TASKS: list[Task] = [
         answer="8\n",
         concepts=("function", "while", "modulo"),
     ),
+    # --- Tier 5: hard / compositional -----------------------------------------
+    Task(
+        id="t5_01_bubble_sort",
+        tier=5,
+        prompt=(
+            "Sort the list [5, 2, 9, 1, 7, 3] into ascending order using bubble "
+            "sort (repeatedly swap adjacent out-of-order pairs; do not use the "
+            "built-in sorted), then print the resulting list."
+        ),
+        solution=(
+            "nums = [5, 2, 9, 1, 7, 3]\n"
+            "n = len(nums)\n"
+            "for i in range(n):\n"
+            "  for j in range(n - 1 - i):\n"
+            "    if nums[j] > nums[j + 1]:\n"
+            "      nums[j], nums[j + 1] = nums[j + 1], nums[j]\n"
+            "print(nums)"
+        ),
+        answer="[1, 2, 3, 5, 7, 9]\n",
+        concepts=("loop", "list"),
+    ),
+    Task(
+        id="t5_02_second_largest",
+        tier=5,
+        prompt=(
+            "Given the list [3, 9, 2, 9, 4, 7], print its second largest value "
+            "(by sorted order, so duplicates of the maximum still count: the "
+            "second element from the end of the sorted list)."
+        ),
+        solution=(
+            "nums = [3, 9, 2, 9, 4, 7]\n"
+            "s = sorted(nums)\n"
+            "print(s[-2])"
+        ),
+        answer="9\n",
+        concepts=("list", "sorting"),
+    ),
+    Task(
+        id="t5_03_digital_root",
+        tier=5,
+        prompt=(
+            "Compute the digital root of 9875: repeatedly replace the number with "
+            "the sum of its decimal digits until a single digit remains, then "
+            "print that digit."
+        ),
+        solution=(
+            "n = 9875\n"
+            "while n >= 10:\n"
+            "  t = 0\n"
+            "  while n > 0:\n"
+            "    t += n % 10\n"
+            "    n //= 10\n"
+            "  n = t\n"
+            "print(n)"
+        ),
+        answer="2\n",
+        concepts=("while", "modulo"),
+    ),
+    Task(
+        id="t5_04_nth_prime",
+        tier=5,
+        prompt=(
+            "Print the 8th prime number (the 1st prime is 2, the 2nd is 3, and so "
+            "on)."
+        ),
+        solution=(
+            "target = 8\n"
+            "count = 0\n"
+            "n = 1\n"
+            "while count < target:\n"
+            "  n += 1\n"
+            "  is_p = True\n"
+            "  d = 2\n"
+            "  while d * d <= n:\n"
+            "    if n % d == 0:\n"
+            "      is_p = False\n"
+            "      break\n"
+            "    d += 1\n"
+            "  if is_p:\n"
+            "    count += 1\n"
+            "print(n)"
+        ),
+        answer="19\n",
+        concepts=("while", "modulo"),
+    ),
+    Task(
+        id="t5_05_dec_to_binary",
+        tier=5,
+        prompt=(
+            "Print the binary representation of 42 as a string of 0s and 1s, with "
+            "no leading zeros and no prefix (compute it manually with repeated "
+            "division by 2; do not use bin)."
+        ),
+        solution=(
+            "n = 42\n"
+            "bits = ''\n"
+            "if n == 0:\n"
+            "  bits = '0'\n"
+            "while n > 0:\n"
+            "  bits = str(n % 2) + bits\n"
+            "  n //= 2\n"
+            "print(bits)"
+        ),
+        answer="101010\n",
+        concepts=("while", "string"),
+    ),
+    Task(
+        id="t5_06_reverse_words",
+        tier=5,
+        prompt=(
+            "Reverse the order of the words in the sentence 'the quick brown fox' "
+            "and print the result as a single space-separated line (the words "
+            "themselves are not reversed, only their order)."
+        ),
+        solution=(
+            "s = 'the quick brown fox'\n"
+            "parts = s.split(' ')\n"
+            "print(' '.join(parts[::-1]))"
+        ),
+        answer="fox brown quick the\n",
+        concepts=("string", "list"),
+    ),
+    Task(
+        id="t5_07_most_common_word",
+        tier=5,
+        prompt=(
+            "In the sentence 'cat dog cat bird cat dog', find and print the word "
+            "that appears the most times (on a tie, print the one that appears "
+            "first in the sentence)."
+        ),
+        solution=(
+            "s = 'cat dog cat bird cat dog'\n"
+            "words = s.split(' ')\n"
+            "best = words[0]\n"
+            "best_count = 0\n"
+            "for w in words:\n"
+            "  c = 0\n"
+            "  for x in words:\n"
+            "    if x == w:\n"
+            "      c += 1\n"
+            "  if c > best_count:\n"
+            "    best_count = c\n"
+            "    best = w\n"
+            "print(best)"
+        ),
+        answer="cat\n",
+        concepts=("string", "loop"),
+    ),
+    Task(
+        id="t5_08_run_length_encode",
+        tier=5,
+        prompt=(
+            "Run-length encode the string 'aaabbbcc' by replacing each run of a "
+            "repeated character with that character followed by the run length, "
+            "and print the result (for example 'aaabb' becomes 'a3b2')."
+        ),
+        solution=(
+            "s = 'aaabbbcc'\n"
+            "out = ''\n"
+            "i = 0\n"
+            "n = len(s)\n"
+            "while i < n:\n"
+            "  c = s[i]\n"
+            "  k = 0\n"
+            "  while i < n and s[i] == c:\n"
+            "    k += 1\n"
+            "    i += 1\n"
+            "  out += c + str(k)\n"
+            "print(out)"
+        ),
+        answer="a3b3c2\n",
+        concepts=("string", "while"),
+    ),
+    Task(
+        id="t5_09_caesar_shift",
+        tier=5,
+        prompt=(
+            "Apply a Caesar cipher to the lowercase string 'hello', shifting each "
+            "letter forward by 3 positions in the alphabet and wrapping around "
+            "from z back to a, then print the result."
+        ),
+        solution=(
+            "s = 'hello'\n"
+            "k = 3\n"
+            "alpha = 'abcdefghijklmnopqrstuvwxyz'\n"
+            "out = ''\n"
+            "for ch in s:\n"
+            "  idx = alpha.find(ch)\n"
+            "  out += alpha[(idx + k) % 26]\n"
+            "print(out)"
+        ),
+        answer="khoor\n",
+        concepts=("string", "loop", "modulo"),
+    ),
+    Task(
+        id="t5_10_right_triangle",
+        tier=5,
+        prompt=(
+            "Print a right triangle of asterisks with 4 rows: the first row has 1 "
+            "asterisk, the second has 2, and so on up to 4 asterisks on the last "
+            "row, each row on its own line."
+        ),
+        solution=(
+            "n = 4\n"
+            "for i in range(1, n + 1):\n"
+            "  print('*' * i)"
+        ),
+        answer="*\n**\n***\n****\n",
+        concepts=("loop", "string"),
+    ),
+    Task(
+        id="t5_11_mult_table_row",
+        tier=5,
+        prompt=(
+            "Print the multiplication table row for 7: the values 7*1, 7*2, ..., "
+            "7*10 on a single line separated by single spaces."
+        ),
+        solution=(
+            "k = 7\n"
+            "parts = []\n"
+            "for i in range(1, 11):\n"
+            "  parts.append(str(k * i))\n"
+            "print(' '.join(parts))"
+        ),
+        answer="7 14 21 28 35 42 49 56 63 70\n",
+        concepts=("loop", "list", "string"),
+    ),
+    Task(
+        id="t5_12_sum_of_squares",
+        tier=5,
+        prompt=(
+            "Print the sum of the squares of the numbers in the list "
+            "[1, 2, 3, 4, 5] (that is, 1*1 + 2*2 + ... + 5*5)."
+        ),
+        solution=(
+            "nums = [1, 2, 3, 4, 5]\n"
+            "total = 0\n"
+            "for x in nums:\n"
+            "  total += x * x\n"
+            "print(total)"
+        ),
+        answer="55\n",
+        concepts=("loop", "list", "arithmetic"),
+    ),
+    Task(
+        id="t5_13_is_palindrome",
+        tier=5,
+        prompt=(
+            "Print yes if the string 'racecar' reads the same forwards and "
+            "backwards, otherwise print no."
+        ),
+        solution=(
+            "s = 'racecar'\n"
+            "if s == s[::-1]:\n"
+            "  print('yes')\n"
+            "else:\n"
+            "  print('no')"
+        ),
+        answer="yes\n",
+        concepts=("string", "conditional"),
+    ),
+    Task(
+        id="t5_14_gcd_of_list",
+        tier=5,
+        prompt=(
+            "Define a function gcd(a, b) using the Euclidean algorithm, then use "
+            "it to compute and print the greatest common divisor of every number "
+            "in the list [24, 36, 60]."
+        ),
+        solution=(
+            "def gcd(a, b):\n"
+            "  while b != 0:\n"
+            "    a, b = b, a % b\n"
+            "  return a\n"
+            "nums = [24, 36, 60]\n"
+            "g = nums[0]\n"
+            "for x in nums:\n"
+            "  g = gcd(g, x)\n"
+            "print(g)"
+        ),
+        answer="12\n",
+        concepts=("function", "loop", "modulo"),
+    ),
+    Task(
+        id="t5_15_fib_list",
+        tier=5,
+        prompt=(
+            "Print the first 8 Fibonacci numbers (starting from 0, 1) on a single "
+            "line separated by commas with no spaces."
+        ),
+        solution=(
+            "n = 8\n"
+            "a, b = 0, 1\n"
+            "parts = []\n"
+            "for i in range(n):\n"
+            "  parts.append(str(a))\n"
+            "  a, b = b, a + b\n"
+            "print(','.join(parts))"
+        ),
+        answer="0,1,1,2,3,5,8,13\n",
+        concepts=("loop", "list", "string"),
+    ),
+    Task(
+        id="t5_16_collatz_sequence",
+        tier=5,
+        prompt=(
+            "Print the full Collatz sequence starting from 6 down to 1 on a "
+            "single line separated by commas with no spaces, where each step "
+            "replaces n with n//2 if n is even or 3*n+1 if n is odd (include both "
+            "the starting 6 and the final 1)."
+        ),
+        solution=(
+            "n = 6\n"
+            "parts = []\n"
+            "while n != 1:\n"
+            "  parts.append(str(n))\n"
+            "  if n % 2 == 0:\n"
+            "    n //= 2\n"
+            "  else:\n"
+            "    n = 3 * n + 1\n"
+            "parts.append('1')\n"
+            "print(','.join(parts))"
+        ),
+        answer="6,3,10,5,16,8,4,2,1\n",
+        concepts=("while", "list", "modulo"),
+    ),
+    Task(
+        id="t5_17_integer_average",
+        tier=5,
+        prompt=(
+            "Print the integer (floor) average of the numbers in the list "
+            "[4, 8, 15, 16, 23, 42] (their sum divided by their count using floor "
+            "division)."
+        ),
+        solution=(
+            "nums = [4, 8, 15, 16, 23, 42]\n"
+            "print(sum(nums) // len(nums))"
+        ),
+        answer="18\n",
+        concepts=("list", "intdiv"),
+    ),
+    Task(
+        id="t5_18_reverse_integer",
+        tier=5,
+        prompt=(
+            "Reverse the digits of the integer 1234 and print the resulting "
+            "integer (so 1234 becomes 4321)."
+        ),
+        solution=(
+            "n = 1234\n"
+            "rev = 0\n"
+            "while n > 0:\n"
+            "  rev = rev * 10 + n % 10\n"
+            "  n //= 10\n"
+            "print(rev)"
+        ),
+        answer="4321\n",
+        concepts=("while", "modulo"),
+    ),
 ]
 
 
 def load_tasks() -> list[Task]:
-  """Return the 50 tasks."""
+  """Return the full task list (tiers 0--5)."""
   return TASKS
 
 
@@ -642,7 +1007,7 @@ if __name__ == "__main__":
   tasks = load_tasks()
 
   # Structural invariants.
-  assert len(tasks) == 50, f"expected 50 tasks, got {len(tasks)}"
+  assert len(tasks) == 68, f"expected 68 tasks, got {len(tasks)}"
   ids = [t.id for t in tasks]
   assert len(set(ids)) == len(ids), "task ids are not unique"
 
