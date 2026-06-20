@@ -237,6 +237,17 @@ _WORDS = (
     "dragon", "castle", "winter", "summer", "pencil",
 )
 
+# Multi-word phrases for the literal-print family (no apostrophes -- they would
+# break the single-quoted string literal). Disjoint from the eval phrases
+# ("Hello, World!" / "the quick brown fox"), so those stay held out.
+_PHRASES = (
+    "Good morning", "I love Python", "red green blue", "open the door",
+    "time to code", "keep it simple", "two plus two", "left and right",
+    "up and down", "the answer", "make it work", "hello there friend",
+)
+
+_UPPERCASE = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
 Sampler = Callable[[random.Random], Tuple[str, str]]
 
 
@@ -492,19 +503,143 @@ def _f4_collatz(rng):
   )
 
 
+def _f0_float(rng):
+  a = round(rng.uniform(0.1, 99.99), 2)
+  return f"Print the number {a}.", f"print({a})"
+
+
+def _f0_bool(rng):
+  b = rng.choice((True, False))
+  return f"Print the boolean value {b}.", f"print({b})"
+
+
+def _f0_upper_letter(rng):
+  c = rng.choice(_UPPERCASE)
+  return f"Print the single letter {c} (uppercase, no quotes).", f"print('{c}')"
+
+
+def _f0_phrase(rng):
+  phrase = rng.choice(_PHRASES)
+  return f"Print exactly: {phrase}", f"print('{phrase}')"
+
+
+def _f1_truediv(rng):
+  b = rng.randint(2, 9)
+  a = rng.randint(1, 99)
+  return (
+      f"Print the result of {a} divided by {b} using true division (a decimal).",
+      f"print({a} / {b})",
+  )
+
+
+def _f1_precedence(rng):
+  a, b, c = rng.randint(1, 20), rng.randint(2, 12), rng.randint(2, 12)
+  return (
+      f"Print the result of {a} plus {b} times {c} (using normal operator "
+      "precedence).",
+      f"print({a} + {b} * {c})",
+  )
+
+
+def _f2_ternary(rng):
+  n = rng.randint(-20, 20)
+  return (
+      f"Set n to {n}. Print the word positive if n is greater than 0, otherwise "
+      "print nonpositive.",
+      f"n = {n}\nprint('positive' if n > 0 else 'nonpositive')",
+  )
+
+
+def _f2_swap(rng):
+  a, b = rng.randint(1, 50), rng.randint(1, 50)
+  return (
+      f"Set a to {a} and b to {b}, swap them using tuple assignment, then print "
+      "a and b on one line separated by a single space.",
+      f"a = {a}\nb = {b}\na, b = b, a\nprint(a, b)",
+  )
+
+
+_FIZZBUZZ_BODY = (
+    "if n % 3 == 0 and n % 5 == 0:\n  print('FizzBuzz')\n"
+    "elif n % 3 == 0:\n  print('Fizz')\n"
+    "elif n % 5 == 0:\n  print('Buzz')\n"
+    "else:\n  print(n)"
+)
+
+
+def _f2_fizzbuzz_single(rng):
+  n = rng.randint(1, 30)
+  return (
+      f"Set n to {n}. If n is divisible by both 3 and 5 print FizzBuzz, else if "
+      "divisible by 3 print Fizz, else if divisible by 5 print Buzz, else print "
+      "n.",
+      f"n = {n}\n{_FIZZBUZZ_BODY}",
+  )
+
+
+def _f2_grade(rng):
+  score = rng.randint(0, 100)
+  return (
+      f"Set score to {score}. Print A if score is at least 90, B if at least 80, "
+      "C if at least 70, otherwise F.",
+      f"score = {score}\nif score >= 90:\n  print('A')\n"
+      "elif score >= 80:\n  print('B')\nelif score >= 70:\n  print('C')\n"
+      "else:\n  print('F')",
+  )
+
+
+def _f3_join_range(rng):
+  n = rng.randint(3, 8)
+  return (
+      f"Print the numbers 1 through {n} (inclusive) on a single line separated by "
+      "commas, with no spaces.",
+      f"print(','.join([str(i) for i in range(1, {n + 1})]))",
+  )
+
+
+def _f3_max_in_list(rng):
+  nums = [rng.randint(1, 30) for _ in range(5)]
+  return (
+      f"Given the list {nums}, print its largest element using a loop (do not use "
+      "the built-in max).",
+      f"nums = {nums}\nbest = nums[0]\nfor x in nums:\n  if x > best:\n"
+      "    best = x\nprint(best)",
+  )
+
+
+def _f4_count_primes(rng):
+  n = rng.randint(10, 40)
+  return (
+      "Define a function is_prime(n) and use it to count how many integers from "
+      f"2 to {n} (inclusive) are prime, then print that count.",
+      f"{_IS_PRIME_DEF}count = 0\nfor k in range(2, {n + 1}):\n"
+      "  if is_prime(k):\n    count += 1\nprint(count)",
+  )
+
+
 FAMILIES: Tuple[Family, ...] = (
     Family("f0_int", 0, _f0_int),
     Family("f0_word", 0, _f0_word),
+    Family("f0_float", 0, _f0_float),
+    Family("f0_bool", 0, _f0_bool),
+    Family("f0_upper_letter", 0, _f0_upper_letter),
+    Family("f0_phrase", 0, _f0_phrase),
     Family("f1_binop", 1, _f1_binop),
     Family("f1_floordiv", 1, _f1_floordiv),
     Family("f1_mod", 1, _f1_mod),
     Family("f1_power", 1, _f1_power),
     Family("f1_parens", 1, _f1_parens),
+    Family("f1_truediv", 1, _f1_truediv),
+    Family("f1_precedence", 1, _f1_precedence),
     Family("f2_var", 2, _f2_var),
     Family("f2_sum3", 2, _f2_sum3),
     Family("f2_evenodd", 2, _f2_evenodd),
     Family("f2_maxtwo", 2, _f2_maxtwo),
     Family("f2_absdiff", 2, _f2_absdiff),
+    Family("f2_ternary", 2, _f2_ternary),
+    Family("f2_swap", 2, _f2_swap),
+    Family("f2_fizzbuzz_single", 2, _f2_fizzbuzz_single),
+    Family("f2_grade", 2, _f2_grade),
     Family("f3_sum_to_n", 3, _f3_sum_to_n),
     Family("f3_count_lines", 3, _f3_count_lines),
     Family("f3_factorial_loop", 3, _f3_factorial_loop),
@@ -512,6 +647,8 @@ FAMILIES: Tuple[Family, ...] = (
     Family("f3_reverse", 3, _f3_reverse),
     Family("f3_count_vowels", 3, _f3_count_vowels),
     Family("f3_fizzbuzz", 3, _f3_fizzbuzz),
+    Family("f3_join_range", 3, _f3_join_range),
+    Family("f3_max_in_list", 3, _f3_max_in_list),
     Family("f4_fib", 4, _f4_fib),
     Family("f4_factorial", 4, _f4_factorial),
     Family("f4_isprime", 4, _f4_isprime),
@@ -520,6 +657,7 @@ FAMILIES: Tuple[Family, ...] = (
     Family("f4_power", 4, _f4_power),
     Family("f4_triangular", 4, _f4_triangular),
     Family("f4_collatz", 4, _f4_collatz),
+    Family("f4_count_primes", 4, _f4_count_primes),
 )
 
 
