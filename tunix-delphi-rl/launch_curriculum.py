@@ -35,14 +35,13 @@ import os
 import jax
 from huggingface_hub import snapshot_download
 
+from models.registry import get_model_spec
 from training.train_curriculum import train_curriculum
 
-DELPHI_REPO = "marin-community/delphi-3e18-447Mparams-1.2Btokens"
 
-
-def _ensure_delphi(model_dir: str) -> str:
-  if not os.path.exists(os.path.join(model_dir, "model.safetensors")):
-    snapshot_download(repo_id=DELPHI_REPO, local_dir=model_dir)
+def _ensure_model(repo: str, model_dir: str) -> str:
+  if not os.path.exists(os.path.join(model_dir, "config.json")):
+    snapshot_download(repo_id=repo, local_dir=model_dir)
   return model_dir
 
 
@@ -75,7 +74,13 @@ def main() -> None:
   passk_temp = float(os.environ.get("CURRIC_PASSK_TEMP", "1.0"))
   eval_tokens = int(os.environ.get("CURRIC_EVAL_TOKENS", "256"))
   seed = int(os.environ.get("CURRIC_SEED", "0"))
-  model_dir = os.environ.get("DELPHI_MODEL_DIR", "./delphi")
+  model_name = os.environ.get("CURRIC_MODEL", "delphi")
+  model_spec = get_model_spec(model_name)
+  model_dir = (
+      os.environ.get("CURRIC_MODEL_DIR")
+      or os.environ.get("DELPHI_MODEL_DIR")
+      or f"./{model_spec.name}"
+  )
 
   print(f"[curric] jax {jax.__version__} devices={jax.devices()}", flush=True)
   print(
@@ -87,8 +92,8 @@ def main() -> None:
       flush=True,
   )
 
-  model_dir = _ensure_delphi(model_dir)
-  print(f"[curric] Delphi ready at {model_dir}", flush=True)
+  model_dir = _ensure_model(model_spec.repo, model_dir)
+  print(f"[curric] model={model_spec.name} repo={model_spec.repo} ready at {model_dir}", flush=True)
 
   result = train_curriculum(
       model_dir=model_dir,
@@ -111,6 +116,7 @@ def main() -> None:
       passk=passk,
       passk_temperature=passk_temp,
       eval_max_new_tokens=eval_tokens,
+      model_spec=model_spec,
   )
 
   for i in range(result.steps_ran):

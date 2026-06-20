@@ -41,7 +41,7 @@ from environments.curriculum_env import (
     solve_metric_fn,
     solve_segments,
 )
-from models.delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
+from models.registry import ModelSpec, get_model_spec
 from training.train_multiturn import _NormalizingGRPOLearner, _build_mesh
 
 
@@ -132,17 +132,25 @@ def train_curriculum(
     eval_max_new_tokens: int = 256,
     do_eval: bool = True,
     mesh: jax.sharding.Mesh | None = None,
+    model_spec: ModelSpec | None = None,
 ) -> CurriculumTrainResult:
-  """SFT warm-up (easy levels) -> curriculum Dr.GRPO; per-level held-out pass@k."""
-  tokenizer = load_tokenizer(model_dir)
+  """SFT warm-up (easy levels) -> curriculum Dr.GRPO; per-level held-out pass@k.
+
+  ``model_spec`` selects the base model + loaders (default: Delphi). The eos used
+  for per-turn stopping comes from ``tokenizer.eos_token_id``, so the same code
+  trains Delphi-447M or Qwen3-1.7B-Base unchanged.
+  """
+  if model_spec is None:
+    model_spec = get_model_spec("delphi")
+  tokenizer = model_spec.load_tokenizer(model_dir)
   if mesh is None:
     mesh = _build_mesh()
   if eval_levels is None:
     eval_levels = train_levels
   eval_problems = load_eval_suite(eval_levels, eval_n_per_level, seed=99)
 
-  actor = load_delphi(model_dir, dtype=jnp.float32, mesh=mesh)
-  reference = None if beta == 0.0 else load_delphi(model_dir, dtype=jnp.bfloat16, mesh=mesh)
+  actor = model_spec.load_model(model_dir, dtype=jnp.float32, mesh=mesh)
+  reference = None if beta == 0.0 else model_spec.load_model(model_dir, dtype=jnp.bfloat16, mesh=mesh)
 
   # Stage 1: SFT warm-up on the easy levels (teach def solve + CoT format).
   if sft_steps > 0:
@@ -176,7 +184,7 @@ def train_curriculum(
     )
 
   # Stage 2: curriculum Dr.GRPO on test-case problems.
-  eos_tokens = sorted(set([DELPHI_EOS_ID]) | set(program_terminal_eos_tokens(tokenizer)))
+  eos_tokens = sorted(set([tokenizer.eos_token_id]) | set(program_terminal_eos_tokens(tokenizer)))
   if len(eos_tokens) <= 1:
     raise RuntimeError("No 'END' terminal token found; per-turn stop would never fire.")
 

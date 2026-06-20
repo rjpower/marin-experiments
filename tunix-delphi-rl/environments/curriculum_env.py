@@ -57,7 +57,6 @@ from problems.coding_problems import (
     sample_problem,
 )
 from environments.curriculum import Curriculum, CurriculumConfig
-from models.delphi_qwen3 import DELPHI_EOS_ID
 
 from tunix.rl.agentic.environments.tool_environment import ToolEnvironment
 
@@ -339,7 +338,7 @@ def evaluate_problems_passk(
       head_dim=model.config.head_dim,
   )
   sampler = sampler_lib.Sampler(transformer=model, tokenizer=tokenizer, cache_config=cache_config)
-  eos_tokens = sorted(set([DELPHI_EOS_ID]) | set(program_terminal_eos_tokens(tokenizer)))
+  eos_tokens = sorted(set([tokenizer.eos_token_id]) | set(program_terminal_eos_tokens(tokenizer)))
 
   prompts = [build_solve_prompt(format_problem_prompt(p)) for p in problems]
   n_correct = [0] * len(problems)
