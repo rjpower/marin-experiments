@@ -49,7 +49,11 @@ import os
 import jax
 from huggingface_hub import snapshot_download
 
-from train_agentic import train_agentic_port, train_agentic_t0
+from train_agentic import (
+    train_agentic_port,
+    train_agentic_t0,
+    train_agentic_t1,
+)
 
 DELPHI_REPO = "marin-community/delphi-3e18-447Mparams-1.2Btokens"
 
@@ -113,21 +117,23 @@ def _run_port(*, model_dir, steps, stage, num_generations, batch_size,
   )
 
 
-def _run_t0(*, model_dir, steps, num_generations, batch_size,
-            learning_rate, use_rollout_logps, sft_steps) -> None:
-  """Runs and reports the single-calculator-call T0 tool path."""
-  result = train_agentic_t0(
+def _run_tool_stage(*, train_fn, label, model_dir, steps, num_generations,
+                    batch_size, learning_rate, use_rollout_logps,
+                    sft_steps, sft_learning_rate) -> None:
+  """Runs and reports a CALC tool stage (T0 single call / T1 chained calls)."""
+  result = train_fn(
       model_dir=model_dir,
       steps=steps,
       num_generations=num_generations,
       batch_size=batch_size,
       learning_rate=learning_rate,
+      sft_learning_rate=sft_learning_rate,
       use_rollout_logps=use_rollout_logps,
       sft_steps=sft_steps,
   )
 
   if not result.reward_history:
-    raise RuntimeError("Delphi T0 tool GRPO produced no reward history")
+    raise RuntimeError(f"Delphi {label} tool GRPO produced no reward history")
 
   for i in range(result.steps_ran):
     tcr = result.tool_call_rate_history[i] if i < len(result.tool_call_rate_history) else float("nan")
@@ -147,7 +153,7 @@ def _run_t0(*, model_dir, steps, num_generations, batch_size,
       flush=True,
   )
   print(
-      f"[launch] T0 COMPLETE ({result.steps_ran} steps, mode=t0)",
+      f"[launch] {label} COMPLETE ({result.steps_ran} steps, mode={label.lower()})",
       flush=True,
   )
 
@@ -162,12 +168,14 @@ def main() -> None:
   learning_rate = float(os.environ.get("DELPHI_LR", "1e-5"))
   use_rollout_logps = os.environ.get("DELPHI_USE_ROLLOUT_LOGPS", "0") == "1"
   sft_steps = int(os.environ.get("DELPHI_SFT_STEPS", "0"))
+  sft_learning_rate = float(os.environ.get("DELPHI_SFT_LR", "1e-4"))
   model_dir = os.environ.get("DELPHI_MODEL_DIR", "./delphi")
 
-  if mode not in ("port", "t0"):
+  if mode not in ("port", "t0", "t1"):
     raise ValueError(
         f"DELPHI_AGENT_MODE={mode!r} is not supported. Supported modes: "
-        "'port' (single-turn no-tool M-port) and 't0' (single calculator call)."
+        "'port' (single-turn no-tool M-port), 't0' (single calculator call) "
+        "and 't1' (two chained calculator calls)."
     )
 
   print(f"[launch] jax {jax.__version__} devices={jax.devices()}", flush=True)
@@ -192,8 +200,10 @@ def main() -> None:
         learning_rate=learning_rate,
         use_rollout_logps=use_rollout_logps,
     )
-  else:  # mode == "t0"
-    _run_t0(
+  else:  # mode in ("t0", "t1")
+    _run_tool_stage(
+        train_fn=train_agentic_t1 if mode == "t1" else train_agentic_t0,
+        label=mode.upper(),
         model_dir=model_dir,
         steps=steps,
         num_generations=num_generations,
@@ -201,6 +211,7 @@ def main() -> None:
         learning_rate=learning_rate,
         use_rollout_logps=use_rollout_logps,
         sft_steps=sft_steps,
+        sft_learning_rate=sft_learning_rate,
     )
 
 

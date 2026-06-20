@@ -58,14 +58,16 @@ from tunix.rl.agentic.environments.tool_environment import ToolEnvironment
 from tunix.rl.rollout import base_rollout
 
 from agentic_common import DelphiRawTextChatParser
-from agentic_sft import run_sft_warmup
+from agentic_sft import run_sft_warmup, t0_segments, t1_segments
 from agentic_tools import (
     CalcToolEnvironment,
     DelphiToolAgent,
     T0_SYSTEM_PROMPT,
     T0_TOOL_MAP,
+    T1_SYSTEM_PROMPT,
     arg_reward as t0_arg_reward,
     build_t0_dataset,
+    build_t1_dataset,
     install_per_call_rollout_seed,
     newline_terminal_eos_tokens,
     t0_metric_fn,
@@ -461,9 +463,13 @@ def train_agentic_port(
   )
 
 
-def train_agentic_t0(
+def _train_agentic_calc(
     *,
     model_dir: str,
+    dataset_builder=build_t0_dataset,
+    sft_segment_fn=t0_segments,
+    system_prompt: str = T0_SYSTEM_PROMPT,
+    env_max_steps: int = 2,
     steps: int = 50,
     num_generations: int = 8,
     batch_size: int = 4,
@@ -483,6 +489,8 @@ def train_agentic_t0(
     sft_steps: int = 0,
     sft_batch_size: int = 16,
     sft_learning_rate: float = 1e-4,
+    sft_prompt_prefix: str = "",
+    sft_max_seq_len: int = 80,
     mesh: jax.sharding.Mesh | None = None,
 ) -> T0TrainResult:
   """Runs Delphi T0 single-calculator-call GRPO through the AGENTIC tool stack.
@@ -580,6 +588,9 @@ def train_agentic_t0(
         batch_size=sft_batch_size,
         learning_rate=sft_learning_rate,
         mesh=mesh,
+        segment_fn=sft_segment_fn,
+        prompt_prefix=sft_prompt_prefix,
+        max_seq_len=sft_max_seq_len,
         seed=seed,
     )
 
@@ -644,7 +655,7 @@ def train_agentic_t0(
       use_rollout_logps=use_rollout_logps,
       # The agent's system content = system_prompt + (suppressed) tool docs; the
       # few-shot tool transcripts ARE the system prompt.
-      system_prompt=T0_SYSTEM_PROMPT,
+      system_prompt=system_prompt,
       max_response_length=max_tokens_to_generate,
       max_concurrency=batch_size * num_generations,
       loss_agg_mode="sequence-mean-token-mean",
@@ -685,11 +696,11 @@ def train_agentic_t0(
       env_class=CalcToolEnvironment,
       env_kwargs={
           "tool_map": T0_TOOL_MAP,
-          "max_steps": 2,
+          "max_steps": env_max_steps,
       },
   )
 
-  train_ds = build_t0_dataset(
+  train_ds = dataset_builder(
       n=steps * batch_size + batch_size,
       seed=seed,
       batch_size=batch_size,
@@ -703,4 +714,56 @@ def train_agentic_t0(
       arg_acc_history=capture.arg_acc_history,
       solve_ratio_history=capture.solve_ratio_history,
       steps_ran=len(capture.reward_history),
+  )
+
+
+def train_agentic_t0(**kwargs) -> T0TrainResult:
+  """T0: a SINGLE calculator call (2-digit multiply).
+
+  Thin wrapper over :func:`_train_agentic_calc` with its T0 defaults
+  (``build_t0_dataset`` / ``t0_segments`` / ``T0_SYSTEM_PROMPT`` /
+  ``env_max_steps=2``). See that function for the full pipeline + arg docs.
+  """
+  return _train_agentic_calc(**kwargs)
+
+
+def train_agentic_t1(
+    *,
+    max_prompt_length: int = 768,
+    max_tokens_to_generate: int = 128,
+    **kwargs,
+) -> T0TrainResult:
+  """T1: TWO CHAINED calculator calls (``a * b * c``).
+
+  Same agentic GRPO pipeline as T0, but the episode is three turns -- the model
+  must (1) ``CALC(a * b)``, (2) COPY that ~4-digit intermediate into a second
+  ``CALC(<a*b> * c)`` (true chaining: the turn-1 tool OUTPUT is a turn-2 ARGUMENT),
+  and (3) copy the final product. ``env_max_steps=3`` admits the extra tool turn;
+  the gold is the precomputed ``answer`` column (``a*b*c``), so the stock
+  :class:`CalcToolEnvironment` copy/solve reward and ``t0_metric_fn`` carry over
+  unchanged (``arg_acc`` still scores the turn-1 ``CALC(a * b)`` operands). The
+  prompt/response budgets are larger than T0 to fit the extra turn + the longer
+  intermediate. The SFT warm-up (:func:`agentic_sft.t1_segments`) is what makes
+  the chained copy in-distribution; without it RL stalls exactly as T0 did.
+
+  Args:
+    max_prompt_length: max accumulated prompt length (system + up to 3 turns).
+    max_tokens_to_generate: per-EPISODE budget across all 3 turns.
+    **kwargs: forwarded to :func:`_train_agentic_calc` (steps, num_generations,
+      batch_size, learning_rate, sft_steps, ...).
+  """
+  return _train_agentic_calc(
+      dataset_builder=build_t1_dataset,
+      sft_segment_fn=t1_segments,
+      system_prompt=T1_SYSTEM_PROMPT,
+      # Prepend the same few-shot prompt to the SFT transcripts (masked) so the
+      # SFT context == the RL rollout prompt. Without this, T1's SFT corrupts the
+      # turn-1 CALC emission (the few-shot ALONE gets it right; the mismatched SFT
+      # breaks it). T0 does not need this (its mismatch is benign).
+      sft_prompt_prefix=T1_SYSTEM_PROMPT,
+      sft_max_seq_len=256,
+      env_max_steps=3,
+      max_prompt_length=max_prompt_length,
+      max_tokens_to_generate=max_tokens_to_generate,
+      **kwargs,
   )

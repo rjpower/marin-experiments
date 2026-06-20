@@ -182,6 +182,27 @@ T0_SYSTEM_PROMPT = (
 )
 
 
+# T1 (two chained calls): the second CALC carries the FIRST tool result as an
+# argument, so the demos show the model copying the intermediate forward.
+T1_SYSTEM_PROMPT = (
+    "You are a calculator-using assistant. Use the calculator ONE step at a "
+    "time: write CALC(...) for the first product, read the tool result, then "
+    "use that result in the next CALC(...), and finally give the number.\n"
+    "Q: 12 * 13 * 14\n"
+    "CALC(12 * 13)\n"
+    "Tool result: 156\n"
+    "CALC(156 * 14)\n"
+    "Tool result: 2184\n"
+    "2184\n"
+    "Q: 24 * 31 * 17\n"
+    "CALC(24 * 31)\n"
+    "Tool result: 744\n"
+    "CALC(744 * 17)\n"
+    "Tool result: 12648\n"
+    "12648"
+)
+
+
 # A genuine end-of-line for a T0 turn ends in a digit (the final numeric answer)
 # or ``')'`` (the close of a ``CALC(a * b)`` call). A trailing-newline BPE token
 # is a valid turn stop ONLY if the char before the newline is one of these (or
@@ -385,6 +406,55 @@ def build_t0_dataset(n: int, seed: int, batch_size: int) -> grain.MapDataset:
   return grain.MapDataset.source(source).batch(batch_size).map(_to_columns)
 
 
+def _make_t1_problem(rng: random.Random) -> tuple[str, int, int, int, str]:
+  """Generates one CHAINED ``a * b * c`` problem (T1: two dependent calls).
+
+  The agent must compute ``a*b`` (turn 1), COPY that ~4-digit intermediate into
+  a second ``CALC(<a*b> * c)`` (turn 2), then copy the final product (turn 3) --
+  so the turn-2 call exercises true chaining (using turn-1's tool output as an
+  argument), not just two independent calls. All operands are 2-digit ``[11,99]``.
+
+  Returns:
+    ``(prompt, a, b, c, answer)`` where ``prompt`` is ``"Q: a * b * c"`` and
+    ``answer`` is ``str(a*b*c)``.
+  """
+  a = rng.randint(11, 99)
+  b = rng.randint(11, 99)
+  c = rng.randint(11, 99)
+  return f"Q: {a} * {b} * {c}", a, b, c, str(a * b * c)
+
+
+class _T1Source(grain.RandomAccessDataSource):
+  """A grain source of ``(prompt, a, b, c, answer)`` T1 rows (deterministic)."""
+
+  def __init__(self, n: int, seed: int):
+    rng = random.Random(seed)
+    self._rows = [_make_t1_problem(rng) for _ in range(n)]
+
+  def __len__(self) -> int:
+    return len(self._rows)
+
+  def __getitem__(self, idx: int) -> tuple[str, int, int, int, str]:
+    return self._rows[idx]
+
+
+def build_t1_dataset(n: int, seed: int, batch_size: int) -> grain.MapDataset:
+  """Builds a batched grain dataset of chained ``a * b * c`` problems for GRPO.
+
+  Emits ``prompts`` / ``a`` / ``b`` / ``c`` / ``answer`` columns. ``a`` / ``b``
+  feed the turn-1 :func:`arg_reward` / :func:`t0_metric_fn` (the first call is
+  ``CALC(a * b)``); ``c`` rides along as an unused reward kwarg; ``answer``
+  (``str(a*b*c)``) is the gold the :class:`CalcToolEnvironment` scores against.
+  """
+  source = _T1Source(n, seed)
+
+  def _to_columns(batch):
+    prompts, a, b, c, answers = batch
+    return {"prompts": prompts, "a": a, "b": b, "c": c, "answer": answers}
+
+  return grain.MapDataset.source(source).batch(batch_size).map(_to_columns)
+
+
 # ---------------------------------------------------------------------------
 # CALC text parser + Delphi tool agent.
 # ---------------------------------------------------------------------------
@@ -549,13 +619,19 @@ class CalcToolEnvironment(ToolEnvironment):
     return outputs
 
   def _shaped_reward(self, task: Dict[str, Any], action: Any) -> float:
-    """Copy-aware terminal reward: copy term (+0.4) + solve term (+1.0)."""
+    """Copy-aware terminal reward: copy term (+0.4) + solve term (+1.0).
+
+    The gold value is the precomputed ``task["answer"]`` (so this generalizes
+    over the whole CALC curriculum: ``a*b`` for T0, ``a*b*c`` for T1's chained
+    calls, etc.); it falls back to ``a*b`` when no answer column is present.
+    """
     try:
-      a = _coerce_int(task["a"])
-      b = _coerce_int(task["b"])
+      gold = _coerce_int(task["answer"])
     except (KeyError, AttributeError, ValueError, TypeError):
-      return 0.0
-    gold = a * b
+      try:
+        gold = _coerce_int(task["a"]) * _coerce_int(task["b"])
+      except (KeyError, AttributeError, ValueError, TypeError):
+        return 0.0
     answer_text = action if isinstance(action, str) else str(action)
     reward = 0.0
     # Dense copy term: did the final answer copy the injected tool result?
@@ -564,14 +640,14 @@ class CalcToolEnvironment(ToolEnvironment):
         rf"(?<!\d){re.escape(result)}(?!\d)", answer_text
     ):
       reward += 0.4
-    # Solve term: did the final answer contain the gold product as a standalone
+    # Solve term: did the final answer contain the gold value as a standalone
     # integer (so "24" does not spuriously match inside "2491")?
     solved = re.search(rf"(?<!\d){gold}(?!\d)", answer_text) is not None
     if solved:
       reward += 1.0
     if _T0_DEBUG_SAMPLES:
       print(
-          f"[t0-dbg] final a*b={a}*{b}={gold} toolres={result} "
+          f"[t0-dbg] final gold={gold} toolres={result} "
           f"reward={reward} answer={answer_text[:80]!r}",
           flush=True,
       )

@@ -1,46 +1,49 @@
-"""Supervised warm-up for the Delphi T0 agentic tool stage.
+"""Supervised warm-up for the Delphi agentic tool stages (T0 / T1).
 
-The T0 GRPO run learns the tool CALL and its operands well (``arg_acc`` 0.37 ->
-0.99 on TPU) but the final-answer COPY -- emitting the injected tool result
-instead of a guessed product -- never takes off: copying a multi-digit number
-verbatim after ``"Tool result: X"`` is out-of-distribution for the 447M Delphi
-base LM, so it happens too rarely in the rollouts for GRPO to reinforce
-(``solve_ratio`` peaks ~0.1 then collapses back to ~0.03 as the policy sharpens
-and exploration dies). This is the classic "RL can only amplify what the base
-policy already samples" wall.
+RL masters the tool CALL + operands but cannot bootstrap the COPY behaviors that
+ground a multi-turn tool episode -- copying the injected ``Tool result: X`` into
+the next call (chaining) or into the final answer is out-of-distribution for the
+447M Delphi base LM, so it is sampled too rarely for GRPO to amplify (T0
+``solve_ratio`` peaked ~0.1 then collapsed as the policy sharpened). This is the
+classic "RL only amplifies what the base policy already samples" wall.
 
 This module does the standard fix: a short SUPERVISED fine-tune that makes the
 call+copy pattern in-distribution BEFORE RL, using tunix's stock
 :class:`~tunix.sft.peft_trainer.PeftTrainer` on the SAME in-memory model object
-(no checkpoint round-trip) -- the warmed ``actor`` flows straight into the
-``RLCluster``. The handoff works because both phases mutate the same ``nnx``
+(no checkpoint round-trip). The warmed ``actor`` flows straight into the
+``RLCluster``; the handoff works because both phases mutate the same ``nnx``
 module in place and ``RLCluster`` re-shards as needed.
 
-Each transcript is the clean single-tool episode::
+Each transcript is the clean tool episode for its stage:
 
-    Q: {a} * {b}
-    CALC({a} * {b})
-    Tool result: {a*b}
-    {a*b}
+  * T0 (single call)::            Q: a * b
+                                  CALC(a * b)
+                                  Tool result: a*b
+                                  a*b
+  * T1 (two chained calls)::      Q: a * b * c
+                                  CALC(a * b)
+                                  Tool result: a*b
+                                  CALC(<a*b> * c)
+                                  Tool result: a*b*c
+                                  a*b*c
 
-with a 3-way mask: train (loss mask 1) on the MODEL's turns -- the
-``CALC(a * b)`` call and the final answer line -- and NOT (loss mask 0) on the
-question or the environment-provided ``Tool result:`` line (the env emits that at
-RL time; the model must learn to copy it, not to produce it). ``positions`` and
-the causal ``attention_mask`` are built from a separate PADDING mask (real tokens
-vs right-padding), exactly as the rollout / RL loss path does it.
+with a per-turn loss mask: train (mask 1) on the MODEL's turns -- every
+``CALC(...)`` call and the final answer -- and NOT (mask 0) on the question or
+the environment-provided ``Tool result:`` lines (the env emits those at RL time;
+the model must learn to COPY them, not produce them). ``positions`` and the
+causal ``attention_mask`` are built from a separate PADDING mask, exactly as the
+rollout / RL loss path does it.
 
 The PeftTrainer's default loss is next-token NLL over ``input_mask`` (see
 ``peft_trainer._default_loss_fn``); the default ``gen_model_input_fn`` is the
 identity, so we install :func:`sft_model_input_fn` to expand each batched
-``{input_tokens, loss_mask, pad_mask}`` row into the loss-fn kwargs
-``{input_tokens, input_mask, positions, attention_mask}``.
+``{input_tokens, loss_mask, pad_mask}`` row into the loss-fn kwargs.
 """
 
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import grain.python as grain
 import jax
@@ -52,37 +55,62 @@ from tunix.sft.peft_trainer import PeftTrainer, TrainingConfig
 
 from delphi_qwen3 import DELPHI_BOS_ID, DELPHI_EOS_ID
 
-# Each transcript segment is (text, train_on_it?). Mask 1 == the model's own
-# turns (the tool call + the copied answer); mask 0 == context the model
-# conditions on but must not be trained to emit (the question, the tool result).
-_SFT_SEGMENTS = (
-    ("Q: {a} * {b}\n", 0),
-    ("CALC({a} * {b})\n", 1),
-    ("Tool result: {gold}\n", 0),
-    ("{gold}\n", 1),
-)
+# A transcript is a list of (text, train_on_it?) segments. Mask 1 == the model's
+# own turns (the tool calls + the copied answer); mask 0 == context the model
+# conditions on but must not be trained to emit (the question, the tool results).
+Segments = List[Tuple[str, int]]
+SegmentFn = Callable[[random.Random], Segments]
 
 
-def _encode_sft_example(
-    tokenizer, a: int, b: int, max_seq_len: int
+def t0_segments(rng: random.Random) -> Segments:
+  """One single-call ``a * b`` transcript (T0)."""
+  a = rng.randint(11, 99)
+  b = rng.randint(11, 99)
+  gold = a * b
+  return [
+      (f"Q: {a} * {b}\n", 0),
+      (f"CALC({a} * {b})\n", 1),
+      (f"Tool result: {gold}\n", 0),
+      (f"{gold}\n", 1),
+  ]
+
+
+def t1_segments(rng: random.Random) -> Segments:
+  """One chained two-call ``a * b * c`` transcript (T1).
+
+  The second call ``CALC(<a*b> * c)`` carries the turn-1 RESULT as an argument,
+  so the warm-up teaches chaining (copy the tool output into the next call), not
+  just two independent calls.
+  """
+  a = rng.randint(11, 99)
+  b = rng.randint(11, 99)
+  c = rng.randint(11, 99)
+  ab = a * b
+  gold = ab * c
+  return [
+      (f"Q: {a} * {b} * {c}\n", 0),
+      (f"CALC({a} * {b})\n", 1),
+      (f"Tool result: {ab}\n", 0),
+      (f"CALC({ab} * {c})\n", 1),
+      (f"Tool result: {gold}\n", 0),
+      (f"{gold}\n", 1),
+  ]
+
+
+def _encode_segments(
+    tokenizer, segments: Segments, max_seq_len: int
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-  """Tokenizes one CALC transcript into (input_tokens, loss_mask, pad_mask).
+  """Tokenizes one transcript into (input_tokens, loss_mask, pad_mask).
 
   Segments are encoded independently (``add_special_tokens=False``) and
   concatenated so the loss mask lines up exactly with segment boundaries; the
   minor BPE boundary effects between segments are irrelevant for teaching the
   pattern. A leading BOS is prepended (mask 0) and the whole thing is
   right-padded to ``max_seq_len`` with ``pad=eos`` (mask 0, pad_mask 0).
-
-  Returns:
-    ``(input_tokens, loss_mask, pad_mask)`` numpy arrays of shape
-    ``[max_seq_len]`` with dtypes int32 / float32 / bool.
   """
-  gold = a * b
   ids: List[int] = [DELPHI_BOS_ID]
   loss: List[int] = [0]
-  for template, train_flag in _SFT_SEGMENTS:
-    text = template.format(a=a, b=b, gold=gold)
+  for text, train_flag in segments:
     seg_ids = tokenizer.encode(text, add_special_tokens=False)
     ids.extend(seg_ids)
     loss.extend([train_flag] * len(seg_ids))
@@ -101,15 +129,32 @@ def _encode_sft_example(
 
 
 class _SFTSource(grain.RandomAccessDataSource):
-  """A grain source of pre-tokenized (input_tokens, loss_mask, pad_mask) rows."""
+  """A grain source of pre-tokenized (input_tokens, loss_mask, pad_mask) rows.
 
-  def __init__(self, tokenizer, n: int, seed: int, max_seq_len: int):
+  When ``prompt_prefix`` is non-empty it is prepended (loss mask 0) to every
+  transcript, so the SFT context matches the RL rollout prompt EXACTLY (the
+  rollout prepends the few-shot ``system_prompt``). Without this, SFT trains the
+  ``Q -> CALC`` mapping in a bare ``BOS Q:...`` context that does not transfer to
+  the RL ``<few-shot> Q:...`` context -- benign for the single-call T0, but for
+  the harder chained T1 it actively corrupts turn-1 (the model stops emitting
+  ``CALC(`` and just echoes the operands).
+  """
+
+  def __init__(
+      self,
+      tokenizer,
+      n: int,
+      seed: int,
+      max_seq_len: int,
+      segment_fn: SegmentFn,
+      prompt_prefix: str = "",
+  ):
     rng = random.Random(seed)
-    self._rows = []
-    for _ in range(n):
-      a = rng.randint(11, 99)
-      b = rng.randint(11, 99)
-      self._rows.append(_encode_sft_example(tokenizer, a, b, max_seq_len))
+    prefix_segs: Segments = [(prompt_prefix + "\n", 0)] if prompt_prefix else []
+    self._rows = [
+        _encode_segments(tokenizer, prefix_segs + segment_fn(rng), max_seq_len)
+        for _ in range(n)
+    ]
 
   def __len__(self) -> int:
     return len(self._rows)
@@ -119,15 +164,22 @@ class _SFTSource(grain.RandomAccessDataSource):
 
 
 def build_sft_dataset(
-    tokenizer, n: int, seed: int, batch_size: int, max_seq_len: int
+    tokenizer,
+    n: int,
+    seed: int,
+    batch_size: int,
+    max_seq_len: int,
+    segment_fn: SegmentFn = t0_segments,
+    prompt_prefix: str = "",
 ) -> grain.MapDataset:
-  """Builds a batched grain dataset of CALC SFT transcripts.
+  """Builds a batched grain dataset of CALC SFT transcripts for a stage.
 
   ``.batch`` collates the 3-tuple rows field-wise into a 3-tuple of stacked
   ``[B, max_seq_len]`` arrays; ``.map`` names them into a dict consumed by
-  :func:`sft_model_input_fn`.
+  :func:`sft_model_input_fn`. ``prompt_prefix`` (if set) is prepended masked to
+  every transcript to match the RL rollout prompt.
   """
-  source = _SFTSource(tokenizer, n, seed, max_seq_len)
+  source = _SFTSource(tokenizer, n, seed, max_seq_len, segment_fn, prompt_prefix)
 
   def _to_columns(batch):
     input_tokens, loss_mask, pad_mask = batch
@@ -164,7 +216,9 @@ def run_sft_warmup(
     batch_size: int,
     learning_rate: float,
     mesh: jax.sharding.Mesh,
-    max_seq_len: int = 64,
+    segment_fn: SegmentFn = t0_segments,
+    prompt_prefix: str = "",
+    max_seq_len: int = 80,
     seed: int = 0,
 ) -> Any:
   """SFT-warms ``model`` in place on CALC transcripts, then returns it.
@@ -172,16 +226,19 @@ def run_sft_warmup(
   The same ``nnx`` model object is handed back for the RL phase (no checkpoint).
   ``train()`` is run inside the mesh context so PeftTrainer's ``shard_input``
   shards the data batches across the ``fsdp`` axis (it reads the ambient mesh
-  from ``pxla.thread_resources``).
+  from ``pxla.thread_resources``). The actor MUST already be FSDP-sharded on the
+  mesh (PeftTrainer shards the optimizer state to the full mesh); the caller
+  arranges that via ``load_delphi(mesh=...)``.
 
   Args:
-    model: the Delphi ``nnx`` actor (fp32) to fine-tune in place.
+    model: the Delphi ``nnx`` actor (fp32), already sharded on ``mesh``.
     tokenizer: the Delphi HF tokenizer (pad=eos).
     steps: number of SFT optimizer steps.
     batch_size: transcripts per step.
     learning_rate: AdamW lr (clipped at global-norm 1.0, as in the RL phase).
     mesh: the device mesh the model is sharded on.
-    max_seq_len: padded transcript length (a CALC episode is ~30 tokens).
+    segment_fn: the per-stage transcript builder (T0 single call vs T1 chained).
+    max_seq_len: padded transcript length (T0 ~30 tokens, T1 ~50; 80 covers both).
     seed: PRNG seed for the synthetic problem set.
 
   Returns:
@@ -193,6 +250,8 @@ def run_sft_warmup(
       seed=seed,
       batch_size=batch_size,
       max_seq_len=max_seq_len,
+      segment_fn=segment_fn,
+      prompt_prefix=prompt_prefix,
   )
   optimizer = optax.chain(
       optax.clip_by_global_norm(1.0),
