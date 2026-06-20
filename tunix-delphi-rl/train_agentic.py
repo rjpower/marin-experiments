@@ -54,9 +54,21 @@ from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.agentic.agentic_grpo_learner import GRPOConfig, GRPOLearner
 from tunix.rl.agentic.agents.model_agent import ModelAgent
 from tunix.rl.agentic.environments.task_environment import TaskEnvironment
+from tunix.rl.agentic.environments.tool_environment import ToolEnvironment
 from tunix.rl.rollout import base_rollout
 
 from agentic_common import DelphiRawTextChatParser
+from agentic_tools import (
+    CalcToolEnvironment,
+    DelphiToolAgent,
+    T0_SYSTEM_PROMPT,
+    T0_TOOL_MAP,
+    arg_reward as t0_arg_reward,
+    build_t0_dataset,
+    install_per_call_rollout_seed,
+    newline_terminal_eos_tokens,
+    t0_metric_fn,
+)
 from arithmetic import (
     answer_reward,
     build_arithmetic_dataset,
@@ -135,6 +147,96 @@ class _AgenticMetricsCapture:
     logp_diff = self._mean_of(metrics.get("sampler_trainer/logp_diff_mean"))
     if logp_diff is not None:
       self.logp_diff_history.append(logp_diff)
+
+
+@dataclasses.dataclass
+class T0TrainResult:
+  """Result of a Delphi T0 tool-call GRPO run.
+
+  Attributes:
+    reward_history: per-global-step mean summed reward (env answer-in-output
+      +1.0, learner arg +0.5, learner format +0.1).
+    tool_call_rate_history: per-step ``tool/tool_call_rate`` (parseable turn-1
+      tool-call rate; ~1.0 from cold).
+    arg_acc_history: per-step ``tool/arg_acc`` (correct-operand rate; the KEY
+      learnable signal, ~0.10 cold).
+    solve_ratio_history: per-step ``arithmetic/solve_ratio`` (final-answer-
+      contains-product rate).
+    steps_ran: number of global steps with a captured reward.
+  """
+
+  reward_history: list[float]
+  tool_call_rate_history: list[float]
+  arg_acc_history: list[float]
+  solve_ratio_history: list[float]
+  steps_ran: int
+
+
+class _T0MetricsCapture:
+  """Captures per-step reward / tool_call_rate / arg_acc / solve_ratio.
+
+  Mirrors :class:`_AgenticMetricsCapture` but reads the T0 reward fns'
+  per-reward-fn means (``rewards/<fn>``) plus the T0 ``tool/`` and
+  ``arithmetic/solve_ratio`` metrics emitted by
+  :func:`agentic_tools.t0_metric_fn`. The summed reward also includes the env
+  ``trajectory_reward`` (+1.0 answer-in-output), which the agentic reward
+  manager folds into the per-fn rewards via ``trajectory_rewards``; we
+  reconstruct the displayed mean from the learner reward fns and add the
+  solve-driven trajectory term so the printed reward tracks the full signal.
+  """
+
+  def __init__(self):
+    self.reward_history: list[float] = []
+    self.tool_call_rate_history: list[float] = []
+    self.arg_acc_history: list[float] = []
+    self.solve_ratio_history: list[float] = []
+
+  @staticmethod
+  def _mean_of(entry: Any) -> float | None:
+    if entry is None or not entry[0]:
+      return None
+    return float(np.mean(np.asarray(entry[0], dtype=np.float32)))
+
+  def __call__(self, metrics_buffer, *args, **kwargs) -> None:
+    del args, kwargs
+    if "train" not in str(getattr(metrics_buffer, "mode", "")).lower():
+      return
+    metrics = getattr(metrics_buffer, "metrics", {})
+
+    # Learner reward-fn means (arg + format); the env answer-in-output reward is
+    # surfaced via solve_ratio below (it is the +1.0 trajectory term).
+    reward_terms = [
+        self._mean_of(metrics.get(f"rewards/{name}"))
+        for name in ("arg_reward", "format_reward")
+    ]
+    reward_terms = [r for r in reward_terms if r is not None]
+
+    tool_call_rate = self._mean_of(metrics.get("tool/tool_call_rate"))
+    if tool_call_rate is not None:
+      self.tool_call_rate_history.append(tool_call_rate)
+    arg_acc = self._mean_of(metrics.get("tool/arg_acc"))
+    if arg_acc is not None:
+      self.arg_acc_history.append(arg_acc)
+    solve = self._mean_of(metrics.get("arithmetic/solve_ratio"))
+    if solve is not None:
+      self.solve_ratio_history.append(solve)
+
+    # Summed reward shown per step = learner terms + env answer term (~solve).
+    if reward_terms or solve is not None:
+      total = float(sum(reward_terms)) + (solve if solve is not None else 0.0)
+      self.reward_history.append(total)
+      # Stream the step live to stdout so long TPU runs show progress (and
+      # partial results survive a late preemption) instead of only dumping the
+      # full trajectory after train() returns.
+      step = len(self.reward_history) - 1
+      tcr = tool_call_rate if tool_call_rate is not None else float("nan")
+      aacc = arg_acc if arg_acc is not None else float("nan")
+      sr = solve if solve is not None else float("nan")
+      print(
+          f"[t0] step {step:4d}: mean_reward={total:.4f} "
+          f"tool_call_rate={tcr:.4f} arg_acc={aacc:.4f} solve_ratio={sr:.4f}",
+          flush=True,
+      )
 
 
 class _NormalizingGRPOLearner(GRPOLearner):
@@ -287,8 +389,18 @@ def train_agentic_port(
       rollout_engine="vanilla",
       offload_to_cpu=False,
       training_config=rl_cluster_lib.RLTrainingConfig(
-          actor_optimizer=optax.adamw(
-              learning_rate=learning_rate, b1=0.9, b2=0.99, weight_decay=0.0
+          # Gradient clipping is load-bearing for the multi-turn tool stage: an
+          # occasional exploding update (more frequent at higher lr) produced
+          # inf/NaN that crashed the TPU run with a libtpu SIGSEGV mid-training
+          # (e.g. lr=2e-5 crashed ~step 3, lr=1e-5 ~step 99) and a restart loses
+          # all progress. Clipping the global norm bounds the update and keeps
+          # runs alive long enough to converge (solve_ratio was already climbing
+          # to ~8% in the first steps before the crash). Harmless for M-port.
+          actor_optimizer=optax.chain(
+              optax.clip_by_global_norm(1.0),
+              optax.adamw(
+                  learning_rate=learning_rate, b1=0.9, b2=0.99, weight_decay=0.0
+              ),
           ),
           eval_every_n_steps=eval_every_n_steps,
           max_steps=steps,
@@ -344,5 +456,214 @@ def train_agentic_port(
       reward_history=capture.reward_history,
       solve_ratio_history=capture.solve_ratio_history,
       logp_diff_history=capture.logp_diff_history,
+      steps_ran=len(capture.reward_history),
+  )
+
+
+def train_agentic_t0(
+    *,
+    model_dir: str,
+    steps: int = 50,
+    num_generations: int = 8,
+    batch_size: int = 4,
+    learning_rate: float = 1e-5,
+    temperature: float = 0.9,
+    # The few-shot tool-call system prompt is ~177 tokens, and the multi-turn
+    # conversation accumulates (task + tool call + tool result + finish), so the
+    # per-turn prompt grows well past M-port's. Size generously: a crash here is
+    # "Total sampling steps N must be less than cache size" (kv_cache_size below).
+    max_prompt_length: int = 640,
+    max_tokens_to_generate: int = 96,
+    beta: float = 0.0,
+    seed: int = 0,
+    eval_every_n_steps: int = 10**9,
+    use_rollout_logps: bool = False,
+    stop_on_newline: bool = True,
+    mesh: jax.sharding.Mesh | None = None,
+) -> T0TrainResult:
+  """Runs Delphi T0 single-calculator-call GRPO through the AGENTIC tool stack.
+
+  Builds the full agentic ``RLCluster`` + ``GRPOLearner`` pipeline with the REAL
+  Delphi model and the tunix tool stack: ``ToolEnvironment`` (stock
+  ``CalculatorTool``) + :class:`agentic_tools.DelphiToolAgent` (suppressed Qwen
+  tool docs + task-as-user-turn) + the suppressed Qwen ``<tool_call>`` parser +
+  :class:`agentic_common.DelphiRawTextChatParser` (with ``generation_suffix="\\n"``
+  so the model starts each turn on a fresh line and does NOT emit a leading
+  newline that the newline-stop would discard).
+
+  Shaped reward (dense gradient on operand-copy):
+    * env ``reward_fn(task, action)`` -> +1.0 if the final answer contains the
+      correct product (the ``trajectory_reward``).
+    * learner ``arg_reward`` -> +0.5 if the turn-1 tool call carries the correct
+      operands (the KEY learnable signal; ~0.10 cold).
+    * learner ``format_reward`` -> +0.1 if the turn-1 text is a parseable call.
+
+  Reward-kwarg flow (verified in ``agentic_grpo_learner._process_results``): the
+  dataset's ``a`` / ``b`` / ``answer`` columns become the env task dict (the
+  trajectory's ``original_input``); the learner forwards every ``original_input``
+  column except ``prompts`` to the reward fns and the metric fn as kwargs. The
+  ``completions`` passed to the learner reward fns are the FIRST assistant
+  message (the turn-1 ``<tool_call>`` text).
+
+  Args:
+    model_dir: directory containing Delphi's ``model.safetensors`` + tokenizer.
+    steps: number of GRPO global steps (``max_steps``).
+    num_generations: GRPO group size (responses per prompt; must be > 1).
+    batch_size: prompts per global step.
+    learning_rate: AdamW learning rate.
+    temperature: rollout sampling temperature.
+    max_prompt_length: max prompt length (the few-shot system prompt + task; the
+      T0 few-shot transcripts are ~180 tokens, so 256 is comfortable).
+    max_tokens_to_generate: per-EPISODE completion budget across all turns; MUST
+      equal ``GRPOConfig.max_response_length`` (enforced by the learner). A
+      2-turn T0 episode uses ~40 tokens (call ~30 + tool result ~5 + answer ~2),
+      so 96 leaves headroom.
+    beta: KL-to-reference weight. ``0.0`` drops the reference model entirely.
+    seed: PRNG seed for the problem set.
+    eval_every_n_steps: eval stride (defaults to effectively never).
+    use_rollout_logps: when True the rollout returns logprobs and the learner
+      logs the sampler-vs-trainer logp diff; defaults False (recompute logps;
+      sidesteps the 0.1.7 cross-turn logp-parity weakness).
+    stop_on_newline: when True (default) the newline token is added to
+      ``eos_tokens`` so each single-line turn (the tool call, the final answer)
+      stops at its newline boundary and the episode stays well under the
+      response budget. REQUIRED: a base LM never emits real EOS, so without a
+      single-token stop every turn fills the whole budget and the agentic
+      context-limit check discards it (empty completions, zero reward). The
+      chat parser's ``generation_suffix="\\n"`` ensures the model emits content
+      BEFORE the first newline (so the stop does not fire on an empty turn).
+    mesh: optional device mesh; defaults to a colocated ``(ndev, 1)`` mesh.
+
+  Returns:
+    A :class:`T0TrainResult` with the reward / tool_call_rate / arg_acc /
+    solve_ratio histories.
+  """
+  tokenizer = load_tokenizer(model_dir)
+
+  actor = load_delphi(model_dir, dtype=jnp.float32)
+  reference = None if beta == 0.0 else load_delphi(model_dir, dtype=jnp.bfloat16)
+
+  if mesh is None:
+    mesh = _build_mesh()
+
+  # Robust newline-stop: a base LM never emits real EOS, so each single-line
+  # turn must stop at its newline. The Llama-3 BPE FUSES a newline with the
+  # preceding char (``"</tool_call>\n"`` ends in token 397 ``">\n"``, not 198),
+  # so a single-id newline stop misses it and the model runs past the call. We
+  # stop on ANY token ending in a trailing newline (no token has an internal
+  # newline, so this == "stop at the first newline" at the BPE level). See
+  # ``agentic_tools.newline_terminal_eos_tokens``.
+  eos_tokens = [DELPHI_EOS_ID]
+  if stop_on_newline:
+    eos_tokens = sorted(set(eos_tokens) | set(newline_terminal_eos_tokens(tokenizer)))
+
+  kv_cache_size = max_prompt_length + max_tokens_to_generate + 8
+  rollout_config = base_rollout.RolloutConfig(
+      max_prompt_length=max_prompt_length,
+      kv_cache_size=kv_cache_size,
+      max_tokens_to_generate=max_tokens_to_generate,
+      temperature=temperature,
+      top_p=1.0,
+      top_k=None,
+      return_logprobs=use_rollout_logps,
+      eos_tokens=eos_tokens,
+  )
+
+  cluster_config = rl_cluster_lib.ClusterConfig(
+      role_to_mesh={
+          rl_cluster_lib.Role.ACTOR: mesh,
+          rl_cluster_lib.Role.REFERENCE: mesh,
+          rl_cluster_lib.Role.ROLLOUT: mesh,
+      },
+      rollout_engine="vanilla",
+      offload_to_cpu=False,
+      training_config=rl_cluster_lib.RLTrainingConfig(
+          # Gradient clipping is load-bearing for the multi-turn tool stage: an
+          # occasional exploding update (more frequent at higher lr) produced
+          # inf/NaN that crashed the TPU run with a libtpu SIGSEGV mid-training
+          # (e.g. lr=2e-5 crashed ~step 3, lr=1e-5 ~step 99) and a restart loses
+          # all progress. Clipping the global norm bounds the update and keeps
+          # runs alive long enough to converge (solve_ratio was already climbing
+          # to ~8% in the first steps before the crash). Harmless for M-port.
+          actor_optimizer=optax.chain(
+              optax.clip_by_global_norm(1.0),
+              optax.adamw(
+                  learning_rate=learning_rate, b1=0.9, b2=0.99, weight_decay=0.0
+              ),
+          ),
+          eval_every_n_steps=eval_every_n_steps,
+          max_steps=steps,
+      ),
+      rollout_config=rollout_config,
+  )
+
+  grpo_config = GRPOConfig(
+      num_generations=num_generations,
+      num_iterations=1,
+      beta=beta,
+      epsilon=0.2,
+      advantage_estimator="grpo",
+      degenerate_group_masking=False,
+      use_rollout_logps=use_rollout_logps,
+      # The agent's system content = system_prompt + (suppressed) tool docs; the
+      # few-shot tool transcripts ARE the system prompt.
+      system_prompt=T0_SYSTEM_PROMPT,
+      max_response_length=max_tokens_to_generate,
+      max_concurrency=batch_size * num_generations,
+      loss_agg_mode="sequence-mean-token-mean",
+  )
+
+  rl_cluster = rl_cluster_lib.RLCluster(
+      actor=actor,
+      reference=reference,
+      tokenizer=tokenizer,
+      cluster_config=cluster_config,
+  )
+
+  # CRITICAL: vary the rollout seed per generation. tunix 0.1.7 generates each
+  # group member with a SEPARATE generate() call but a FIXED RolloutConfig.seed,
+  # so all num_generations samples would be byte-identical -> zero intra-group
+  # variance -> zero GRPO advantage -> no gradient. This patches the rollout to
+  # fold a fresh per-call seed. (See agentic_tools.install_per_call_rollout_seed.)
+  install_per_call_rollout_seed(rl_cluster, base_seed=seed)
+
+  capture = _T0MetricsCapture()
+  rl_cluster.with_external_metrics_logger(capture)
+
+  # CalcToolEnvironment computes its own copy-aware shaped TERMINAL reward
+  # (copy term +0.4 if the final answer copies the executed tool result, solve
+  # term +1.0 if it contains the gold product), so no reward_fn is passed via
+  # env_kwargs. The learner arg_reward (+0.5, correct operands) is summed on top;
+  # format_reward is dropped (redundant now that CALC parsing is closing-optional
+  # and the dense copy term carries the turn-2 signal). The (agent, env) pair
+  # builder forwards env_kwargs into CalcToolEnvironment(single_example,
+  # tool_map=..., max_steps=2).
+  learner = _NormalizingGRPOLearner(
+      rl_cluster=rl_cluster,
+      algo_config=grpo_config,
+      reward_fns=[t0_arg_reward],
+      chat_parser=DelphiRawTextChatParser(generation_suffix="\n"),
+      metric_fns=[t0_metric_fn],
+      agent_class=DelphiToolAgent,
+      env_class=CalcToolEnvironment,
+      env_kwargs={
+          "tool_map": T0_TOOL_MAP,
+          "max_steps": 2,
+      },
+  )
+
+  train_ds = build_t0_dataset(
+      n=steps * batch_size + batch_size,
+      seed=seed,
+      batch_size=batch_size,
+  )
+
+  learner.train(train_ds, eval_dataset=None)
+
+  return T0TrainResult(
+      reward_history=capture.reward_history,
+      tool_call_rate_history=capture.tool_call_rate_history,
+      arg_acc_history=capture.arg_acc_history,
+      solve_ratio_history=capture.solve_ratio_history,
       steps_ran=len(capture.reward_history),
   )

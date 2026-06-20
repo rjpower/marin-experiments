@@ -27,7 +27,13 @@ text is harmless for the single-turn case (no tool messages are produced).
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List
+
+# Temporary diagnostic: when DELPHI_T0_DEBUG=1, print the rendered MULTI-TURN
+# rollout prompt (the one containing a tool result) so we can see exactly what
+# the model is asked to continue on turn 2.
+_DEBUG = os.environ.get("DELPHI_T0_DEBUG", "0") == "1"
 
 
 class DelphiRawTextChatParser:
@@ -40,12 +46,32 @@ class DelphiRawTextChatParser:
   its answer (e.g. ``"... Q: 3 + 4 = A:"``), so the rendered user turn IS the
   raw prompt and the model continues it directly.
 
-  The ``add_generation_prompt`` and ``is_first_msg`` flags are intentionally
-  ignored: a base LM has no assistant/generation marker to append and no BOS to
+  The ``is_first_msg`` flag is intentionally ignored: a base LM has no BOS to
   inject here (the rollout tokenizer adds BOS itself). Deliberately NOT exposing
   an ``assistant_token`` attribute keeps ``convert_single_message`` from trying
   to strip a generation prefix off assistant turns (there is none).
+
+  ``add_generation_prompt`` is honored only through the optional
+  :attr:`generation_suffix` (default ``""``, so single-turn M-port is unchanged:
+  its prompts already end exactly where the model should emit, e.g. ``"...A:"``).
+  Multi-turn TOOL stages (T0+) set ``generation_suffix="\\n"`` so the rollout
+  prompt ends with a trailing newline and the model begins its turn on a fresh
+  line, emitting ``<tool_call>`` (or the final number) DIRECTLY instead of a
+  leading ``"\\n<tool_call>"``. The leading-newline matters because the tool
+  stages add the newline token to ``eos_tokens`` (single-line turns): if the
+  model's first generated token were the newline, the completion would be empty
+  and the agentic engine would discard the turn (the M-port degenerate failure).
   """
+
+  def __init__(self, generation_suffix: str = ""):
+    """Builds the raw-text parser.
+
+    Args:
+      generation_suffix: text appended to the rendered prompt when
+        ``add_generation_prompt=True`` (the live rollout prompt). Default ``""``
+        preserves the M-port single-turn behavior; tool stages pass ``"\\n"``.
+    """
+    self.generation_suffix = generation_suffix
 
   def parse(
       self,
@@ -59,14 +85,16 @@ class DelphiRawTextChatParser:
       messages: a list of ``{"role": str, "content": str}`` dicts. Supported
         roles are ``system``, ``user``, ``assistant`` and ``tool``; an empty
         ``system``/``assistant`` content contributes nothing.
-      add_generation_prompt: ignored (a base LM has no generation marker).
+      add_generation_prompt: when True (the live rollout prompt), appends
+        :attr:`generation_suffix` to the result.
       is_first_msg: ignored (the rollout tokenizer injects BOS itself).
 
     Returns:
       The messages' contents joined by newlines, with ``tool`` messages prefixed
-      by ``"Tool result: "``.
+      by ``"Tool result: "``, plus :attr:`generation_suffix` when
+      ``add_generation_prompt`` is set.
     """
-    del add_generation_prompt, is_first_msg
+    del is_first_msg
     parts: List[str] = []
     for message in messages:
       role = message.get("role")
@@ -86,4 +114,15 @@ class DelphiRawTextChatParser:
         # Single-turn M-port never emits tool messages; rendered here so the
         # later tool stages (T0+) can feed tool outputs back as plain text.
         parts.append(f"Tool result: {content}")
-    return "\n".join(parts)
+    rendered = "\n".join(parts)
+    if add_generation_prompt and self.generation_suffix:
+      rendered += self.generation_suffix
+    if (
+        _DEBUG
+        and add_generation_prompt
+        and any(m.get("role") == "tool" for m in messages)
+    ):
+      # Turn-2 rollout prompt: show the tail (the tool result + where the model
+      # must continue) so we can confirm the result is present and well-rendered.
+      print(f"[t0-dbg] turn2-prompt-tail={rendered[-160:]!r}", flush=True)
+    return rendered
