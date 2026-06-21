@@ -180,7 +180,9 @@ def main() -> None:
           actor_optimizer=clipped_adamw(learning_rate),
           eval_every_n_steps=10**9,
           max_steps=steps,
-          mini_batch_size=prompts_per_batch * num_generations,
+          # mini_batch_size is in PROMPTS and must divide the per-step prompt
+          # count (PROMPTS_PER_BATCH); one mini-batch = the whole prompt batch.
+          mini_batch_size=prompts_per_batch,
           train_micro_batch_size=1,
           metrics_logging_options=metrics,
           checkpoint_root_directory=rl_ckpt_dir,
