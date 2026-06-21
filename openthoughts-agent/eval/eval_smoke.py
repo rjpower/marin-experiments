@@ -73,12 +73,17 @@ def main() -> None:
       _log(f"  built in {rec['build_secs']}s; starting gVisor sandbox")
       sandbox = GvisorContainerSandbox(task.image_tag)
 
-      solve = os.path.join(task.root, "solution", "solve.sh")
-      if os.path.isfile(solve):
-        sandbox.copy_in(solve, "/tmp/solve.sh")
-        r = sandbox.exec("bash /tmp/solve.sh", timeout=task.agent_timeout_sec)
+      soldir = os.path.join(task.root, "solution")
+      if os.path.isfile(os.path.join(soldir, "solve.sh")):
+        # Copy the whole solution dir (the dir copy_in path; single-file docker cp
+        # misbehaves under runsc) and run the oracle from there.
+        cp = sandbox.copy_in(soldir, "/sol")
+        _log(f"  copy solution dir exit={cp.exit_code} {cp.stderr[-150:] if cp.exit_code else ''}")
+        ls = sandbox.exec("ls -l /sol/solve.sh")
+        r = sandbox.exec("bash /sol/solve.sh", timeout=task.agent_timeout_sec)
         rec["oracle_exit"] = r.exit_code
-        _log(f"  oracle solve.sh exit={r.exit_code}; stdout tail={r.stdout[-200:]!r}")
+        _log(f"  oracle ls='{ls.stdout.strip()}' exit={r.exit_code}; "
+             f"out={r.stdout[-150:]!r}; err={r.stderr[-200:]!r}")
       else:
         _log("  no oracle solve.sh (skipping solve, grading bare image)")
 
