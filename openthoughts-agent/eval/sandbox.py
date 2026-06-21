@@ -28,6 +28,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import uuid
 from typing import Protocol
 
 
@@ -225,7 +226,9 @@ class GvisorContainerSandbox:
     ensure_dockerd()
     self.image = image
     self.workdir = workdir  # None => use the image's own WORKDIR
-    self._name = name or f"ota-task-{os.getpid()}-{int(time.monotonic()*1000)}"
+    # uuid (not pid+time): RL rollouts boot G containers concurrently in one
+    # process, and a pid+millisecond name collides ("container name already in use").
+    self._name = name or f"ota-task-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     argv = [
         "docker", "run", "-d", "--rm",
         "--runtime", runtime,
