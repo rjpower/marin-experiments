@@ -250,8 +250,28 @@ class GvisorContainerSandbox:
     return _run(argv, timeout=timeout)
 
   def copy_in(self, local_path: str, container_path: str, *, timeout: float = 120.0) -> ExecResult:
-    """Copies a host path into the container (``docker cp``)."""
-    return _run(["docker", "cp", local_path, f"{self._name}:{container_path}"], timeout=timeout)
+    """Copies a host path into the container (``docker cp``), dereferencing symlinks.
+
+    HF ``snapshot_download`` stores files as symlinks into a ``blobs/`` cache; a
+    plain ``docker cp`` would copy them as symlinks that dangle inside the
+    container (the blob path doesn't exist there). So we stage a dereferenced
+    copy first -- ``shutil.copy`` follows file symlinks; ``copytree(symlinks=
+    False)`` follows them through a tree.
+    """
+    staging = tempfile.mkdtemp(prefix="ota-cp-")
+    try:
+      base = os.path.basename(local_path.rstrip("/")) or "payload"
+      src = os.path.join(staging, base)
+      if os.path.isdir(local_path):
+        shutil.copytree(
+            local_path, src, symlinks=False,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+      else:
+        shutil.copy(local_path, src)
+      return _run(["docker", "cp", src, f"{self._name}:{container_path}"], timeout=timeout)
+    finally:
+      shutil.rmtree(staging, ignore_errors=True)
 
   def close(self) -> None:
     _run(["docker", "rm", "-f", self._name], timeout=30)

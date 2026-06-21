@@ -30,12 +30,29 @@ def _log(msg: str) -> None:
   print(f"[eval-smoke] {msg}", flush=True)
 
 
+def _has_real_oracle(task) -> bool:
+  """True if the task ships a non-stub ``solution/solve.sh``.
+
+  ~half of OpenThoughts-TB-dev tasks ship a stub oracle (`echo "no solution
+  written"`); only the real ones can drive the grader to a pass, so the smoke
+  prefers them to actually exercise the score==1.0 path.
+  """
+  solve = os.path.join(task.root, "solution", "solve.sh")
+  if not os.path.isfile(solve):
+    return False
+  with open(solve) as f:
+    body = [ln for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+  return bool(body) and not any("no solution written" in ln.lower()
+                                or "not implemented" in ln.lower() for ln in body)
+
+
 def main() -> None:
   # No-op on the custom task image; installs docker+runsc on the stock iris image.
   ensure_sandbox_runtime()
   limit = int(os.environ.get("TASK_LIMIT", "3"))
-  tasks = load_tb_tasks(limit=limit)
-  _log(f"{len(tasks)} tasks to oracle-grade")
+  all_tasks = load_tb_tasks()
+  tasks = [t for t in all_tasks if _has_real_oracle(t)][:limit]
+  _log(f"{len(tasks)}/{len(all_tasks)} tasks with real oracles to build+solve+grade")
 
   records = []
   for i, task in enumerate(tasks):
