@@ -19,6 +19,8 @@ set -euo pipefail
 TPU="${SP_TPU:-v6e-8}"
 TOKENS="${SP_TOKENS:?set SP_TOKENS, e.g. SP_TOKENS=10e9}"
 REGION="${SP_REGION:-us-east5}"
+DATA_REGION="${SP_DATA_REGION:-$REGION}"   # GCS data bucket region; decouple from TPU region
+                                           # (e.g. TPU europe-west4 reads bucket marin-eu-west4)
 EXPERTS="${SP_EXPERTS:-1024}"
 HIDDEN="${SP_HIDDEN:-512}"
 INTER="${SP_INTERMEDIATE:-0}"   # 0 = heuristic I=D/2 (thin); set e.g. 2048 for fat experts
@@ -35,7 +37,7 @@ submit() {
     --max-retries 3 --cpu 32 --memory 128GB --disk 100GB \
     -e WANDB_API_KEY "$WANDB_API_KEY" \
     -e SP_TPU "$TPU" -e SP_GROUP "$GROUP" -e SP_TOKENS "$TOKENS" \
-    -e SP_DATA nemotron -e SP_DATA_REGION "$REGION" \
+    -e SP_DATA nemotron -e SP_DATA_REGION "$DATA_REGION" \
     -e SP_HIDDEN "$HIDDEN" -e SP_EXPERTS "$EXPERTS" -e SP_INTERMEDIATE "$INTER" \
     ${BATCH:+-e SP_BATCH $BATCH} "$@" \
     -- python launch.py 2>&1 | grep -E 'Job submitted|Dashboard' || true
