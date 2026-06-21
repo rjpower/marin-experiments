@@ -22,7 +22,7 @@ OpenThoughts-TB-dev tasks ──build──▶ gVisor sandbox ──agent loop�
 | **gVisor sandbox** on a privileged iris TPU task | ✅ confirmed live: containers run gVisor kernel `4.19.0-gvisor` (host `6.8.0-gcp`); exec + file copy verified |
 | **Qwen3-8B SFT** on v6e-16 | ✅ 1000 steps, ChatML + assistant-turn loss mask, orbax checkpoint at `gs://marin-us-central2/openthoughts-agent/qwen3-8b-agent-sft/1000/` |
 | **Eval harness** (Terminal-Bench) | ✅ validated end-to-end: a TB task built under gVisor + its oracle solution graded to **score 1.0** |
-| **First agent eval** (Qwen3-8B-SFT, 5 TB-dev tasks) | runs clean (0 infra errors), 20-turn loops, **format learned** (parse-failures mostly 0), **solved 0/5** |
+| **First agent eval** (Qwen3-8B-SFT) | runs clean (0 infra errors), 20-turn loops, **format learned** (parse-failures mostly 0), **solved 0/5** then **0/20** on a wider sample (capability floor, not a harness artifact) |
 
 The 0/5 is an honest capability baseline, not a harness artifact: the same
 harness scores a task's oracle solution 1.0, and the SFT model emits well-formed
