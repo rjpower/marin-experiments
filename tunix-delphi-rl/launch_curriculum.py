@@ -19,6 +19,10 @@ Config via env vars so the coordinator can size the run:
   * ``CURRIC_NUM_GENERATIONS`` (16), ``CURRIC_BATCH_SIZE`` (8), ``CURRIC_LR`` (1e-5).
   * ``CURRIC_TEMPERATURE`` (1.0), ``CURRIC_MAX_PROMPT`` (1024), ``CURRIC_MAX_RESPONSE`` (768).
   * ``CURRIC_PASSK`` (16), ``CURRIC_PASSK_TEMP`` (1.0), ``CURRIC_EVAL_TOKENS`` (256).
+  * ``CURRIC_MODEL`` (``delphi``) -- registry key; ``CURRIC_MODEL_DIR``.
+  * ``CURRIC_CHAT_SFT_STEPS`` (0)  -- Stage-0 "up to shape" chat+tool SFT steps (0 skips).
+  * ``CURRIC_CHAT_DATASET`` (``allenai/tulu-3-sft-mixture``), ``CURRIC_CHAT_MIXTURE`` (1).
+  * ``CURRIC_CHAT_BATCH_SIZE`` (8), ``CURRIC_CHAT_LR`` (1e-5), ``CURRIC_CHAT_MAX_SEQ_LEN`` (1024).
   * ``CURRIC_SEED`` (0), ``DELPHI_MODEL_DIR`` (``./delphi``).
 
 Submit on a single-host TPU (the coordinator submits; do NOT submit from here):
@@ -74,6 +78,12 @@ def main() -> None:
   passk_temp = float(os.environ.get("CURRIC_PASSK_TEMP", "1.0"))
   eval_tokens = int(os.environ.get("CURRIC_EVAL_TOKENS", "256"))
   seed = int(os.environ.get("CURRIC_SEED", "0"))
+  chat_sft_steps = int(os.environ.get("CURRIC_CHAT_SFT_STEPS", "0"))
+  chat_sft_dataset = os.environ.get("CURRIC_CHAT_DATASET", "allenai/tulu-3-sft-mixture")
+  chat_sft_batch_size = int(os.environ.get("CURRIC_CHAT_BATCH_SIZE", "8"))
+  chat_sft_lr = float(os.environ.get("CURRIC_CHAT_LR", "1e-5"))
+  chat_sft_max_seq_len = int(os.environ.get("CURRIC_CHAT_MAX_SEQ_LEN", "1024"))
+  chat_sft_use_mixture = os.environ.get("CURRIC_CHAT_MIXTURE", "1") not in ("0", "false", "False")
   model_name = os.environ.get("CURRIC_MODEL", "delphi")
   model_spec = get_model_spec(model_name)
   model_dir = (
@@ -89,6 +99,11 @@ def main() -> None:
       f"sft_steps={sft_steps} sft_levels={sft_levels} num_generations={num_generations} "
       f"batch_size={batch_size} lr={learning_rate} temp={temperature} "
       f"max_prompt={max_prompt} max_response={max_response} passk={passk}",
+      flush=True,
+  )
+  print(
+      f"[curric] model={model_name} chat_sft_steps={chat_sft_steps} "
+      f"chat_sft_mixture={chat_sft_use_mixture} chat_sft_dataset={chat_sft_dataset}",
       flush=True,
   )
 
@@ -117,6 +132,12 @@ def main() -> None:
       passk_temperature=passk_temp,
       eval_max_new_tokens=eval_tokens,
       model_spec=model_spec,
+      chat_sft_steps=chat_sft_steps,
+      chat_sft_dataset=chat_sft_dataset,
+      chat_sft_batch_size=chat_sft_batch_size,
+      chat_sft_learning_rate=chat_sft_lr,
+      chat_sft_max_seq_len=chat_sft_max_seq_len,
+      chat_sft_use_mixture=chat_sft_use_mixture,
   )
 
   for i in range(result.steps_ran):

@@ -42,6 +42,7 @@ from environments.curriculum_env import (
     solve_segments,
 )
 from models.registry import ModelSpec, get_model_spec
+from training.chat_sft import run_chat_sft
 from training.train_multiturn import _NormalizingGRPOLearner, _build_mesh
 
 
@@ -133,6 +134,12 @@ def train_curriculum(
     do_eval: bool = True,
     mesh: jax.sharding.Mesh | None = None,
     model_spec: ModelSpec | None = None,
+    chat_sft_steps: int = 0,
+    chat_sft_dataset: str = "allenai/tulu-3-sft-mixture",
+    chat_sft_batch_size: int = 8,
+    chat_sft_learning_rate: float = 1e-5,
+    chat_sft_max_seq_len: int = 1024,
+    chat_sft_use_mixture: bool = True,
 ) -> CurriculumTrainResult:
   """SFT warm-up (easy levels) -> curriculum Dr.GRPO; per-level held-out pass@k.
 
@@ -151,6 +158,31 @@ def train_curriculum(
 
   actor = model_spec.load_model(model_dir, dtype=jnp.float32, mesh=mesh)
   reference = None if beta == 0.0 else model_spec.load_model(model_dir, dtype=jnp.bfloat16, mesh=mesh)
+
+  # Stage 0: "up to shape" -- conversational + tool-calling chat-SFT (tulu-3 +
+  # smoltalk2 tool-use mixture) so the actor is a fluent instruction-follower /
+  # tool-user BEFORE it specializes to the curriculum's def-solve + CoT format.
+  # Runs in place on the same nnx actor (no checkpoint); skipped when steps == 0.
+  # This is the "up to shape" warm-up the multi-turn capstone added (train_multiturn
+  # Stage 0); putting it on the GRADED curriculum is the discriminating head-to-head.
+  if chat_sft_steps > 0:
+    chat_stream_fn = None
+    if chat_sft_use_mixture:
+      from sft_data.instruction_datasets import load_up_to_shape_mixture
+
+      chat_stream_fn = lambda: load_up_to_shape_mixture(seed=seed)  # noqa: E731
+    actor = run_chat_sft(
+        actor,
+        tokenizer,
+        dataset_name=chat_sft_dataset,
+        steps=chat_sft_steps,
+        batch_size=chat_sft_batch_size,
+        learning_rate=chat_sft_learning_rate,
+        mesh=mesh,
+        max_seq_len=chat_sft_max_seq_len,
+        seed=seed,
+        stream_fn=chat_stream_fn,
+    )
 
   # Stage 1: SFT warm-up on the easy levels (teach def solve + CoT format).
   if sft_steps > 0:
