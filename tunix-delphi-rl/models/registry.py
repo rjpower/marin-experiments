@@ -37,6 +37,20 @@ def _delphi_spec() -> ModelSpec:
   )
 
 
+def _delphi_19b_spec() -> ModelSpec:
+  from models.delphi_qwen3 import load_delphi, load_tokenizer
+
+  # The ~2B point on the Delphi ladder, width-matched (hidden 2048) to
+  # Qwen3-1.7B-Base for the agentic post-training comparison. The same
+  # config-driven ``load_delphi`` handles its multi-shard safetensors.
+  return ModelSpec(
+      name="delphi-1.9b",
+      repo="marin-community/delphi-3e20-1.9Bparams-24.7Btokens",
+      load_model=load_delphi,
+      load_tokenizer=load_tokenizer,
+  )
+
+
 def _qwen3_17b_base_spec() -> ModelSpec:
   from models.qwen3_loader import load_qwen3, load_qwen3_tokenizer
 
@@ -51,6 +65,10 @@ def _qwen3_17b_base_spec() -> ModelSpec:
 # Name -> factory (lazy so importing this module doesn't import every loader).
 _REGISTRY: dict[str, Callable[[], ModelSpec]] = {
     "delphi": _delphi_spec,
+    "delphi-447m": _delphi_spec,
+    "delphi-1.9b": _delphi_19b_spec,
+    "delphi-2b": _delphi_19b_spec,
+    "delphi-1.9b-base": _delphi_19b_spec,
     "qwen3": _qwen3_17b_base_spec,
     "qwen3-1.7b": _qwen3_17b_base_spec,
     "qwen3-1.7b-base": _qwen3_17b_base_spec,
