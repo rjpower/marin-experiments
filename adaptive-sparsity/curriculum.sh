@@ -22,6 +22,7 @@ REGION="${SP_REGION:-us-east5}"
 EXPERTS="${SP_EXPERTS:-1024}"
 HIDDEN="${SP_HIDDEN:-512}"
 INTER="${SP_INTERMEDIATE:-0}"   # 0 = heuristic I=D/2 (thin); set e.g. 2048 for fat experts
+BATCH="${SP_BATCH:-}"           # empty = heuristic batch; set e.g. 128 to cut HBM (desyncs LR uniformly)
 SCHED="${SP_SCHED:-1:0.8,2:0.05,4:0.05,8:0.05,16:0.05}"
 GROUP="${SP_GROUP:-sparsity-curric-E$EXPERTS-t$TOKENS}"
 
@@ -35,7 +36,8 @@ submit() {
     -e WANDB_API_KEY "$WANDB_API_KEY" \
     -e SP_TPU "$TPU" -e SP_GROUP "$GROUP" -e SP_TOKENS "$TOKENS" \
     -e SP_DATA nemotron -e SP_DATA_REGION "$REGION" \
-    -e SP_HIDDEN "$HIDDEN" -e SP_EXPERTS "$EXPERTS" -e SP_INTERMEDIATE "$INTER" "$@" \
+    -e SP_HIDDEN "$HIDDEN" -e SP_EXPERTS "$EXPERTS" -e SP_INTERMEDIATE "$INTER" \
+    ${BATCH:+-e SP_BATCH $BATCH} "$@" \
     -- python launch.py 2>&1 | grep -E 'Job submitted|Dashboard' || true
 }
 
