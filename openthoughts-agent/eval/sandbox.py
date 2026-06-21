@@ -1,0 +1,183 @@
+"""Isolated command execution for agent tool use, via gVisor (runsc).
+
+The OpenThoughts terminal agent issues shell commands that we must NOT run on the
+training host. Terminal-Bench tasks ship their own Docker environment, so the
+sandbox model is: run each task's image as a container under the **runsc** OCI
+runtime (gVisor), and ``docker exec`` the agent's commands into it.
+
+This runs inside the iris TPU task container, which is ``--privileged`` (iris adds
+that for accelerators), so rootful gVisor + a task-local dockerd work. The custom
+task image (`docker/Dockerfile.agent-task`) ships `runsc`, `docker`, and a
+`/etc/docker/daemon.json` registering the `runsc` runtime.
+
+Implementations:
+  * :class:`GvisorContainerSandbox` -- a long-lived container per task, started
+    with ``docker run --runtime=runsc``; the production path.
+  * :class:`LocalUnsafeSandbox` -- plain subprocess, NO isolation. For developing
+    the agent-loop / grading logic on a laptop only; never use on untrusted code.
+
+Use :func:`make_sandbox` to pick by ``OTA_SANDBOX`` env (``gvisor`` | ``local``).
+"""
+
+import dataclasses
+import os
+import shutil
+import subprocess
+import time
+from typing import Protocol
+
+
+@dataclasses.dataclass(frozen=True)
+class ExecResult:
+  """Result of one command execution."""
+
+  stdout: str
+  stderr: str
+  exit_code: int
+  timed_out: bool = False
+
+
+class Sandbox(Protocol):
+  """A place to run agent shell commands in isolation."""
+
+  def exec(self, command: str, *, timeout: float = 60.0) -> ExecResult:
+    """Runs ``command`` (a shell string) and returns its result."""
+    ...
+
+  def close(self) -> None:
+    """Tears down any container / resources."""
+    ...
+
+
+def _run(argv: list[str], *, timeout: float, input_text: str | None = None) -> ExecResult:
+  """Runs a subprocess with a hard timeout, capturing stdout/stderr."""
+  try:
+    proc = subprocess.run(
+        argv,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return ExecResult(proc.stdout, proc.stderr, proc.returncode)
+  except subprocess.TimeoutExpired as e:
+    return ExecResult(e.stdout or "", (e.stderr or "") + "\n[timeout]", 124, timed_out=True)
+
+
+def ensure_dockerd(*, timeout: float = 60.0) -> None:
+  """Starts a task-local dockerd if the socket isn't already up, and waits for it.
+
+  Idempotent. Requires the ``--privileged`` task container (TPU jobs have it).
+
+  Raises:
+    RuntimeError: if dockerd does not become ready within ``timeout``.
+  """
+  if shutil.which("docker") is None:
+    raise RuntimeError("docker not found; use the openthoughts-agent-task image.")
+  # Already up?
+  if _run(["docker", "info"], timeout=10).exit_code == 0:
+    return
+  # Launch the daemon detached; its logs go to /tmp.
+  subprocess.Popen(
+      ["dockerd"],
+      stdout=open("/tmp/dockerd.out", "w"),
+      stderr=subprocess.STDOUT,
+  )
+  deadline = time.monotonic() + timeout
+  while time.monotonic() < deadline:
+    if _run(["docker", "info"], timeout=10).exit_code == 0:
+      return
+    time.sleep(1.0)
+  raise RuntimeError(f"dockerd not ready after {timeout}s (see /tmp/dockerd.out).")
+
+
+class GvisorContainerSandbox:
+  """A Terminal-Bench task environment running under gVisor.
+
+  Starts ``image`` as a detached container with the ``runsc`` runtime and execs
+  agent commands into it via ``docker exec``. The container is removed on
+  :meth:`close`.
+  """
+
+  def __init__(
+      self,
+      image: str,
+      *,
+      workdir: str = "/workspace",
+      runtime: str = "runsc",
+      network: str = "none",
+      name: str | None = None,
+      mem_limit: str = "4g",
+      cpus: str = "2",
+  ):
+    ensure_dockerd()
+    self.image = image
+    self.workdir = workdir
+    self._name = name or f"ota-task-{os.getpid()}-{int(time.monotonic()*1000)}"
+    # Keep the container alive with a no-op PID 1 so we can exec into it.
+    res = _run(
+        [
+            "docker", "run", "-d", "--rm",
+            "--runtime", runtime,
+            "--network", network,
+            "--memory", mem_limit,
+            "--cpus", cpus,
+            "--workdir", workdir,
+            "--name", self._name,
+            image,
+            "sleep", "infinity",
+        ],
+        timeout=300,
+    )
+    if res.exit_code != 0:
+      raise RuntimeError(
+          f"failed to start sandbox container from {image!r}: {res.stderr}"
+      )
+
+  def exec(self, command: str, *, timeout: float = 60.0) -> ExecResult:
+    return _run(
+        ["docker", "exec", "--workdir", self.workdir, self._name, "bash", "-lc", command],
+        timeout=timeout,
+    )
+
+  def close(self) -> None:
+    _run(["docker", "rm", "-f", self._name], timeout=30)
+
+
+class LocalUnsafeSandbox:
+  """Plain subprocess execution with NO isolation. Dev/testing only.
+
+  Runs commands directly in a temp dir on the host. Use ONLY to exercise the
+  agent-loop / grading logic with trusted commands; never on model-generated code.
+  """
+
+  def __init__(self, workdir: str | None = None):
+    import tempfile
+
+    self.workdir = workdir or tempfile.mkdtemp(prefix="ota-local-")
+
+  def exec(self, command: str, *, timeout: float = 60.0) -> ExecResult:
+    return _run(["bash", "-lc", command], timeout=timeout, input_text=None)
+
+  def close(self) -> None:
+    pass
+
+
+def make_sandbox(image: str | None = None, **kwargs) -> Sandbox:
+  """Returns a sandbox per the ``OTA_SANDBOX`` env (default ``gvisor``).
+
+  Args:
+    image: the Docker image for the gvisor sandbox (required for ``gvisor``).
+    **kwargs: forwarded to the sandbox constructor.
+
+  Raises:
+    ValueError: for an unknown ``OTA_SANDBOX`` or a missing image.
+  """
+  kind = os.environ.get("OTA_SANDBOX", "gvisor").lower()
+  if kind == "gvisor":
+    if not image:
+      raise ValueError("gvisor sandbox requires an image.")
+    return GvisorContainerSandbox(image, **kwargs)
+  if kind == "local":
+    return LocalUnsafeSandbox(**{k: v for k, v in kwargs.items() if k == "workdir"})
+  raise ValueError(f"Unknown OTA_SANDBOX={kind!r} (expected gvisor|local).")

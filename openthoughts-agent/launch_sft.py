@@ -17,10 +17,14 @@ Config via env:
   * ``DATA_LIMIT`` (unset = all ~15.2k traces; set small for a smoke).
   * ``CKPT_DIR`` (./checkpoints/<model>-agent-sft).
   * ``EVAL_TOKENS`` (384).
-  * ``REMAT`` (decoder | block | none) -- activation rematerialization.
+  * ``REMAT`` (decoder | block | none) -- activation rematerialization (decoder
+    default; needed for 8B training memory since attention scores are seq^2/layer).
   * ``FLASH`` (0|1) -- TPU splash attention. Default OFF: tunix's splash kernel
     shard-maps the activation batch over ``fsdp``, so it needs BATCH_SIZE
     divisible by the fsdp axis and currently breaks for small batches.
+  * ``EVAL_GEN`` (0|1) -- run an in-job before/after generation. Default OFF: the
+    tunix Sampler mutates KV-cache Params, which conflicts with remat's trace
+    level. Only enable with REMAT=none; otherwise eval in a separate job.
 
 NOTE: ``BATCH_SIZE`` must be divisible by the fsdp axis size
 (``device_count // TP``), since FSDP shards the data batch across that axis.
@@ -104,6 +108,7 @@ def main() -> None:
       "none": qm.RematConfig.NONE,
   }[os.environ.get("REMAT", "decoder").lower()]
   use_flash = os.environ.get("FLASH", "0") == "1"
+  eval_gen = os.environ.get("EVAL_GEN", "0") == "1"
 
   fsdp = jax.device_count() // tp
   if batch_size % fsdp != 0:
@@ -139,21 +144,25 @@ def main() -> None:
   )
   print("[ota-sft] LOAD OK", flush=True)
 
-  im_start_id, im_end_id, _ = resolve_chatml_ids(tokenizer)
-  eos_id = int(tokenizer.eos_token_id)
-  cache_size = 1024 + eval_tokens + 16
-  cache_config = sampler_lib.CacheConfig(
-      cache_size=cache_size,
-      num_layers=model.config.num_layers,
-      num_kv_heads=model.config.num_kv_heads,
-      head_dim=model.config.head_dim,
-  )
-  prompts = [_format_agent_prompt(tokenizer, HELD_OUT_TASK)]
-
-  # ---- before SFT ----
-  sampler = sampler_lib.Sampler(transformer=model, tokenizer=tokenizer, cache_config=cache_config)
-  before = _generate(sampler, mesh, prompts, max_new=eval_tokens, eos_id=eos_id, im_end_id=im_end_id)
-  print(f"[ota-sft] BEFORE-SFT action:\n{before[0][:600]!r}", flush=True)
+  # In-job before/after generation is a qualitative nicety, but the tunix Sampler
+  # mutates KV-cache Params during decode, which conflicts with remat's trace level
+  # ("Cannot mutate Param from a different trace level"). Since the SFT job uses
+  # remat for 8B memory, generation is OFF by default here; the dedicated eval job
+  # loads the checkpoint with remat=NONE for sampling. Set EVAL_GEN=1 to force it
+  # (only valid with REMAT=none).
+  if eval_gen:
+    im_start_id, im_end_id, _ = resolve_chatml_ids(tokenizer)
+    eos_id = int(tokenizer.eos_token_id)
+    cache_config = sampler_lib.CacheConfig(
+        cache_size=1024 + eval_tokens + 16,
+        num_layers=model.config.num_layers,
+        num_kv_heads=model.config.num_kv_heads,
+        head_dim=model.config.head_dim,
+    )
+    prompts = [_format_agent_prompt(tokenizer, HELD_OUT_TASK)]
+    sampler = sampler_lib.Sampler(transformer=model, tokenizer=tokenizer, cache_config=cache_config)
+    before = _generate(sampler, mesh, prompts, max_new=eval_tokens, eos_id=eos_id, im_end_id=im_end_id)
+    print(f"[ota-sft] BEFORE-SFT action:\n{before[0][:600]!r}", flush=True)
 
   # ---- SFT ----
   model = run_agent_sft(
@@ -168,10 +177,10 @@ def main() -> None:
       checkpoint_dir=checkpoint_dir,
   )
 
-  # ---- after SFT ----
-  sampler = sampler_lib.Sampler(transformer=model, tokenizer=tokenizer, cache_config=cache_config)
-  after = _generate(sampler, mesh, prompts, max_new=eval_tokens, eos_id=eos_id, im_end_id=im_end_id)
-  print(f"[ota-sft] AFTER-SFT action:\n{after[0][:600]!r}", flush=True)
+  if eval_gen:
+    sampler = sampler_lib.Sampler(transformer=model, tokenizer=tokenizer, cache_config=cache_config)
+    after = _generate(sampler, mesh, prompts, max_new=eval_tokens, eos_id=eos_id, im_end_id=im_end_id)
+    print(f"[ota-sft] AFTER-SFT action:\n{after[0][:600]!r}", flush=True)
   print(f"[ota-sft] SFT COMPLETE (model={model_spec.name} steps={steps} ckpt={checkpoint_dir})", flush=True)
 
 
