@@ -44,6 +44,16 @@ RUN set -eux; \
     docker --version; \
     dockerd --version
 
+# Docker 27 dropped the legacy builder; `docker build` needs the buildx (BuildKit)
+# CLI plugin, which the static tarball above does not include.
+ARG BUILDX_VERSION=0.17.1
+RUN set -eux; \
+    mkdir -p /usr/local/lib/docker/cli-plugins; \
+    wget -q "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-amd64" \
+        -O /usr/local/lib/docker/cli-plugins/docker-buildx; \
+    chmod a+rx /usr/local/lib/docker/cli-plugins/docker-buildx; \
+    docker buildx version
+
 # --- gVisor (runsc) ---
 # Pinned to a release for reproducibility; bump deliberately.
 ARG GVISOR_ARCH=x86_64

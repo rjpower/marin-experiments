@@ -76,6 +76,12 @@ def _run(argv: list[str], *, timeout: float, input_text: str | None = None) -> E
 # being published. Confirmed working on a v6e TPU task (see eval/gvisor_smoke.py).
 _DOCKER_VERSION = "27.3.1"
 _DOCKER_TGZ_URL = f"https://download.docker.com/linux/static/stable/x86_64/docker-{_DOCKER_VERSION}.tgz"
+# Docker 27's `docker build` requires BuildKit (the legacy builder was removed),
+# and the static docker tarball does NOT bundle the buildx CLI plugin -- without
+# it builds fail with "unable to open Dockerfile". Install it separately.
+_BUILDX_VERSION = "0.17.1"
+_BUILDX_URL = f"https://github.com/docker/buildx/releases/download/v{_BUILDX_VERSION}/buildx-v{_BUILDX_VERSION}.linux-amd64"
+_CLI_PLUGINS_DIR = "/usr/local/lib/docker/cli-plugins"
 _RUNSC_URL = "https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc"
 _BIN_DIR = "/usr/local/bin"
 _DAEMON_JSON_PATH = "/etc/docker/daemon.json"
@@ -104,6 +110,13 @@ def _install_static_docker() -> None:
 def _install_runsc() -> None:
   dst = os.path.join(_BIN_DIR, "runsc")
   urllib.request.urlretrieve(_RUNSC_URL, dst)
+  os.chmod(dst, 0o755)
+
+
+def _install_buildx() -> None:
+  os.makedirs(_CLI_PLUGINS_DIR, exist_ok=True)
+  dst = os.path.join(_CLI_PLUGINS_DIR, "docker-buildx")
+  urllib.request.urlretrieve(_BUILDX_URL, dst)
   os.chmod(dst, 0o755)
 
 
@@ -140,6 +153,11 @@ def ensure_sandbox_runtime() -> None:
     _install_static_docker()
   if shutil.which("runsc") is None:
     _install_runsc()
+  if not any(
+      os.path.isfile(os.path.join(d, "docker-buildx"))
+      for d in (_CLI_PLUGINS_DIR, os.path.expanduser("~/.docker/cli-plugins"))
+  ):
+    _install_buildx()
   _ensure_runsc_runtime_registered()
 
 
@@ -239,9 +257,18 @@ class GvisorContainerSandbox:
 
 
 def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecResult:
-  """Builds a Docker image from ``context_dir`` (must contain a Dockerfile)."""
+  """Builds a Docker image from ``context_dir`` (must contain a Dockerfile).
+
+  Uses ``docker buildx build --load`` (BuildKit): Docker 27 dropped the legacy
+  builder, so a plain ``docker build`` fails without the buildx plugin.
+  ``--load`` writes the result into the local image store so ``docker run`` (and
+  hence the gVisor sandbox) can use it.
+  """
   ensure_dockerd()
-  return _run(["docker", "build", "-t", tag, context_dir], timeout=timeout)
+  return _run(
+      ["docker", "buildx", "build", "--load", "-t", tag, context_dir],
+      timeout=timeout,
+  )
 
 
 class LocalUnsafeSandbox:
