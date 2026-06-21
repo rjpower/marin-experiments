@@ -141,6 +141,13 @@ class GrugModelConfig:
     """Per-block gradient checkpointing. "recompute_all" reruns the whole block in
     backward (lowest memory); "save_moe" keeps the tagged MoE dispatch tensors so
     backward skips re-running expert dispatch and its EP collectives."""
+    fast_qb_beta: bool = False
+    """If True, compute the QB (loss-free balancing) per-expert threshold β with
+    ``jax.lax.approx_max_k`` instead of an exact ``top_k`` sort. β only needs the
+    qb_count-th largest logit per expert and feeds a stop-gradient'd router bias, so an
+    approximate quantile is tolerable. Profiling showed the exact sort over
+    ``[E, tokens]`` dominates device time (~35%); this is the main throughput lever.
+    Kept off by default so the routing dynamics match the exact-β baseline runs."""
     rope: RotaryConfig = dataclasses.field(default_factory=RotaryConfig)
 
     def __post_init__(self) -> None:
@@ -558,9 +565,18 @@ class MoEMLP(eqx.Module):
         local_tokens = s_minus_alpha.shape[0] // num_devices
         qb_count = max(1, local_tokens * self.cfg.num_experts_per_token // self.cfg.num_experts)
 
+        fast_qb = self.cfg.fast_qb_beta
+
         def _local_qb_beta(s_ma):
-            topk_vals, _ = jax.lax.top_k(s_ma.T, qb_count)
-            beta = topk_vals[:, -1]
+            if fast_qb:
+                # β is the qb_count-th largest logit per expert (a high quantile). The exact
+                # top_k sort over [E, local_tokens] dominates device time; approx_max_k is a
+                # TPU-native partial reduction, and β = min of the approximate top set.
+                approx_vals, _ = jax.lax.approx_max_k(s_ma.T, qb_count, recall_target=0.95)
+                beta = jnp.min(approx_vals, axis=-1)
+            else:
+                topk_vals, _ = jax.lax.top_k(s_ma.T, qb_count)
+                beta = topk_vals[:, -1]
             return jax.lax.pmean(beta, axis_name=_BATCH_AXES)
 
         router_stats["qb_beta"] = shard_map(
