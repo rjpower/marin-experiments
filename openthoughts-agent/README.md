@@ -15,7 +15,7 @@ tasks are Docker environments + graders), so tool execution runs in an isolated
 | --- | --- | --- |
 | **1. SFT** | Qwen3-8B on `open-thoughts/OpenThoughts-Agent-v1-SFT` (~15.2k Terminus-2 traces), ChatML + assistant-turn loss masking → orbax checkpoint | done (`launch_sft.py`); deep multi-epoch run training |
 | **2. Eval** | SFT'd agent on `open-thoughts/OpenThoughts-TB-dev` / Terminal-Bench, tools in a gvisor sandbox | done + validated (`launch_eval.py`); see `REPORT.md` |
-| **3. RL** | Dr.GRPO (tunix agentic) — multi-turn rollouts in the gvisor sandbox, sparse grader reward | built (`launch_rl.py`); smoke in progress |
+| **3. RL** | Dr.GRPO (tunix agentic) — multi-turn rollouts in the gvisor sandbox, sparse grader reward | built + validated (`launch_rl.py`): full loop ran single- & multi-host (1.7B); 8B run pending deep-SFT ckpt |
 
 ## Quick start
 
