@@ -98,9 +98,12 @@ def main() -> None:
   isolated = gv.exit_code == 0 and gv.stdout.strip() and gv.stdout.strip() != runc.stdout.strip()
   _log(f"GVISOR ISOLATION: {'CONFIRMED (runsc kernel != host kernel)' if isolated else 'NOT CONFIRMED'}")
 
-  # Exercise the production sandbox class on a stock image.
-  _log("exercising GvisorContainerSandbox(alpine)")
-  sb = GvisorContainerSandbox("alpine", workdir="/root")
+  # Exercise the production sandbox class. Use a bash-bearing image (TB task
+  # images ship bash; alpine is busybox-only, which is why GvisorContainerSandbox's
+  # `bash -lc` would fail there -- an image limitation, not a sandbox bug).
+  sandbox_image = "debian:stable-slim"
+  _log(f"exercising GvisorContainerSandbox({sandbox_image})")
+  sb = GvisorContainerSandbox(sandbox_image, workdir="/root")
   try:
     r = sb.exec("echo from-sandbox && uname -r && id")
     _log(f"sandbox.exec -> exit={r.exit_code}\n{r.stdout}{r.stderr[-200:]}")
