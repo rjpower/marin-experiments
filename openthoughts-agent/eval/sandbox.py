@@ -103,7 +103,7 @@ class GvisorContainerSandbox:
       self,
       image: str,
       *,
-      workdir: str = "/workspace",
+      workdir: str | None = None,
       runtime: str = "runsc",
       network: str = "none",
       name: str | None = None,
@@ -112,36 +112,49 @@ class GvisorContainerSandbox:
   ):
     ensure_dockerd()
     self.image = image
-    self.workdir = workdir
+    self.workdir = workdir  # None => use the image's own WORKDIR
     self._name = name or f"ota-task-{os.getpid()}-{int(time.monotonic()*1000)}"
+    argv = [
+        "docker", "run", "-d", "--rm",
+        "--runtime", runtime,
+        "--network", network,
+        "--memory", mem_limit,
+        "--cpus", cpus,
+    ]
+    if workdir:
+      argv += ["--workdir", workdir]
     # Keep the container alive with a no-op PID 1 so we can exec into it.
-    res = _run(
-        [
-            "docker", "run", "-d", "--rm",
-            "--runtime", runtime,
-            "--network", network,
-            "--memory", mem_limit,
-            "--cpus", cpus,
-            "--workdir", workdir,
-            "--name", self._name,
-            image,
-            "sleep", "infinity",
-        ],
-        timeout=300,
-    )
+    argv += ["--name", self._name, image, "sleep", "infinity"]
+    res = _run(argv, timeout=300)
     if res.exit_code != 0:
       raise RuntimeError(
           f"failed to start sandbox container from {image!r}: {res.stderr}"
       )
 
+  @property
+  def name(self) -> str:
+    """The container name (for ``docker cp`` / grading)."""
+    return self._name
+
   def exec(self, command: str, *, timeout: float = 60.0) -> ExecResult:
-    return _run(
-        ["docker", "exec", "--workdir", self.workdir, self._name, "bash", "-lc", command],
-        timeout=timeout,
-    )
+    argv = ["docker", "exec"]
+    if self.workdir:
+      argv += ["--workdir", self.workdir]
+    argv += [self._name, "bash", "-lc", command]
+    return _run(argv, timeout=timeout)
+
+  def copy_in(self, local_path: str, container_path: str, *, timeout: float = 120.0) -> ExecResult:
+    """Copies a host path into the container (``docker cp``)."""
+    return _run(["docker", "cp", local_path, f"{self._name}:{container_path}"], timeout=timeout)
 
   def close(self) -> None:
     _run(["docker", "rm", "-f", self._name], timeout=30)
+
+
+def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecResult:
+  """Builds a Docker image from ``context_dir`` (must contain a Dockerfile)."""
+  ensure_dockerd()
+  return _run(["docker", "build", "-t", tag, context_dir], timeout=timeout)
 
 
 class LocalUnsafeSandbox:

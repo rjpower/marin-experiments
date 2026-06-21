@@ -26,11 +26,23 @@ FROM ghcr.io/marin-community/iris-task:latest
 # images with gVisor as the OCI runtime (`docker run --runtime=runsc`). dockerd is
 # started at task time (see eval/sandbox.py), which needs the --privileged the TPU
 # task container already has.
+#
+# Use Docker's official static binaries (the standard DinD approach) rather than
+# the distro `docker.io` package, which did not reliably land the `docker` CLI on
+# this slim base. iptables/uidmap are still needed by dockerd at runtime.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        docker.io iptables uidmap ca-certificates wget; \
+        iptables uidmap ca-certificates wget xz-utils; \
     rm -rf /var/lib/apt/lists/*
+
+ARG DOCKER_VERSION=27.3.1
+RUN set -eux; \
+    wget -q "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" -O /tmp/docker.tgz; \
+    tar -xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1; \
+    rm -f /tmp/docker.tgz; \
+    docker --version; \
+    dockerd --version
 
 # --- gVisor (runsc) ---
 # Pinned to a release for reproducibility; bump deliberately.

@@ -55,6 +55,23 @@ def resolve_chatml_ids(tokenizer) -> tuple[int, int, list[int]]:
   return int(im_start), int(im_end), [int(t) for t in newline_ids]
 
 
+def render_chatml(messages: list[dict[str, Any]], *, add_generation_prompt: bool = True) -> str:
+  """Renders messages as Qwen3 ChatML text (matches :func:`encode_agent_conversation`).
+
+  Used at eval/rollout time to build the prompt string fed to the sampler, so the
+  policy sees the exact format it was SFT'd on. With ``add_generation_prompt`` the
+  string ends at ``<|im_start|>assistant\\n`` for the model to continue.
+  """
+  parts = []
+  for msg in messages:
+    role = msg.get("role", "user")
+    content = msg.get("content") or ""
+    parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+  if add_generation_prompt:
+    parts.append("<|im_start|>assistant\n")
+  return "".join(parts)
+
+
 def encode_agent_conversation(
     tokenizer,
     messages: list[dict[str, Any]],

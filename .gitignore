@@ -78,3 +78,7 @@ credentials.json
 *.pem
 
 submodules/
+
+# Locally-downloaded model snapshots / checkpoints (HF weights, orbax dumps)
+*/qwen3-*/
+*/checkpoints/
