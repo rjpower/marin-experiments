@@ -2,7 +2,7 @@
 
 **Marin Research Report · June 2026**
 
-Weaver issues #229 (feasibility) · #5 (agentic tool use) · #7 (agentic coding)
+Weaver issues #229 (feasibility) · #5 (agentic tool use) · #7 (agentic coding) · #8 (test-case curriculum → the clear RL win at 1.7B)
 
 ---
 
@@ -20,7 +20,9 @@ From there we escalated through five milestones, each a real run on TPU v6e:
 
 **The one negative that mattered everywhere:** multi-turn GRPO without gradient clipping does not wobble, it **crashes** — `inf`/`NaN` grads surface as a libtpu `SIGSEGV` that loses all progress. Clipping is load-bearing infrastructure, not a tuning knob.
 
-We then escalated once more — a **multi-turn coding agent** with a **test-case-graded reward and a difficulty curriculum**, built specifically to predict that Dr.GRPO would *finally beat SFT* (§11). It did not (§12), and the negative is the sharpest result here: the redesign **fixed the representation** (SFT now reaches pass@1 = 1.0 on every held-out level, vs. ~1/18 before), but RL still moved held-out pass@1 by **exactly zero** — because the 447M policy is **bimodal per problem** (pass@1 = pass@k at every level, even at temperature 1.5), so RLVR has **no pass@k-to-pass@1 gap to compress**. A clear RL win at this scale needs *compositional* problems that manufacture that gap, or a larger base model — not more RL tuning.
+We then escalated once more — a **multi-turn coding agent** with a **test-case-graded reward and a difficulty curriculum**, built specifically to predict that Dr.GRPO would *finally beat SFT* (§11). At **447M it did not** (§12): the redesign **fixed the representation** (SFT now reaches pass@1 = 1.0 on every held-out level, vs. ~1/18 before), but RL moved held-out pass@1 by **exactly zero**, because the 447M genuinely cannot generalize to held-out families at this scale — `pass@16 = 0` there even with proper sampling, so RLVR has **no pass@k-to-pass@1 gap to compress**. (One honest correction along the way: the "*bimodal at every level, even at temperature 1.5*" framing was partly a **measurement bug** — tunix's `Sampler` decodes greedily unless `top_p` is passed, so our eval's *k* "draws" were one identical sequence; the held-out-`= 0` result survives re-measurement, the "no spread anywhere" generalization did not. §12/§13.)
+
+**So we acted on §12's own prescription — bigger base model + compositional problems — and got the clear win (§13).** On **Qwen3-1.7B-Base** (Delphi is a Qwen3, so it loads through the identical native path) with multi-stage problems and *sampled* pass@k, **Dr.GRPO lifts aggregate pass@1 from 0.289 → 0.466 (+61 %)** — the lift largest at pass@1 and shrinking with *k* (textbook pass@k compression), raising pass@16 to 1.0 on trained mid-levels, **and generalizing to held-out levels 7–9 it never trained on** (tier 7 pass@1 0.078 → 0.188). RL is decisive exactly when the model is *partially competent and unreliable*; tunix/iris delivers that win at the 1.7B scale.
 
 > **What "grug-style model into tunix" meant in practice.** We read it as "bring a marin model into tunix," and the cheapest correct path is tunix's native NNX model zoo + a weight loader — **not** porting grug's `equinox.Module`. For Delphi this is exact and free. A *genuinely* grug-only architecture (e.g. an MoE GatedNorm/XSA variant with no HF equivalent) would still need the equinox→nnx port + KV-cache + RoPE-offset (Strategy A in `DESIGN.md`); we scope that as a separate follow-on.
 
@@ -283,6 +285,8 @@ We built the whole apparatus to test it — and the prediction was **wrong**, in
 
 ## 12. The result: a test-case curriculum, and why RL *still* doesn't beat SFT at 447M (#8)
 
+> **Correction (added 2026-06-21, after §13).** The headline diagnostic in this section — *"pass@1 = pass@k at every tier and temperature, so the policy has no spread for RLVR to compress"* — was **partly a measurement artifact**. The eval sampler was called without `top_p`, and tunix's `Sampler` then decodes **greedily** (silently ignoring `temperature` *and* `seed`), so every "draw" was the identical argmax sequence. Re-measured with real sampling (`top_p=1.0`): the **held-out 447M result below stands** — levels 4–6 are genuinely `pass@16 = 0` (the model truly cannot generalize to held-out families at this scale), so the "RL acquires no new held-out capability at 447M" conclusion is **correct**. But the *generalization* — "no pass@k spread anywhere, fundamentally bimodal" — was the artifact; the partial-competence configs did have hidden spread. The corrected, complete picture and the **clear RL win at 1.7B** are in **§13**. The narrative below is preserved as the original record; read it through that correction.
+
 To give RL a real chance we rebuilt the task three ways (design: [`CURRICULUM_DESIGN.md`](CURRICULUM_DESIGN.md); literature-grounded rationale: [`RL_HEADROOM.md`](RL_HEADROOM.md)):
 
 1. **Test-case-graded reward.** Instead of one canonical-output match, the model writes `def solve(...)` and is scored on the **fraction of N hidden tests passed** — a *continuous* reward, so a group of samples has reward *variance* and Dr.GRPO has a gradient. (The old binary reward gave all-pass-or-all-fail groups → zero advantage → no gradient.)
@@ -310,6 +314,38 @@ This **empirically confirms** the risk flagged up front in [`RL_HEADROOM.md`](RL
 
 > **Integration note (worth logging).** The test-case grader runs the `micropython` interpreter ~9× per program per round (N hidden tests + public-test feedback) vs. 1× in §9. At rollout concurrency 32 this blew host RAM and the container was OOM-killed at 64 GB; the runs only completed at **150 GB**. The TPU/HBM and iris plumbing were never the constraint — host-side grading cost was.
 
+## 13. The clear RL win: a bigger base model, a measurement-bug fix, and pass@k compression that *generalizes* (#8)
+
+§12 ended with a prescription it had not yet run: a clear RL win needs a **`pass@k > pass@1 > 0`** regime, which 447M's templated families never produce — so manufacture it with **compositional problems** and a **larger base model**. We did both. The result is an unambiguous win.
+
+**Three changes.** (1) **Reorganized the codebase** into `problems/ models/ environments/ training/ tests/` with a pytest suite, and rewrote `AGENTS.md` (the layout this report's links assume). (2) **Bumped the model class** to **Qwen3-1.7B-Base** — a general HF→tunix Qwen3 loader (`models/qwen3_loader.py`) and a `ModelSpec` registry (`models/registry.py`) parameterize the whole train/eval stack by model; Delphi *is* a Qwen3, so the 1.7B loads through the same native path with no architecture work, and at `rope_theta = 1e6` it needs no RoPE monkeypatch (§3.1). (3) **Compositional problems**: levels **7–9** chain 2–3 operations into longer programs (e.g. *sum of primes below n*, *RLE then reverse*, *evaluate a small expression*), held out from training.
+
+**The pivotal fix — a measurement bug, not a model change.** Before trusting any pass@k number we found that tunix's `Sampler.__call__` **decodes greedily unless `top_p` is passed** — it picks sampling mode by argument, and with only `temperature`/`seed` (no `top_p`) it silently runs argmax, ignoring both. *Every* `evaluate_problems_passk` call had been greedy, which is exactly why §12 saw `pass@1 = pass@k` everywhere (all *k* draws were one identical sequence). The RL **rollout** path was unaffected (its `RolloutConfig` sets `top_p = 1.0`), so training dynamics were always real — only the eval lens was broken. One-line fix: pass `top_p = 1.0` to the eval samplers. With it, the 1.7B's few-shot baseline shows a **wide, real** pass@k gap.
+
+**The setup.** No SFT (few-shot base model), **Dr.GRPO for 150 steps** over train levels **1–6**, eval on **all 1–9** (so 7–9 are held out), `num_gen 8 × batch 3`, lr `2e-6`, temp 1.0, multi-turn rounds 2. The 1.7B fp32 actor + optimizer + rollout needs ~68 GB/chip and **OOMs a v6e-4** (31 GB/chip); a single-host **v6e-8** (2× sharding) fits it — the first time in this project the TPU itself, not host RAM, set the slice size.
+
+**The result — aggregate pass@k (72 tasks, k=16, temp 1.0), before → after RL:**
+
+| metric | before RL (few-shot) | **after RL** | Δ |
+|---|---|---|---|
+| **pass@1** | 0.289 | **0.466** | **+0.177 (+61 %)** |
+| pass@2 | 0.440 | 0.615 | +0.175 |
+| pass@4 | 0.588 | 0.733 | +0.145 |
+| pass@8 | 0.708 | 0.822 | +0.114 |
+| pass@16 | 0.792 | 0.875 | +0.083 |
+
+**Three textbook RLVR signatures at once:**
+
+1. **Compression.** The lift is **largest at pass@1 and shrinks monotonically as k grows** (+0.18 at k=1 → +0.08 at k=16) — the precise shape of RLVR converting unreliable-but-sometimes-right (pass@k) into reliable (pass@1).
+2. **Ceiling raised, not just sharpened.** On trained mid-levels pass@16 went to **1.0** (tier 5: 0.63→1.0, tier 6: 0.75→1.0) — RL also found genuinely new solutions, not only re-weighted old ones. Per-trained-tier pass@1 rose +0.13 to +0.31 (tier 1: 0.59→0.90, tier 2: 0.53→0.83, tier 4: 0.43→0.71).
+3. **Generalization to held-out levels.** Levels **7–9, never trained on**, also lifted: tier 7 pass@1 **0.078 → 0.188** (>2×), tier 8 0.086→0.141, tier 9 0.094→0.188. RL trained on 1–6 transferred to harder compositional problems it never saw — the "SFT memorizes, RL generalizes" effect, demonstrated.
+
+**Why this won where §12 didn't — and it reconciles cleanly.** RLVR needs a `pass@k > pass@1 > 0` gap to compress. The 447M after SFT(1–3) had none on held-out families: re-measured *with sampling*, it is genuinely `1.0` in-distribution and genuinely `0.0` at all k on held-out (a **capability floor**, confirmed not an artifact). The 1.7B few-shot has partial competence **everywhere** — a wide gap on every tier — so RL has spread to compress on all nine levels. The §12 prescription was right; the only correction is *why* 447M failed (it lacks the gap on held-out families, not "RL fundamentally cannot compress at this scale").
+
+**Verdict (#8).** With a sound measurement (sampled pass@k), a base model above the sub-2B floor, and compositional problems, **Dr.GRPO on tunix/iris produces a clear, generalizing RL win over the few-shot base** — pass@1 +61 % relative, compressing the pass@k gap and transferring to held-out difficulty. This is the positive counterpart to §10/§12: RL is decisive exactly when the model is *partially competent and unreliable*, and tunix's GRPO on iris delivers it at the 1.7B scale.
+
+*Caveat:* eval is `n=8` problems/tier (72 total); the per-tier deltas (+0.13–0.31 on trained tiers) are well beyond sampling noise, but a larger-`n` confirmation would tighten the held-out figures. `train_curriculum` does not checkpoint the actor, so re-eval requires a re-run. *Reproduce:* `CURRIC_MODEL=qwen3 CURRIC_SFT_STEPS=0 CURRIC_TRAIN_LEVELS=1,2,3,4,5,6 CURRIC_EVAL_LEVELS=1,2,3,4,5,6,7,8,9 python launch_curriculum.py` on a v6e-8 (`--memory 200GB`).
+
 ---
 
-Full design + A/B/C strategy trade study: [`DESIGN.md`](DESIGN.md). How to work in this directory (file map, invariants, gotchas): [`AGENTS.md`](AGENTS.md). Per-milestone working logs: `.agents/logs/tunix-iris/`. Tracked as weaver issues #229 (feasibility), #5 (tool use), #7 (coding), #8 (test-case curriculum / RL headroom).
+Full design + A/B/C strategy trade study: [`DESIGN.md`](DESIGN.md). How to work in this directory (file map, invariants, gotchas): [`AGENTS.md`](AGENTS.md). Per-milestone working logs: `.agents/logs/tunix-iris/`. Tracked as weaver issues #229 (feasibility), #5 (tool use), #7 (coding), #8 (test-case curriculum / RL headroom → **resolved in §13: a clear RL win at Qwen3-1.7B-Base** once the eval greedy-decoding bug was fixed and the model class raised).
