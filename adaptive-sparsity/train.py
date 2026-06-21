@@ -96,6 +96,11 @@ class GrugRunConfig:
     optimizer: OptimizerConfig = field(default_factory=AdamConfig)
     trainer: GrugTrainerConfig = field(default_factory=GrugTrainerConfig)
     eval: GrugEvalConfig | None = field(default_factory=GrugEvalConfig)
+    # Optional active-expert curriculum: a list of (active_k, end_step) phases applied
+    # in order. The model is initialized at the first phase's k; at each later boundary
+    # the routed-expert width is widened in place (weights preserved). None = no
+    # curriculum (constant k = model.num_experts_per_token). See ``_swap_active_k``.
+    k_schedule: tuple[tuple[int, int], ...] | None = None
 
 
 def build_train_dataset(
@@ -265,6 +270,57 @@ def _apply_qb_betas(model: Transformer, qb_betas: jax.Array) -> Transformer:
         new_blocks[i] = eqx.tree_at(lambda b: b.mlp, block, new_mlp)
         moe_idx += 1
     return eqx.tree_at(lambda t: t.blocks, model, tuple(new_blocks))
+
+
+def _transplant_arrays(donor, acceptor):
+    """Return ``acceptor``'s pytree (structure + static fields) with every array leaf
+    replaced by ``donor``'s, matched by flatten order.
+
+    Used to change a *static* config field (``num_experts_per_token``) on a trained
+    module without disturbing the learned weights. No parameter shape depends on the
+    routing width k, so the array leaves of the two trees are in 1:1 correspondence;
+    only the static treedef (which carries k) differs. Raises if the leaf count or any
+    shape differs, guarding against silent treedef drift. The result keeps ``donor``'s
+    arrays (so their values *and* device sharding carry over) under ``acceptor``'s
+    config. Works for both the model and the optax state (whose leaves mirror params).
+    """
+    donor_arrays = jax.tree_util.tree_leaves(eqx.filter(donor, eqx.is_array))
+    acc_leaves, acc_treedef = jax.tree_util.tree_flatten(eqx.filter(acceptor, eqx.is_array))
+    if len(donor_arrays) != len(acc_leaves):
+        raise ValueError(f"transplant leaf-count mismatch: donor={len(donor_arrays)} acceptor={len(acc_leaves)}")
+    for d, a in zip(donor_arrays, acc_leaves):
+        if d.shape != a.shape:
+            raise ValueError(f"transplant shape mismatch: donor {d.shape} vs acceptor {a.shape}")
+    return eqx.combine(jax.tree_util.tree_unflatten(acc_treedef, donor_arrays), acceptor)
+
+
+def _swap_active_k(
+    state: "GrugTrainState",
+    new_k: int,
+    *,
+    optimizer: optax.GradientTransformation,
+    mp: jmp.Policy,
+    key: PRNGKeyArray,
+) -> "GrugTrainState":
+    """Return ``state`` reconfigured to route ``new_k`` experts per token.
+
+    Changing the top-k width is a static (treedef) change, which would otherwise
+    desync the optax state (its leaves mirror the param treedef). We rebuild a fresh
+    model + optimizer state at ``new_k`` purely for their structure, then transplant
+    the trained arrays into them. Training resumes from the same weights / optimizer
+    moments with a wider (or narrower) active expert set; ``step`` and the pending QB
+    biases (k-independent) carry over unchanged.
+    """
+    old_cfg = state.params.config
+    if old_cfg.num_experts_per_token == new_k:
+        return state
+    new_cfg = dataclasses.replace(old_cfg, num_experts_per_token=new_k)
+    new_params = _transplant_arrays(state.params, mp.cast_to_param(Transformer.init(new_cfg, key=key)))
+    new_opt_state = _transplant_arrays(state.opt_state, optimizer.init(new_params))
+    new_ema = None
+    if state.ema_params is not None:
+        new_ema = _transplant_arrays(state.ema_params, mp.cast_to_param(Transformer.init(new_cfg, key=key)))
+    return dataclasses.replace(state, params=new_params, opt_state=new_opt_state, ema_params=new_ema)
 
 
 def initial_state(
@@ -528,9 +584,30 @@ def _run_grug_local(config: GrugRunConfig) -> None:
         last_loss: float | jax.Array = 0.0
         last_step_duration = 0.0
 
+        # Active-expert curriculum: widen the routed-expert set at each (k, end_step)
+        # boundary. The model starts at k_schedule[0][0] (set at model init); a swap is
+        # an in-place treedef change that triggers one train_step recompile per phase.
+        k_schedule = config.k_schedule
+        cur_phase = 0
+        if k_schedule:
+            logger.info(f"curriculum k-schedule (active_k, end_step): {list(k_schedule)}")
+
         # Main optimization loop.
         try:
             while int(state.step) < trainer.num_train_steps:
+                if k_schedule is not None:
+                    while cur_phase + 1 < len(k_schedule) and int(state.step) >= k_schedule[cur_phase][1]:
+                        cur_phase += 1
+                        new_k = k_schedule[cur_phase][0]
+                        logger.info(f"curriculum: step {int(state.step)} -> active_k={new_k}")
+                        state = _swap_active_k(
+                            state,
+                            new_k,
+                            optimizer=optimizer,
+                            mp=trainer.mp,
+                            key=jax.random.PRNGKey(1000 + new_k),
+                        )
+                        levanter.tracker.log({"curriculum/active_k": new_k}, step=int(state.step))
                 with jax.profiler.TraceAnnotation("load_batch"):
                     batch = next(iterator)
                 step_start = time.perf_counter()

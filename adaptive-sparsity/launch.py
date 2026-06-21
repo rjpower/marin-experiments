@@ -85,6 +85,7 @@ class GrugMoeLaunchConfig:
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     grug_trainer: GrugTrainerConfig = field(default_factory=GrugTrainerConfig)
     checkpointer: CheckpointerConfig | None = None
+    k_schedule: tuple[tuple[int, int], ...] | None = None
 
 
 def _resolve_tracker(tracker: TrackerConfig, run_id: str) -> TrackerConfig:
@@ -130,6 +131,7 @@ def run_inline(config: GrugMoeLaunchConfig) -> None:
         trainer=grug_trainer,
         # No validation sets in the FineWeb-Edu mixture; convergence metric is train/loss.
         eval=None,
+        k_schedule=config.k_schedule,
     )
     _run_grug_local(run_config)
 
@@ -162,6 +164,21 @@ def _make_step() -> ExecutorStep:
     remat_mode = _env("SP_REMAT", "recompute_all")
     moe_impl = _env("SP_MOE_IMPL", "") or None
     log_every = int(_env("SP_LOG_EVERY", "1"))
+
+    # Active-expert curriculum: SP_CURRICULUM="k0:frac0,k1:frac1,..." ramps the routed
+    # expert width k over training (cheap exposure at small k, then cash in expert
+    # capacity at the end). Forces fixed routing; the model starts at the first phase's
+    # k and is widened in place at each boundary (see train._swap_active_k).
+    curriculum = _env("SP_CURRICULUM", "")
+    curric_ks: list[int] = []
+    curric_fracs: list[float] = []
+    if curriculum:
+        for part in curriculum.split(","):
+            k_str, f_str = part.split(":")
+            curric_ks.append(int(k_str))
+            curric_fracs.append(float(f_str))
+        mode = "fixed"
+        top_k = curric_ks[0]
 
     if mode not in ("fixed", "adaptive"):
         raise ValueError(f"SPARSITY_MODE must be 'fixed' or 'adaptive', got {mode!r}")
@@ -202,8 +219,21 @@ def _make_step() -> ExecutorStep:
     steps = int(_env("SP_STEPS", str(ref_steps)))
     profiler = ProfilerConfig(enabled=True, start_step=10, num_steps=10) if profile else ProfilerConfig()
 
+    # Build the curriculum (active_k, end_step) phases from the cumulative token
+    # fractions, with the final phase ending exactly at the total step count.
+    k_schedule = None
+    if curriculum:
+        ends: list[int] = []
+        acc = 0.0
+        for i, frac in enumerate(curric_fracs):
+            acc += frac
+            ends.append(steps if i == len(curric_fracs) - 1 else max(1, round(acc * steps)))
+        k_schedule = tuple((k, e) for k, e in zip(curric_ks, ends))
+
     active_frac = top_k / num_experts
-    if adaptive:
+    if curriculum:
+        arm = f"curric-d{hidden}-E{num_experts}-k{curric_ks[0]}to{curric_ks[-1]}"
+    elif adaptive:
         arm = f"adapt-d{hidden}-E{num_experts}-k{top_k}-min{min_k}-c{coef:g}-t{temp:g}"
     else:
         arm = f"fixed-d{hidden}-E{num_experts}-k{top_k}"
@@ -230,12 +260,14 @@ def _make_step() -> ExecutorStep:
         profiler=profiler,
         tracker=WandbConfig(
             project="marin_moe",
-            tags=["moe", "adaptive-sparsity", mode, f"E{num_experts}", f"k{top_k}"],
+            tags=["moe", "adaptive-sparsity", mode, f"E{num_experts}", f"k{top_k}"]
+            + (["curriculum"] if curriculum else []),
             group=group,
             name=None,
         ),
         optimizer=versioned(optimizer),
         grug_trainer=versioned(GrugTrainerConfig(z_loss_weight=1e-4, ema_beta=None, log_every=log_every)),
+        k_schedule=k_schedule,
     )
 
     tokens = batch * steps * 4096
@@ -243,7 +275,8 @@ def _make_step() -> ExecutorStep:
         f"[arm] {run_id}  mode={mode} E={num_experts} k={top_k} min_k={min_k} "
         f"coef={coef} nominal_active_frac={active_frac:.4%} batch={batch} steps={steps} "
         f"tokens={tokens/1e9:.1f}B layers={model.num_layers} data={data_kind} budget={budget:g} "
-        f"remat={remat_mode} moe_impl={moe_impl} log_every={log_every} profile={profile}"
+        f"remat={remat_mode} moe_impl={moe_impl} log_every={log_every} profile={profile} "
+        f"curriculum={k_schedule}"
     )
     return ExecutorStep(name=f"grug/sparsity/{run_id}", fn=run_inline, config=launch)
 
