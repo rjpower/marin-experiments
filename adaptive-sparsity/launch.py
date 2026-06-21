@@ -164,6 +164,14 @@ def _make_step() -> ExecutorStep:
     remat_mode = _env("SP_REMAT", "recompute_all")
     moe_impl = _env("SP_MOE_IMPL", "") or None
     log_every = int(_env("SP_LOG_EVERY", "1"))
+    fast_qb = _env("SP_FAST_QB", "0") == "1"
+    # Expert intermediate width override. The heuristic hardcodes I_expert = D/2 (thin
+    # experts, so total params scale with a large E); set this to make experts "fat" (e.g.
+    # 2*D) for a geometry where the routed experts are a large FLOP fraction and sparsity is
+    # a real compute lever. 0 keeps the heuristic default. Sizing/LR are unaffected (LR
+    # depends on D/tokens/batch, not I); iso-token budgeting uses the reference (heuristic-I)
+    # model, so the token count is unchanged and only wall-clock FLOPs grow.
+    intermediate = int(_env("SP_INTERMEDIATE", "0"))
 
     # Active-expert curriculum: SP_CURRICULUM="k0:frac0,k1:frac1,..." ramps the routed
     # expert width k over training (cheap exposure at small k, then cash in expert
@@ -213,8 +221,12 @@ def _make_step() -> ExecutorStep:
         sparsity_loss_coef=coef if adaptive else 0.0,
         sparsity_temp=temp,
     )
-    # Apply the perf-tuning overrides (remat policy + MoE dispatch backend).
-    model = dataclasses.replace(model, remat_mode=remat_mode, moe_implementation=moe_impl)
+    # Apply the perf-tuning overrides (remat policy + MoE dispatch backend + fast QB β) and
+    # the optional fat-expert geometry override (intermediate width).
+    overrides = dict(remat_mode=remat_mode, moe_implementation=moe_impl, fast_qb_beta=fast_qb)
+    if intermediate > 0:
+        overrides["intermediate_dim"] = intermediate
+    model = dataclasses.replace(model, **overrides)
     batch = int(_env("SP_BATCH", str(ref_batch)))
     steps = int(_env("SP_STEPS", str(ref_steps)))
     profiler = ProfilerConfig(enabled=True, start_step=10, num_steps=10) if profile else ProfilerConfig()
@@ -237,6 +249,8 @@ def _make_step() -> ExecutorStep:
         arm = f"adapt-d{hidden}-E{num_experts}-k{top_k}-min{min_k}-c{coef:g}-t{temp:g}"
     else:
         arm = f"fixed-d{hidden}-E{num_experts}-k{top_k}"
+    if intermediate > 0:
+        arm = f"{arm}-I{intermediate}"
     run_id = f"sparsity-{arm}-s{seed}-st{steps}"
 
     if smoke or data_kind == "fineweb":
@@ -274,9 +288,9 @@ def _make_step() -> ExecutorStep:
     print(
         f"[arm] {run_id}  mode={mode} E={num_experts} k={top_k} min_k={min_k} "
         f"coef={coef} nominal_active_frac={active_frac:.4%} batch={batch} steps={steps} "
-        f"tokens={tokens/1e9:.1f}B layers={model.num_layers} data={data_kind} budget={budget:g} "
-        f"remat={remat_mode} moe_impl={moe_impl} log_every={log_every} profile={profile} "
-        f"curriculum={k_schedule}"
+        f"tokens={tokens/1e9:.1f}B layers={model.num_layers} I_expert={model.intermediate_dim} "
+        f"data={data_kind} budget={budget:g} remat={remat_mode} moe_impl={moe_impl} "
+        f"log_every={log_every} profile={profile} curriculum={k_schedule}"
     )
     return ExecutorStep(name=f"grug/sparsity/{run_id}", fn=run_inline, config=launch)
 
