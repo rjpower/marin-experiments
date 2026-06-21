@@ -6,11 +6,14 @@ Lifted from the proven ``tunix-delphi-rl`` plumbing. The only generalisation is
 pure FSDP runs out of HBM.
 """
 
+import os
+
 import jax
 import numpy as np
 import optax
 
 from tunix.sft import utils as sft_utils
+from tunix.sft.metrics_logger import MetricsLoggerOptions
 
 
 def init_distributed() -> None:
@@ -26,6 +29,51 @@ def init_distributed() -> None:
     jax.distributed.initialize()
   except RuntimeError as e:  # already initialized
     print(f"[dist] jax.distributed already initialized: {e}", flush=True)
+
+
+def metrics_logging_options(
+    run_name: str,
+    *,
+    config: dict | None = None,
+    log_dir: str | None = None,
+    flush_every_n_steps: int = 20,
+) -> MetricsLoggerOptions | None:
+  """Opt-in tunix metrics logging (wandb + tensorboard), or ``None`` if unconfigured.
+
+  Both the SFT ``PeftTrainer`` and the RL learner take a
+  ``metrics_logging_options`` on their training config; threading the same builder
+  through both gives loss/reward curves with one switch. Returns ``None`` (logging
+  off, stdout only) unless ``WANDB_PROJECT`` or a log dir is set, so a plain run
+  never depends on wandb being reachable.
+
+  Config via env:
+    * ``WANDB_PROJECT`` -- wandb project; enables the wandb backend (needs
+      ``WANDB_API_KEY``, which the iris job inherits).
+    * ``TB_LOG_DIR`` (or the ``log_dir`` arg) -- tensorboard dir (local or
+      ``gs://``); also the dir tunix's logger needs even for wandb-only.
+
+  Args:
+    run_name: the wandb run name (e.g. ``"ota-sft-qwen3-8b"``).
+    config: hyperparameters to record on the run.
+    log_dir: tensorboard log dir; falls back to ``TB_LOG_DIR``.
+    flush_every_n_steps: metric flush cadence.
+  """
+  project = os.environ.get("WANDB_PROJECT")
+  log_dir = log_dir or os.environ.get("TB_LOG_DIR")
+  if not project and not log_dir:
+    return None
+  backend_kwargs: dict = {}
+  if project:
+    backend_kwargs["wandb"] = {"config": config or {}}
+  # tunix's MetricsLoggerOptions requires a log_dir; default to a job-local path
+  # (tensorboard backend writes there; harmless if only wandb is wanted).
+  return MetricsLoggerOptions(
+      log_dir=log_dir or f"/tmp/tb/{run_name}",
+      project_name=project or "openthoughts-agent",
+      run_name=run_name,
+      flush_every_n_steps=flush_every_n_steps,
+      backend_kwargs=backend_kwargs,
+  )
 
 
 def clipped_adamw(learning_rate: float) -> optax.GradientTransformation:

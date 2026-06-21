@@ -49,7 +49,7 @@ from tunix.models.qwen3 import model as qm
 
 from models.registry import get_model_spec
 from training.agent_sft import resolve_chatml_ids, run_agent_sft
-from training.common import build_mesh, init_distributed
+from training.common import build_mesh, init_distributed, metrics_logging_options
 
 # A held-out terminal task (not in the SFT stream) used only for a qualitative
 # before/after generation -- mirrors the Terminus-2 single-action prompt shape.
@@ -166,6 +166,14 @@ def main() -> None:
     print(f"[ota-sft] BEFORE-SFT action:\n{before[0][:600]!r}", flush=True)
 
   # ---- SFT ----
+  metrics = metrics_logging_options(
+      os.environ.get("RUN_NAME", f"{model_spec.name}-agent-sft"),
+      config={
+          "stage": "sft", "model": model_spec.name, "steps": steps,
+          "batch_size": batch_size, "lr": learning_rate, "max_seq_len": max_seq_len,
+          "tp": tp, "remat": os.environ.get("REMAT", "decoder"), "flash": use_flash,
+      },
+  )
   model = run_agent_sft(
       model, tokenizer,
       steps=steps,
@@ -176,6 +184,7 @@ def main() -> None:
       seed=seed,
       limit=data_limit,
       checkpoint_dir=checkpoint_dir,
+      metrics_options=metrics,
   )
 
   if eval_gen:

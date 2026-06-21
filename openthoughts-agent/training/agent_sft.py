@@ -244,6 +244,7 @@ def run_agent_sft(
     checkpoint_dir: str | None = None,
     save_interval_secs: int = 600,
     max_to_keep: int = 2,
+    metrics_options=None,
 ) -> Any:
   """SFTs ``model`` in place on agent traces and (optionally) checkpoints it.
 
@@ -289,7 +290,7 @@ def run_agent_sft(
       training_config=TrainingConfig(
           eval_every_n_steps=10**9,
           max_steps=steps,
-          metrics_logging_options=None,
+          metrics_logging_options=metrics_options,
           checkpoint_root_directory=checkpoint_dir,
           checkpointing_options=checkpointing_options,
       ),
