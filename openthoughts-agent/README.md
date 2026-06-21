@@ -1,0 +1,59 @@
+# openthoughts-agent
+
+Post-training **Qwen3-8B** into an **OpenThoughts terminal agent**
+(https://www.openthoughts.ai/blog/agent) with `google-tunix`, run on the
+**marin/iris** TPU cluster (v6e-8 / v6e-16).
+
+The OpenThoughts agent reads a task + live terminal output and emits structured
+shell actions; it's evaluated on **Terminal-Bench** (the `OpenThoughts-TB-dev`
+tasks are Docker environments + graders), so tool execution runs in an isolated
+**gvisor (runsc)** sandbox.
+
+## Pipeline
+
+| Stage | What | Status |
+| --- | --- | --- |
+| **1. SFT** | Qwen3-8B on `open-thoughts/OpenThoughts-Agent-v1-SFT` (~15.2k Terminus-2 traces), ChatML + assistant-turn loss masking → orbax checkpoint | implemented (`launch_sft.py`) |
+| **2. Eval** | SFT'd agent on `open-thoughts/OpenThoughts-TB-dev` / Terminal-Bench, tools in a gvisor sandbox | in progress |
+| **3. RL** | Dr.GRPO (tunix) on the ~720 verified RL tasks; sync rollouts → async | planned |
+
+## Quick start
+
+```bash
+# CPU: fast unit tests (ChatML masking; tokenizer only, no weights)
+uv run pytest -q
+
+# TPU SFT on iris (8B): see AGENTS.md for the full submit recipe
+uv run iris --cluster=marin job run --no-wait \
+  --tpu v6e-16 --enable-extra-resources --extra tpu --region europe-west4 \
+  --cpu 8 --memory 200GB --disk 200GB --max-retries 1 --job-name ota-sft-qwen3-8b \
+  -e HF_TOKEN "$HF_TOKEN" -e WANDB_API_KEY "$WANDB_API_KEY" \
+  -e CKPT_DIR gs://marin-us-central2/openthoughts-agent/qwen3-8b-sft \
+  -- python launch_sft.py
+```
+
+See **`AGENTS.md`** for the cluster recipe, env knobs, and the hard-won
+invariants (fp32 actor, gradient clipping, the greedy-sampler `top_p` fix,
+commit-before-submit, etc.).
+
+## Layout
+
+```
+launch_sft.py            # iris entrypoint (stage 1: SFT)
+models/qwen3_loader.py   # stock HF Qwen3 -> tunix nnx (fp32 params, remat, flash)
+models/registry.py       # qwen3-8b / qwen3-8b-base / qwen3-1.7b-base
+agent_data/agent_traces.py  # stream OpenThoughts-Agent-v1-SFT (pinned revision)
+training/agent_sft.py    # ChatML encoder + assistant masking + PeftTrainer + orbax ckpt
+training/common.py       # clipped_adamw, build_mesh(tp=...), sft_model_input_fn
+eval/                    # Terminal-Bench harness + gvisor sandbox (stage 2)
+tests/                   # CPU encoder/masking tests
+```
+
+## Provenance
+
+Built on the `tunix-delphi-rl` feasibility study
+([marin-experiments PR #2](https://github.com/rjpower/marin-experiments/pull/2)):
+the tunix Qwen3 loader, the FSDP mesh, `clipped_adamw`, and the loss-masked
+`PeftTrainer` SFT pattern are adapted from it. New here: the ChatML agent-trace
+encoder, the pyarrow trace loader, orbax checkpointing, and the 8B memory wiring
+(fp32 params + decoder remat + flash attention + optional tensor parallelism).
