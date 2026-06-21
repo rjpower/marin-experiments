@@ -160,6 +160,7 @@ def main() -> None:
       temperature=temperature,
       top_p=1.0,  # tunix sampler decodes greedily without top_p
       eos_tokens=[im_end_id, eos_id],
+      return_logprobs=True,  # agentic learner uses rollout logprobs (use_rollout_logps)
   )
   metrics = metrics_logging_options(
       os.environ.get("RUN_NAME", f"{spec.name}-agent-rl"),
