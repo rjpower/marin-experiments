@@ -257,19 +257,27 @@ class GvisorContainerSandbox:
     container (the blob path doesn't exist there). So we stage a dereferenced
     copy first -- ``shutil.copy`` follows file symlinks; ``copytree(symlinks=
     False)`` follows them through a tree.
+
+    For a single file we ``docker cp`` it INTO the destination's parent dir
+    rather than to the exact dest path: a single-file ``docker cp`` to a
+    not-yet-existing dest path misbehaves under the runsc runtime (it lands as a
+    broken/empty target), whereas copying into an existing dir works (as the
+    directory path does).
     """
     staging = tempfile.mkdtemp(prefix="ota-cp-")
     try:
-      base = os.path.basename(local_path.rstrip("/")) or "payload"
-      src = os.path.join(staging, base)
       if os.path.isdir(local_path):
+        src = os.path.join(staging, os.path.basename(local_path.rstrip("/")) or "payload")
         shutil.copytree(
-            local_path, src, symlinks=False,
+            src=local_path, dst=src, symlinks=False,
             ignore=shutil.ignore_patterns("__pycache__"),
         )
-      else:
-        shutil.copy(local_path, src)
-      return _run(["docker", "cp", src, f"{self._name}:{container_path}"], timeout=timeout)
+        return _run(["docker", "cp", src, f"{self._name}:{container_path}"], timeout=timeout)
+      # Single file: stage under the DEST basename, cp into the dest's parent dir.
+      dst_dir = os.path.dirname(container_path.rstrip("/")) or "/"
+      src = os.path.join(staging, os.path.basename(container_path.rstrip("/")))
+      shutil.copy(local_path, src)
+      return _run(["docker", "cp", src, f"{self._name}:{dst_dir}/"], timeout=timeout)
     finally:
       shutil.rmtree(staging, ignore_errors=True)
 
