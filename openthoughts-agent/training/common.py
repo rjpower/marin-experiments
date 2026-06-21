@@ -13,6 +13,21 @@ import optax
 from tunix.sft import utils as sft_utils
 
 
+def init_distributed() -> None:
+  """Bring up the JAX distributed client (multi-host TPU), before any other jax call.
+
+  Required on multi-host slices (v6e-8/-16 span 2/4 hosts): orbax checkpoint
+  barriers call into the distributed client and otherwise raise "Distributed
+  system is not available". On TPU this auto-detects the coordinator from the
+  slice metadata; on a single host it's a harmless no-op. Idempotent: a second
+  call (or a harness that already initialized) is ignored.
+  """
+  try:
+    jax.distributed.initialize()
+  except RuntimeError as e:  # already initialized
+    print(f"[dist] jax.distributed already initialized: {e}", flush=True)
+
+
 def clipped_adamw(learning_rate: float) -> optax.GradientTransformation:
   """Global-norm-clipped AdamW (b1=0.9, b2=0.99, wd=0.0).
 

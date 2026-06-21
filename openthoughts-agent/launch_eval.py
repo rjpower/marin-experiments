@@ -40,7 +40,7 @@ from eval.sandbox import GvisorContainerSandbox, build_image
 from eval.tb_tasks import load_tb_tasks
 from models.checkpoint import restore_sft_model
 from models.registry import get_model_spec
-from training.common import build_mesh
+from training.common import build_mesh, init_distributed
 
 
 def _ensure_model(repo: str, model_dir: str) -> str:
@@ -50,6 +50,7 @@ def _ensure_model(repo: str, model_dir: str) -> str:
 
 
 def main() -> None:
+  init_distributed()  # must precede any jax call (orbax multi-host barriers)
   model_name = os.environ.get("AGENT_MODEL", "qwen3-8b")
   checkpoint_dir = os.environ["CKPT_DIR"]
   task_limit = os.environ.get("TASK_LIMIT")

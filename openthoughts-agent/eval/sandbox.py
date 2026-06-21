@@ -20,10 +20,13 @@ Use :func:`make_sandbox` to pick by ``OTA_SANDBOX`` env (``gvisor`` | ``local``)
 """
 
 import dataclasses
+import json
 import os
 import shutil
 import subprocess
+import tarfile
 import time
+import urllib.request
 from typing import Protocol
 
 
@@ -64,6 +67,22 @@ def _run(argv: list[str], *, timeout: float, input_text: str | None = None) -> E
     return ExecResult(e.stdout or "", (e.stderr or "") + "\n[timeout]", 124, timed_out=True)
 
 
+# --- Runtime bootstrap of docker + runsc -------------------------------------
+# Two ways to get the sandbox runtime into the privileged iris task:
+#   * the custom task image (docker/Dockerfile.agent-task) bakes these in -- then
+#     ensure_sandbox_runtime() is a pure no-op; OR
+#   * on the stock iris image, we download the exact same binaries at runtime.
+# This lets the eval run either way, so we don't hard-depend on the custom image
+# being published. Confirmed working on a v6e TPU task (see eval/gvisor_smoke.py).
+_DOCKER_VERSION = "27.3.1"
+_DOCKER_TGZ_URL = f"https://download.docker.com/linux/static/stable/x86_64/docker-{_DOCKER_VERSION}.tgz"
+_RUNSC_URL = "https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc"
+_BIN_DIR = "/usr/local/bin"
+_DAEMON_JSON_PATH = "/etc/docker/daemon.json"
+# ptrace: no /dev/kvm in iris tasks. ignore-cgroups: the task cgroup is restricted
+# so runsc can't write cgroup.subtree_control. network=sandbox: gVisor netstack.
+_RUNSC_RUNTIME_ARGS = ["--platform=ptrace", "--network=sandbox", "--ignore-cgroups"]
+
 # dockerd flags for running nested inside a container: vfs avoids nested-overlayfs
 # failures, and we disable the bridge/iptables since sandbox containers use
 # ``--network none`` (no docker bridge needed). Override via ``DOCKERD_ARGS``.
@@ -71,8 +90,61 @@ _DEFAULT_DOCKERD_ARGS = ["--storage-driver=vfs", "--iptables=false", "--bridge=n
 _DOCKERD_LOG = "/tmp/dockerd.out"
 
 
+def _install_static_docker() -> None:
+  urllib.request.urlretrieve(_DOCKER_TGZ_URL, "/tmp/ota-docker.tgz")
+  with tarfile.open("/tmp/ota-docker.tgz") as t:
+    t.extractall("/tmp/ota-docker-extract")
+  src = "/tmp/ota-docker-extract/docker"
+  for fn in os.listdir(src):
+    dst = os.path.join(_BIN_DIR, fn)
+    shutil.copy(os.path.join(src, fn), dst)
+    os.chmod(dst, 0o755)
+
+
+def _install_runsc() -> None:
+  dst = os.path.join(_BIN_DIR, "runsc")
+  urllib.request.urlretrieve(_RUNSC_URL, dst)
+  os.chmod(dst, 0o755)
+
+
+def _ensure_runsc_runtime_registered() -> None:
+  """Writes the runsc runtime into daemon.json if it isn't already registered."""
+  existing: dict = {}
+  if os.path.exists(_DAEMON_JSON_PATH):
+    try:
+      with open(_DAEMON_JSON_PATH) as f:
+        existing = json.load(f)
+    except (OSError, json.JSONDecodeError):
+      existing = {}
+  runtimes = existing.get("runtimes", {})
+  if "runsc" in runtimes:
+    return  # already registered (custom image) -- leave it untouched
+  runtimes["runsc"] = {
+      "path": os.path.join(_BIN_DIR, "runsc"),
+      "runtimeArgs": _RUNSC_RUNTIME_ARGS,
+  }
+  existing["runtimes"] = runtimes
+  os.makedirs(os.path.dirname(_DAEMON_JSON_PATH), exist_ok=True)
+  with open(_DAEMON_JSON_PATH, "w") as f:
+    json.dump(existing, f)
+
+
+def ensure_sandbox_runtime() -> None:
+  """Idempotently ensure docker + runsc + the runsc Docker runtime are available.
+
+  No-op on the custom openthoughts-agent-task image (everything is pre-baked); on
+  the stock iris image it downloads Docker's static binaries + runsc at runtime.
+  Must run before dockerd starts, since dockerd reads daemon.json at startup.
+  """
+  if shutil.which("docker") is None:
+    _install_static_docker()
+  if shutil.which("runsc") is None:
+    _install_runsc()
+  _ensure_runsc_runtime_registered()
+
+
 def ensure_dockerd(*, timeout: float = 120.0) -> None:
-  """Starts a task-local dockerd if the socket isn't already up, and waits for it.
+  """Bootstraps the runtime if needed, starts a task-local dockerd, and waits.
 
   Idempotent. Requires the ``--privileged`` task container (TPU jobs have it).
   Runs dockerd with vfs storage + no bridge/iptables, which is what lets it come
@@ -82,8 +154,7 @@ def ensure_dockerd(*, timeout: float = 120.0) -> None:
     RuntimeError: if dockerd does not become ready within ``timeout`` (the error
       includes the tail of dockerd's own log to make the cause visible).
   """
-  if shutil.which("docker") is None:
-    raise RuntimeError("docker not found; use the openthoughts-agent-task image.")
+  ensure_sandbox_runtime()
   if _run(["docker", "info"], timeout=10).exit_code == 0:
     return
   extra = os.environ.get("DOCKERD_ARGS")

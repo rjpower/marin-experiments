@@ -27,23 +27,12 @@ Submit on the smallest TPU slice (privileged, fast to schedule):
 """
 
 import os
-import shutil
-import tarfile
-import urllib.request
 
 from eval.sandbox import (
     GvisorContainerSandbox,
     _run,
     ensure_dockerd,
-)
-
-DOCKER_VERSION = "27.3.1"
-DOCKER_URL = f"https://download.docker.com/linux/static/stable/x86_64/docker-{DOCKER_VERSION}.tgz"
-RUNSC_BASE = "https://storage.googleapis.com/gvisor/releases/release/latest/x86_64"
-BIN_DIR = "/usr/local/bin"
-DAEMON_JSON = (
-    '{"runtimes":{"runsc":{"path":"/usr/local/bin/runsc",'
-    '"runtimeArgs":["--platform=ptrace","--network=sandbox","--ignore-cgroups"]}}}'
+    ensure_sandbox_runtime,
 )
 
 
@@ -51,29 +40,10 @@ def _log(msg: str) -> None:
   print(f"[gvisor-smoke] {msg}", flush=True)
 
 
-def bootstrap() -> None:
-  """Installs docker static binaries + runsc and registers the runsc runtime."""
-  if shutil.which("docker") is None:
-    _log(f"downloading docker {DOCKER_VERSION} static binaries")
-    urllib.request.urlretrieve(DOCKER_URL, "/tmp/docker.tgz")
-    with tarfile.open("/tmp/docker.tgz") as t:
-      t.extractall("/tmp/docker-extract")
-    for fn in os.listdir("/tmp/docker-extract/docker"):
-      dst = os.path.join(BIN_DIR, fn)
-      shutil.copy(os.path.join("/tmp/docker-extract/docker", fn), dst)
-      os.chmod(dst, 0o755)
-  if shutil.which("runsc") is None:
-    _log("downloading runsc")
-    urllib.request.urlretrieve(f"{RUNSC_BASE}/runsc", os.path.join(BIN_DIR, "runsc"))
-    os.chmod(os.path.join(BIN_DIR, "runsc"), 0o755)
-  os.makedirs("/etc/docker", exist_ok=True)
-  with open("/etc/docker/daemon.json", "w") as f:
-    f.write(DAEMON_JSON)
-
-
 def main() -> None:
   _log(f"uid={os.getuid()} (privileged TPU task expected to be root)")
-  bootstrap()
+  # No-op on the custom task image; installs docker+runsc on the stock iris image.
+  ensure_sandbox_runtime()
 
   v = _run(["runsc", "--version"], timeout=30)
   _log(f"runsc --version -> exit={v.exit_code}\n{v.stdout}{v.stderr}")

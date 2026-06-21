@@ -49,7 +49,7 @@ from tunix.models.qwen3 import model as qm
 
 from models.registry import get_model_spec
 from training.agent_sft import resolve_chatml_ids, run_agent_sft
-from training.common import build_mesh
+from training.common import build_mesh, init_distributed
 
 # A held-out terminal task (not in the SFT stream) used only for a qualitative
 # before/after generation -- mirrors the Terminus-2 single-action prompt shape.
@@ -92,6 +92,7 @@ def _generate(sampler, mesh, prompts, *, max_new, eos_id, im_end_id):
 
 
 def main() -> None:
+  init_distributed()  # must precede any jax call (orbax multi-host barriers)
   model_name = os.environ.get("AGENT_MODEL", "qwen3-8b")
   steps = int(os.environ.get("SFT_STEPS", "2000"))
   batch_size = int(os.environ.get("BATCH_SIZE", "8"))
