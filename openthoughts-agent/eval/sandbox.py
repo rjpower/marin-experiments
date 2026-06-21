@@ -268,6 +268,12 @@ def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecR
   HuggingFace ``snapshot_download`` stores files as symlinks into a ``blobs/``
   cache; BuildKit can't follow symlinks that point outside the build context, so
   we first materialize the context with symlinks dereferenced.
+
+  Build RUN steps (apt-get, etc.) need network egress, but dockerd runs with
+  ``--bridge=none`` (so it can come up nested without iptables, which the stock
+  iris image lacks). So we build with ``--network=host`` -- RUN steps use the
+  task's own network. The sandboxed run-time containers still use ``--network
+  none``.
   """
   ensure_dockerd()
   staging = tempfile.mkdtemp(prefix="ota-build-")
@@ -278,7 +284,7 @@ def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecR
         ignore=shutil.ignore_patterns("__pycache__"),
     )
     return _run(
-        ["docker", "buildx", "build", "--load", "-t", tag, ctx],
+        ["docker", "buildx", "build", "--network=host", "--load", "-t", tag, ctx],
         timeout=timeout,
     )
   finally:
