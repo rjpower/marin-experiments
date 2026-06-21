@@ -15,7 +15,7 @@ stages each have one root entrypoint: `launch_sft.py`, `launch_eval.py`,
 |------|------|------|
 | 1. SFT | Qwen3-8B on `OpenThoughts-Agent-v1-SFT` (~15.2k Terminus-2 traces) → GCS ckpt | **done**; baseline ckpt at `…/qwen3-8b-agent-sft`; a 3-epoch **deep** run is training to `…/qwen3-8b-agent-sft-deep` |
 | 2. Eval | SFT'd agent on `OpenThoughts-TB-dev` (Terminal-Bench) in a gVisor sandbox | **done + validated**: clean end-to-end, oracle grades 1.0, baseline solved 0/5 (format learned, capability low) |
-| 3. RL | Dr.GRPO (tunix agentic), sync rollouts | **built**: env+agent+launcher, CPU-tested; single-host machinery smoke in progress; real 8B run pending deep-SFT ckpt |
+| 3. RL | Dr.GRPO (tunix agentic), sync rollouts | **built + validated**: full loop ran end-to-end single-host (1.7B/v6e-4, TP=4) AND multi-host (1.7B/v6e-8); real 8B run pending deep-SFT ckpt + 8B memory-fit |
 
 Milestone-1 write-up: `REPORT.md`. PR: rjpower/marin-experiments#9.
 
@@ -227,16 +227,16 @@ smoke — keep them):
   `max_prompt_length` (`model_serving._fit_messages`) or the sampler KV cache overflows.
 - **RL needs reward spread.** Dr.GRPO advantage = reward − group mean; an all-0 (or
   all-1) group yields 0 advantage. Train on tasks the SFT policy solves *sometimes*.
-- **RL rollouts run sandbox containers in-process (sync).** Validate single-host (v6e-4)
-  first; multi-host agentic rollout (8B on v6e-8/-16) is a separate rung to verify.
-- **Multi-host AGENTIC RL is unproven.** The tunix agentic learner has no
-  `process_index` guards — every host runs the collect engine + steps its own
-  containers, while `rl_cluster.generate` is a cross-host collective expecting
-  identical prompts per host. Container output isn't guaranteed deterministic across
-  hosts → possible desync/hang. (The prior multi-host RL win was *single-turn* GRPO:
-  pure JAX generate, no env, so multi-host-safe.) For the 8B run — which needs a
-  multi-host slice — either confirm empirically on v6e-8, drive rollout from one host,
-  or file a tunix issue. The single-host smoke does not exercise this.
+- **RL rollouts run sandbox containers in-process (sync).** Validated single-host
+  (1.7B/v6e-4, TP=4) AND multi-host (1.7B/v6e-8, 2 hosts) — both ran the full
+  rollout→gVisor→grade→Dr.GRPO loop to completion (`ota-rl-smoke6`, `ota-rl-mh`).
+- **Multi-host agentic RL works** (despite no `process_index` guards in the tunix
+  learner): the 1.7B/v6e-8 smoke completed cleanly, no collective desync/hang. So the
+  8B run on v6e-8/-16 is unblocked on that axis — remaining 8B work is the memory-fit
+  ladder (TP + short seqs at `remat=NONE`, which the rollout sampler forces).
+- **RL backprop OOMs without sharding** at `remat=NONE` (forced by the sampler). 1.7B
+  OOMs v6e-4 at TP=1 (42G temporaries); **TP shards the per-sequence activations** →
+  TP=4 fits 1.7B on v6e-4. 8B will need higher TP / shorter seqs on v6e-16.
 - **Re-`uv lock` before submit if stale** — `marin-*` are nightly `0.2.x.dev`.
 
 ## Dependencies

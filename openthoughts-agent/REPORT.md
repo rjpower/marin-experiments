@@ -112,13 +112,45 @@ uv run iris --cluster=marin job run --tpu v6e-8 --enable-extra-resources --extra
   -e CKPT_DIR gs://.../qwen3-8b-agent-sft -e TASK_LIMIT 5 -- python launch_eval.py
 ```
 
-## Next steps (milestones 2-3)
+## Phase 2 (in progress): deep SFT + RL
 
-- **More SFT signal**: full epochs (this run was ~0.6), larger/curated trace sets,
-  data generation from successful rollouts. Wire a metrics logger — tunix
-  `PeftTrainer` prints no loss to stdout, so the eval is currently the only signal.
-- **RL**: Dr.GRPO via tunix with the gVisor sandbox as the reward environment
-  (sync rollouts first, then async). The eval harness already *is* the reward
-  function (`grade_task` → reward in [0,1]).
-- **Eval breadth**: run the full 70-task TB-dev set; track parse-rate vs solve-rate
-  separately (format is learned; capability is the gap).
+Built on top of milestone 1 (same branch / PR):
+
+- **Metrics logging** — opt-in wandb/tensorboard wired through both SFT and RL
+  (`training.common.metrics_logging_options`, gated on `WANDB_PROJECT`). The
+  `PeftTrainer` prints no loss to stdout, so this is the only training signal;
+  validated live on the deep-SFT job.
+- **Deep SFT** — a 3-epoch run (≈11.4k steps at batch 4) from base into a fresh
+  checkpoint dir, wandb-tracked, resumable via `PeftTrainer.maybe_restore`. The
+  milestone-1 baseline was only ~0.26 epoch.
+- **RL stage (Dr.GRPO)** — multi-turn RL via tunix's *agentic* learner
+  (`tunix.rl.agentic`), so the gVisor harness is the reward environment:
+  - `rl/agent.py` `TerminusAgent` parses the Terminus-2 JSON action (reuses the
+    eval loop) with no system turn — matching the SFT traces' role layout.
+  - `rl/environment.py` `TerminalBenchEnv` boots the task image under gVisor, execs
+    the agent's shell per turn, and grades the container at episode end → sparse
+    reward. With `reward_fns=None` the agentic reward manager uses this env reward;
+    `advantage_estimator="drgrpo"` makes the per-group reward spread the advantage.
+  - `launch_rl.py` wires the RLCluster (vanilla rollout — no vLLM), Dr.GRPO config,
+    and `QwenChatTemplateParser(enable_thinking=True)` (tokenization verified
+    byte-identical to the SFT encoder).
+  - **Validated end-to-end**: the full rollout → 4 concurrent gVisor containers →
+    generation → multi-turn env stepping → grading → Dr.GRPO `train_step` loop ran
+    to completion on a single host (1.7B/v6e-4, TP=4) **and** across hosts
+    (1.7B/v6e-8). Multi-host agentic rollout — the main risk, since the tunix
+    learner has no per-host guards — works.
+
+Findings from bringing RL up: tunix enforces `max_tokens_to_generate ==
+max_response_length` and `return_logprobs=True`, and `mini_batch_size` is in prompts
+(must divide `PROMPTS_PER_BATCH`). A real concurrency bug surfaced — G rollouts boot
+containers simultaneously and collided on `pid+ms` names (uuid fix). RL backprop OOMs
+at `remat=NONE` (forced by the sampler) unless TP shards the activations (TP=4 fits
+1.7B on v6e-4; 1.7B OOMs at TP=1, matching prior experience).
+
+## Next steps
+
+- **Eval the deep-SFT checkpoint** when it lands — the gate for RL is reward spread
+  (pass@k > pass@1 > 0); the 0/20 baseline has none, so RL would no-op (bimodal wall).
+- **8B RL run** — v6e-16, the deep-SFT ckpt, and the 8B memory-fit ladder (higher TP /
+  shorter seqs at `remat=NONE`). Pick RL tasks the SFT policy solves *sometimes*.
+- **Larger / generated SFT data**; **async RL rollouts** (may modify the tunix fork).
