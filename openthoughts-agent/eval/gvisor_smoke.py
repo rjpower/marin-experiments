@@ -43,7 +43,7 @@ RUNSC_BASE = "https://storage.googleapis.com/gvisor/releases/release/latest/x86_
 BIN_DIR = "/usr/local/bin"
 DAEMON_JSON = (
     '{"runtimes":{"runsc":{"path":"/usr/local/bin/runsc",'
-    '"runtimeArgs":["--platform=ptrace","--network=sandbox"]}}}'
+    '"runtimeArgs":["--platform=ptrace","--network=sandbox","--ignore-cgroups"]}}}'
 )
 
 

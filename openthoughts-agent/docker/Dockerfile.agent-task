@@ -59,14 +59,17 @@ RUN set -eux; \
     runsc --version
 
 # Register runsc as a Docker runtime, defaulting to the ptrace platform (no /dev/kvm
-# is passed into iris tasks). Containers opt in with `docker run --runtime=runsc`.
+# is passed into iris tasks). `--ignore-cgroups` is required because the iris task
+# container's cgroup is delegated/restricted, so runsc can't write subtree_control
+# to set up a child cgroup (it would fail with "operation not supported").
+# Containers opt in with `docker run --runtime=runsc`.
 RUN mkdir -p /etc/docker && \
     printf '%s\n' \
       '{' \
       '  "runtimes": {' \
       '    "runsc": {' \
       '      "path": "/usr/local/bin/runsc",' \
-      '      "runtimeArgs": ["--platform=ptrace", "--network=sandbox"]' \
+      '      "runtimeArgs": ["--platform=ptrace", "--network=sandbox", "--ignore-cgroups"]' \
       '    }' \
       '  }' \
       '}' > /etc/docker/daemon.json
