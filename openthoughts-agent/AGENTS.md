@@ -229,6 +229,14 @@ smoke — keep them):
   all-1) group yields 0 advantage. Train on tasks the SFT policy solves *sometimes*.
 - **RL rollouts run sandbox containers in-process (sync).** Validate single-host (v6e-4)
   first; multi-host agentic rollout (8B on v6e-8/-16) is a separate rung to verify.
+- **Multi-host AGENTIC RL is unproven.** The tunix agentic learner has no
+  `process_index` guards — every host runs the collect engine + steps its own
+  containers, while `rl_cluster.generate` is a cross-host collective expecting
+  identical prompts per host. Container output isn't guaranteed deterministic across
+  hosts → possible desync/hang. (The prior multi-host RL win was *single-turn* GRPO:
+  pure JAX generate, no env, so multi-host-safe.) For the 8B run — which needs a
+  multi-host slice — either confirm empirically on v6e-8, drive rollout from one host,
+  or file a tunix issue. The single-host smoke does not exercise this.
 - **Re-`uv lock` before submit if stale** — `marin-*` are nightly `0.2.x.dev`.
 
 ## Dependencies
