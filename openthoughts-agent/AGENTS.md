@@ -15,7 +15,7 @@ stages each have one root entrypoint: `launch_sft.py`, `launch_eval.py`,
 |------|------|------|
 | 1. SFT | Qwen3-8B on `OpenThoughts-Agent-v1-SFT` (~15.2k Terminus-2 traces) → GCS ckpt | **done**; baseline ckpt at `…/qwen3-8b-agent-sft`; a 3-epoch **deep** run is training to `…/qwen3-8b-agent-sft-deep` |
 | 2. Eval | SFT'd agent on `OpenThoughts-TB-dev` (Terminal-Bench) in a gVisor sandbox | **done + validated**: clean end-to-end, oracle grades 1.0, baseline solved 0/5 (format learned, capability low) |
-| 3. RL | Dr.GRPO (tunix agentic), sync rollouts | **built + validated**: full loop ran end-to-end single-host (1.7B/v6e-4, TP=4) AND multi-host (1.7B/v6e-8); real 8B run pending deep-SFT ckpt + 8B memory-fit |
+| 3. RL | Dr.GRPO (tunix agentic), sync rollouts | **built + validated at 8B**: full loop ran end-to-end single-host (1.7B/v6e-4 TP=4), multi-host (1.7B/v6e-8), AND **8B on v6e-16 TP=8** (`ota-rl-8b-fit2`, restore→rollout→grade→train_step); real run pending deep-SFT ckpt for reward spread |
 
 Milestone-1 write-up: `REPORT.md`. PR: rjpower/marin-experiments#9.
 
@@ -231,12 +231,19 @@ smoke — keep them):
   (1.7B/v6e-4, TP=4) AND multi-host (1.7B/v6e-8, 2 hosts) — both ran the full
   rollout→gVisor→grade→Dr.GRPO loop to completion (`ota-rl-smoke6`, `ota-rl-mh`).
 - **Multi-host agentic RL works** (despite no `process_index` guards in the tunix
-  learner): the 1.7B/v6e-8 smoke completed cleanly, no collective desync/hang. So the
-  8B run on v6e-8/-16 is unblocked on that axis — remaining 8B work is the memory-fit
-  ladder (TP + short seqs at `remat=NONE`, which the rollout sampler forces).
+  learner): both the 1.7B/v6e-8 and the **8B/v6e-16** runs completed cleanly, no
+  collective desync/hang. The 8B run is unblocked on that axis.
 - **RL backprop OOMs without sharding** at `remat=NONE` (forced by the sampler). 1.7B
   OOMs v6e-4 at TP=1 (42G temporaries); **TP shards the per-sequence activations** →
-  TP=4 fits 1.7B on v6e-4. 8B will need higher TP / shorter seqs on v6e-16.
+  TP=4 fits 1.7B on v6e-4. **8B fits v6e-16 at TP=8** (`ota-rl-8b-fit2`: restore from
+  SFT ckpt → rollout G=2 → grade → train_step, at prompt 4096 / response 768 / 3 turns,
+  with headroom). Larger G / longer episodes may need TP=16 or shorter seqs.
+- **8B RL timing** (v6e-16, the fit probe): restore ~11 min, image build ~2 min, then
+  ~4 min for 1 step at G=2 / 3 turns. Per-step cost scales with G × turns × tokens.
+- **Disk: request ≤ a single node's free space.** `--disk 300GB` was rejected
+  (autoscaler `insufficient_resources: disk`); 100GB ran the 8B RL probe fine (model +
+  a few task images under vfs). Multi-task eval has needed 200–250GB (vfs doesn't share
+  image layers, so disk ≈ Σ task-image sizes). Keep RL disk modest (100GB).
 - **Re-`uv lock` before submit if stale** — `marin-*` are nightly `0.2.x.dev`.
 
 ## Dependencies
