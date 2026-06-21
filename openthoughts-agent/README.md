@@ -13,9 +13,9 @@ tasks are Docker environments + graders), so tool execution runs in an isolated
 
 | Stage | What | Status |
 | --- | --- | --- |
-| **1. SFT** | Qwen3-8B on `open-thoughts/OpenThoughts-Agent-v1-SFT` (~15.2k Terminus-2 traces), ChatML + assistant-turn loss masking → orbax checkpoint | implemented (`launch_sft.py`) |
-| **2. Eval** | SFT'd agent on `open-thoughts/OpenThoughts-TB-dev` / Terminal-Bench, tools in a gvisor sandbox | in progress |
-| **3. RL** | Dr.GRPO (tunix) on the ~720 verified RL tasks; sync rollouts → async | planned |
+| **1. SFT** | Qwen3-8B on `open-thoughts/OpenThoughts-Agent-v1-SFT` (~15.2k Terminus-2 traces), ChatML + assistant-turn loss masking → orbax checkpoint | done (`launch_sft.py`); deep multi-epoch run training |
+| **2. Eval** | SFT'd agent on `open-thoughts/OpenThoughts-TB-dev` / Terminal-Bench, tools in a gvisor sandbox | done + validated (`launch_eval.py`); see `REPORT.md` |
+| **3. RL** | Dr.GRPO (tunix agentic) — multi-turn rollouts in the gvisor sandbox, sparse grader reward | built (`launch_rl.py`); smoke in progress |
 
 ## Quick start
 
@@ -40,14 +40,18 @@ commit-before-submit, etc.).
 
 ```
 launch_sft.py            # iris entrypoint (stage 1: SFT)
-models/qwen3_loader.py   # stock HF Qwen3 -> tunix nnx (fp32 params, remat, flash)
-models/registry.py       # qwen3-8b / qwen3-8b-base / qwen3-1.7b-base
+launch_eval.py           # iris entrypoint (stage 2: Terminal-Bench eval)
+launch_rl.py             # iris entrypoint (stage 3: Dr.GRPO RL)
+models/                  # HF Qwen3 -> tunix nnx loader, registry, orbax checkpoints
 agent_data/agent_traces.py  # stream OpenThoughts-Agent-v1-SFT (pinned revision)
 training/agent_sft.py    # ChatML encoder + assistant masking + PeftTrainer + orbax ckpt
-training/common.py       # clipped_adamw, build_mesh(tp=...), sft_model_input_fn
-eval/                    # Terminal-Bench harness + gvisor sandbox (stage 2)
-tests/                   # CPU encoder/masking tests
+training/common.py       # clipped_adamw, build_mesh(tp), metrics_logging, init_distributed
+eval/                    # gvisor sandbox + Terminal-Bench harness (agent loop, grade)
+rl/                      # Dr.GRPO env + agent (tunix.rl.agentic) over the gvisor sandbox
+tests/                   # CPU tests (encoder/masking, agent loop, RL env)
 ```
+
+See **`AGENTS.md`** → "Common tasks" for copy-paste submit commands for every stage.
 
 ## Provenance
 
