@@ -64,23 +64,33 @@ def _run(argv: list[str], *, timeout: float, input_text: str | None = None) -> E
     return ExecResult(e.stdout or "", (e.stderr or "") + "\n[timeout]", 124, timed_out=True)
 
 
-def ensure_dockerd(*, timeout: float = 60.0) -> None:
+# dockerd flags for running nested inside a container: vfs avoids nested-overlayfs
+# failures, and we disable the bridge/iptables since sandbox containers use
+# ``--network none`` (no docker bridge needed). Override via ``DOCKERD_ARGS``.
+_DEFAULT_DOCKERD_ARGS = ["--storage-driver=vfs", "--iptables=false", "--bridge=none"]
+_DOCKERD_LOG = "/tmp/dockerd.out"
+
+
+def ensure_dockerd(*, timeout: float = 120.0) -> None:
   """Starts a task-local dockerd if the socket isn't already up, and waits for it.
 
   Idempotent. Requires the ``--privileged`` task container (TPU jobs have it).
+  Runs dockerd with vfs storage + no bridge/iptables, which is what lets it come
+  up nested inside the iris task container.
 
   Raises:
-    RuntimeError: if dockerd does not become ready within ``timeout``.
+    RuntimeError: if dockerd does not become ready within ``timeout`` (the error
+      includes the tail of dockerd's own log to make the cause visible).
   """
   if shutil.which("docker") is None:
     raise RuntimeError("docker not found; use the openthoughts-agent-task image.")
-  # Already up?
   if _run(["docker", "info"], timeout=10).exit_code == 0:
     return
-  # Launch the daemon detached; its logs go to /tmp.
+  extra = os.environ.get("DOCKERD_ARGS")
+  args = extra.split() if extra else _DEFAULT_DOCKERD_ARGS
   subprocess.Popen(
-      ["dockerd"],
-      stdout=open("/tmp/dockerd.out", "w"),
+      ["dockerd", *args],
+      stdout=open(_DOCKERD_LOG, "w"),
       stderr=subprocess.STDOUT,
   )
   deadline = time.monotonic() + timeout
@@ -88,7 +98,13 @@ def ensure_dockerd(*, timeout: float = 60.0) -> None:
     if _run(["docker", "info"], timeout=10).exit_code == 0:
       return
     time.sleep(1.0)
-  raise RuntimeError(f"dockerd not ready after {timeout}s (see /tmp/dockerd.out).")
+  tail = ""
+  try:
+    with open(_DOCKERD_LOG) as f:
+      tail = "".join(f.readlines()[-25:])
+  except OSError:
+    pass
+  raise RuntimeError(f"dockerd not ready after {timeout}s. dockerd log tail:\n{tail}")
 
 
 class GvisorContainerSandbox:

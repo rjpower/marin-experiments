@@ -78,7 +78,7 @@ def main() -> None:
   v = _run(["runsc", "--version"], timeout=30)
   _log(f"runsc --version -> exit={v.exit_code}\n{v.stdout}{v.stderr}")
 
-  ensure_dockerd(timeout=90)
+  ensure_dockerd()
   _log("dockerd is up")
 
   # gVisor isolation proof: kernel under runsc vs runc.
