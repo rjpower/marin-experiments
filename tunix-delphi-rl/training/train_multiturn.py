@@ -66,7 +66,8 @@ from environments.coding_agent_env import (
     program_terminal_eos_tokens,
 )
 from problems.coding_tasks import load_tasks
-from models.delphi_qwen3 import DELPHI_EOS_ID, load_delphi, load_tokenizer
+from models.registry import ModelSpec, get_model_spec
+from training.chat_sft import run_chat_sft
 
 
 @dataclasses.dataclass
@@ -210,6 +211,13 @@ def train_multiturn(
     passk: int = 0,
     passk_temperature: float = 1.0,
     repair_passk: int = 0,
+    model_spec: ModelSpec | None = None,
+    chat_sft_steps: int = 0,
+    chat_sft_dataset: str = "allenai/tulu-3-sft-mixture",
+    chat_sft_batch_size: int = 8,
+    chat_sft_learning_rate: float = 1e-5,
+    chat_sft_max_seq_len: int = 1024,
+    chat_sft_use_mixture: bool = True,
     mesh: jax.sharding.Mesh | None = None,
 ) -> MultiTurnTrainResult:
   """Runs the Delphi multi-turn coding SFT warm-up + Dr.GRPO RL and evaluates.
@@ -242,7 +250,9 @@ def train_multiturn(
   Returns:
     A :class:`MultiTurnTrainResult` with per-step histories + the two evals.
   """
-  tokenizer = load_tokenizer(model_dir)
+  if model_spec is None:
+    model_spec = get_model_spec("delphi")
+  tokenizer = model_spec.load_tokenizer(model_dir)
   if mesh is None:
     mesh = _build_mesh()
   if eval_max_rounds is None:
@@ -253,10 +263,33 @@ def train_multiturn(
 
   # Load the actor FSDP-sharded on the mesh (required for SFT; keeps eval's
   # sampler on the same sharding either way).
-  actor = load_delphi(model_dir, dtype=jnp.float32, mesh=mesh)
+  actor = model_spec.load_model(model_dir, dtype=jnp.float32, mesh=mesh)
   reference = (
-      None if beta == 0.0 else load_delphi(model_dir, dtype=jnp.bfloat16, mesh=mesh)
+      None if beta == 0.0 else model_spec.load_model(model_dir, dtype=jnp.bfloat16, mesh=mesh)
   )
+
+  # Stage 0: "up to shape" -- conversational + tool-calling chat-SFT (tulu-3 +
+  # smoltalk2 tool-use mixture) so the actor is a fluent instruction-follower /
+  # tool-user BEFORE it specializes to the multi-turn code-agent format. Runs in
+  # place on the same nnx actor (no checkpoint); skipped when chat_sft_steps == 0.
+  if chat_sft_steps > 0:
+    chat_stream_fn = None
+    if chat_sft_use_mixture:
+      from sft_data.instruction_datasets import load_up_to_shape_mixture
+
+      chat_stream_fn = lambda: load_up_to_shape_mixture(seed=seed)  # noqa: E731
+    actor = run_chat_sft(
+        actor,
+        tokenizer,
+        dataset_name=chat_sft_dataset,
+        steps=chat_sft_steps,
+        batch_size=chat_sft_batch_size,
+        learning_rate=chat_sft_learning_rate,
+        mesh=mesh,
+        max_seq_len=chat_sft_max_seq_len,
+        seed=seed,
+        stream_fn=chat_stream_fn,
+    )
 
   # Stage 1: SFT warm-up on the multi-turn execution-format transcripts.
   if sft_steps > 0:
@@ -334,7 +367,7 @@ def train_multiturn(
   # Stage 3: Dr.GRPO RL on the multi-turn rollout. Per-turn END stop (multi-line
   # programs); the base LM never emits EOS, so without it the first turn fills the
   # whole episode budget.
-  eos_tokens = sorted(set([DELPHI_EOS_ID]) | set(program_terminal_eos_tokens(tokenizer)))
+  eos_tokens = sorted(set([tokenizer.eos_token_id]) | set(program_terminal_eos_tokens(tokenizer)))
   if len(eos_tokens) <= 1:
     raise RuntimeError(
         "No 'END' terminal token found in the tokenizer vocab; per-turn stop "

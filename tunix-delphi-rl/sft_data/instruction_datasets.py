@@ -54,7 +54,10 @@ Public API
   * :func:`load_instruction_messages` — stream a named dataset as
     ``{"messages": [...], "metadata": {...}}`` dicts.
   * :data:`TULU_DATASETS` — the wired tulu dataset keys.
+  * :data:`TOOLUSE_DATASETS` — the smoltalk2 tool-calling SFT split keys.
   * :func:`load_tulu_sft` — convenience over ``allenai/tulu-3-sft-mixture``.
+  * :func:`load_up_to_shape_mixture` — weighted interleave of tulu-3 chat + the
+    tool-use splits (mostly chat with a small tool-use slice).
   * :data:`INSTRUCTION_DATASET_NAME_TO_CONFIG` — name → config registry; adding a
     dataset stays a one-entry change.
 
@@ -436,6 +439,39 @@ INSTRUCTION_DATASET_NAME_TO_CONFIG: dict[str, InstructionDatasetConfig] = {
         metadata_columns=["reference_answer"],
         name="facebook/natural_reasoning",
     ),
+    # -- smoltalk2 tool-calling SFT splits -----------------------------------
+    # All three live in the single ``HuggingFaceTB/smoltalk2`` repo under the
+    # ``SFT`` config (passed as ``name=`` to ``load_dataset``), differing only by
+    # split. Each row carries a ``messages`` list of {role, content} dicts whose
+    # roles include ``tool``; tool calls are pre-rendered into ``content``, so the
+    # plain ``messages`` adapter (same as the tulu mixtures) handles them.
+    "smoltalk2-xlam": InstructionDatasetConfig(
+        hf_dataset_id="HuggingFaceTB/smoltalk2",
+        revision="fc6cc21",
+        adapter=multi_turn_adapter(),
+        metadata_columns=[],
+        name="smoltalk2-xlam",
+        subsets=["SFT"],
+        splits=["xlam_traces_no_think"],
+    ),
+    "smoltalk2-hermes-fc": InstructionDatasetConfig(
+        hf_dataset_id="HuggingFaceTB/smoltalk2",
+        revision="fc6cc21",
+        adapter=multi_turn_adapter(),
+        metadata_columns=[],
+        name="smoltalk2-hermes-fc",
+        subsets=["SFT"],
+        splits=["hermes_function_calling_v1_no_think"],
+    ),
+    "smoltalk2-smolagents": InstructionDatasetConfig(
+        hf_dataset_id="HuggingFaceTB/smoltalk2",
+        revision="fc6cc21",
+        adapter=multi_turn_adapter(),
+        metadata_columns=[],
+        name="smoltalk2-smolagents",
+        subsets=["SFT"],
+        splits=["smolagents_toolcalling_traces_think"],
+    ),
 }
 
 
@@ -445,6 +481,15 @@ TULU_DATASETS: list[str] = [
     "allenai/tulu-v2-sft-mixture",
     "allenai/tulu-v2-sft-mixture-olmo-4096",
     "sherryy/tulu-3-sft-personas-instruction-following-expanded",
+]
+
+
+# The smoltalk2 tool-calling splits, for blending a small tool-use slice into a
+# conversational chat-SFT stage.
+TOOLUSE_DATASETS: list[str] = [
+    "smoltalk2-xlam",
+    "smoltalk2-hermes-fc",
+    "smoltalk2-smolagents",
 ]
 
 
@@ -564,3 +609,74 @@ def load_instruction_messages(
 def load_tulu_sft(limit: int | None = None, *, split: str | None = None) -> Iterator[dict[str, Any]]:
   """Convenience: stream ``allenai/tulu-3-sft-mixture`` (the primary tulu mix)."""
   return load_instruction_messages("allenai/tulu-3-sft-mixture", limit=limit, split=split)
+
+
+# Default mixture: mostly tulu-3 chat with a small deliberate tool-use slice
+# (~85% chat / ~15% tool-use, the latter split evenly across the three smoltalk2
+# function-calling splits). Weights are relative; they need not sum to 1.
+_UP_TO_SHAPE_DEFAULT_WEIGHTS: dict[str, float] = {
+    "allenai/tulu-3-sft-mixture": 0.85,
+    "smoltalk2-xlam": 0.05,
+    "smoltalk2-hermes-fc": 0.05,
+    "smoltalk2-smolagents": 0.05,
+}
+
+
+def load_up_to_shape_mixture(
+    *,
+    limit: int | None = None,
+    seed: int = 0,
+    weights: dict[str, float] | None = None,
+) -> Iterator[dict[str, Any]]:
+  """Stream a weighted interleave of tulu-3 chat + smoltalk2 tool-use.
+
+  Blends ``allenai/tulu-3-sft-mixture`` with the three :data:`TOOLUSE_DATASETS`
+  splits so a base model can be post-trained on conversational **and** tool-use
+  data in one stream. The default proportions are ~85% tulu-3 chat and ~15%
+  tool-use (split evenly across the three smoltalk2 splits); pass *weights* to
+  override (keys are registry names, values are relative weights that need not
+  sum to 1).
+
+  Each underlying dataset is consumed lazily via :func:`load_instruction_messages`
+  (``streaming=True``), so nothing is materialized up front. On each step we draw
+  a source weighted by *weights* and yield its next row; exhausted sources are
+  dropped and the remaining weights renormalize, so the stream ends only when all
+  sources are exhausted (or *limit* is reached).
+
+  Args:
+    limit: Max number of *emitted* examples across all sources. ``None`` runs
+      until every source is exhausted.
+    seed: Seed for the source-selection RNG (deterministic interleave).
+    weights: Optional ``{registry_name: relative_weight}`` override. Defaults to
+      :data:`_UP_TO_SHAPE_DEFAULT_WEIGHTS`.
+
+  Yields:
+    ``{"messages": [...], "metadata": {...}}`` rows, the same shape as
+    :func:`load_instruction_messages`.
+  """
+  import random
+
+  weights = dict(weights if weights is not None else _UP_TO_SHAPE_DEFAULT_WEIGHTS)
+  if not weights:
+    raise ValueError("load_up_to_shape_mixture requires at least one weighted source")
+
+  rng = random.Random(seed)
+  # name -> (iterator, weight); we never materialize a source, only pull next().
+  streams: dict[str, Iterator[dict[str, Any]]] = {
+      name: load_instruction_messages(name) for name in weights
+  }
+
+  emitted = 0
+  while streams:
+    names = list(streams)
+    pick = rng.choices(names, weights=[weights[n] for n in names], k=1)[0]
+    try:
+      row = next(streams[pick])
+    except StopIteration:
+      # Source exhausted: drop it and let the remaining weights renormalize.
+      del streams[pick]
+      continue
+    yield row
+    emitted += 1
+    if limit is not None and emitted >= limit:
+      return

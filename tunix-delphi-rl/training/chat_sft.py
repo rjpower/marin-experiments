@@ -24,7 +24,7 @@ produce the content and then STOP (emit EOS).
 from __future__ import annotations
 
 import random
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import grain.python as grain
 import jax
@@ -159,13 +159,19 @@ class _ChatSFTSource(grain.RandomAccessDataSource):
       eos_id: int,
       split: str | None = None,
       scan_cap: int | None = None,
+      stream_fn: Callable[[], Iterable[dict]] | None = None,
   ):
-    from sft_data.instruction_datasets import load_instruction_messages
+    if stream_fn is None:
+      from sft_data.instruction_datasets import load_instruction_messages
+
+      stream_fn = lambda: load_instruction_messages(  # noqa: E731
+          dataset_name, limit=None, split=split
+      )
 
     cap = scan_cap if scan_cap is not None else max(n * 20, 2000)
     rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     scanned = 0
-    for ex in load_instruction_messages(dataset_name, limit=None, split=split):
+    for ex in stream_fn():
       scanned += 1
       enc = encode_chat_messages(
           tokenizer, ex.get("messages", []), max_seq_len,
@@ -222,11 +228,17 @@ def build_chat_sft_dataset(
     bos_id: int | None,
     eos_id: int,
     split: str | None = None,
+    stream_fn: Callable[[], Iterable[dict]] | None = None,
 ) -> grain.MapDataset:
-  """Batched grain dataset of chat-SFT rows (same column layout as the CALC SFT)."""
+  """Batched grain dataset of chat-SFT rows (same column layout as the CALC SFT).
+
+  ``stream_fn`` (a zero-arg callable yielding ``{"messages": [...]}`` rows)
+  overrides the default per-``dataset_name`` HF stream -- the caller passes one to
+  feed a custom mixture (e.g. the tulu+tool-use "up to shape" stream).
+  """
   source = _ChatSFTSource(
       tokenizer, dataset_name, n, seed, max_seq_len,
-      bos_id=bos_id, eos_id=eos_id, split=split,
+      bos_id=bos_id, eos_id=eos_id, split=split, stream_fn=stream_fn,
   )
   return grain.MapDataset.source(source).batch(batch_size).map(_to_columns)
 
@@ -243,6 +255,7 @@ def run_chat_sft(
     max_seq_len: int = 2048,
     seed: int = 0,
     split: str | None = None,
+    stream_fn: Callable[[], Iterable[dict]] | None = None,
 ) -> Any:
   """Chat-SFTs ``model`` in place on ``dataset_name`` conversations, returns it.
 
@@ -272,7 +285,7 @@ def run_chat_sft(
   n = (steps + 2) * batch_size
   dataset = build_chat_sft_dataset(
       tokenizer, dataset_name, n, seed, batch_size, max_seq_len,
-      bos_id=bos_id, eos_id=eos_id, split=split,
+      bos_id=bos_id, eos_id=eos_id, split=split, stream_fn=stream_fn,
   )
   optimizer = clipped_adamw(learning_rate)
   trainer = PeftTrainer(

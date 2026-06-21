@@ -17,6 +17,7 @@ import pytest
 
 from sft_data.instruction_datasets import (
     INSTRUCTION_DATASET_NAME_TO_CONFIG,
+    TOOLUSE_DATASETS,
     TULU_DATASETS,
     InputDatasetFormat,
     instruct_column_response_adapter,
@@ -214,6 +215,122 @@ def test_tulu3_uses_multi_turn_format():
 def test_unknown_dataset_raises():
   with pytest.raises(KeyError):
     next(load_instruction_messages("not/a-dataset", limit=1))
+
+
+# ---------------------------------------------------------------------------
+# smoltalk2 tool-calling registry + adapter (offline)
+# ---------------------------------------------------------------------------
+
+
+def test_tooluse_datasets_present_and_pinned():
+  assert TOOLUSE_DATASETS, "TOOLUSE_DATASETS must be non-empty"
+  for key in TOOLUSE_DATASETS:
+    assert key in INSTRUCTION_DATASET_NAME_TO_CONFIG, f"{key} missing from registry"
+    cfg = INSTRUCTION_DATASET_NAME_TO_CONFIG[key]
+    assert _HASH_RE.match(cfg.revision), f"{key} revision {cfg.revision!r} is not a pinned hash"
+
+
+def test_smoltalk2_config_fields():
+  # All three keys point at the one smoltalk2 repo, pinned revision, SFT subset,
+  # the messages adapter, and their respective named split.
+  expected_splits = {
+      "smoltalk2-xlam": "xlam_traces_no_think",
+      "smoltalk2-hermes-fc": "hermes_function_calling_v1_no_think",
+      "smoltalk2-smolagents": "smolagents_toolcalling_traces_think",
+  }
+  for key, split in expected_splits.items():
+    cfg = INSTRUCTION_DATASET_NAME_TO_CONFIG[key]
+    assert cfg.hf_dataset_id == "HuggingFaceTB/smoltalk2"
+    assert cfg.revision == "fc6cc21"
+    assert cfg.subsets == ["SFT"]
+    assert cfg.splits == [split]
+    assert cfg.adapter.dataset_format == InputDatasetFormat.SINGLE_COLUMN_MULTI_TURN
+
+
+def test_smoltalk2_load_dataset_kwargs_thread_subset():
+  # The SFT config must reach load_dataset as ``name=`` while ``split`` stays the
+  # named split — and tulu (no subset) must be unaffected.
+  from sft_data.instruction_datasets import _load_dataset_kwargs
+
+  cfg = INSTRUCTION_DATASET_NAME_TO_CONFIG["smoltalk2-xlam"]
+  kwargs = _load_dataset_kwargs(cfg, cfg.splits[0])
+  assert kwargs["path"] == "HuggingFaceTB/smoltalk2"
+  assert kwargs["name"] == "SFT"
+  assert kwargs["split"] == "xlam_traces_no_think"
+  assert kwargs["revision"] == "fc6cc21"
+  assert kwargs["streaming"] is True
+
+  tulu_cfg = INSTRUCTION_DATASET_NAME_TO_CONFIG["allenai/tulu-3-sft-mixture"]
+  tulu_kwargs = _load_dataset_kwargs(tulu_cfg, "train")
+  assert "name" not in tulu_kwargs
+
+
+def test_smoltalk2_tool_role_passes_through_adapter():
+  # smoltalk2 shape: a `messages` column whose roles include `tool`; tool calls
+  # are pre-rendered into content. The plain messages adapter preserves the
+  # `tool` role with no special structured handling.
+  cfg = INSTRUCTION_DATASET_NAME_TO_CONFIG["smoltalk2-xlam"]
+  row = {
+      "messages": [
+          {"role": "user", "content": "weather in Paris?"},
+          {"role": "assistant", "content": '[get_weather(city="Paris")]'},
+          {"role": "tool", "content": '{"temp": 20}'},
+          {"role": "assistant", "content": "It is 20 degrees."},
+      ],
+  }
+  out = transform_row(row, cfg)
+  assert [m["role"] for m in out["messages"]] == ["user", "assistant", "tool", "assistant"]
+  assert out["messages"][2] == {"role": "tool", "content": '{"temp": 20}'}
+
+
+def test_up_to_shape_mixture_interleaves_offline(monkeypatch):
+  # Drive load_up_to_shape_mixture over synthetic in-memory streams (no network)
+  # to check it interleaves the chat + tool-use sources, yields the standard row
+  # shape, honors `limit`, and is deterministic for a fixed seed.
+  import sft_data.instruction_datasets as mod
+
+  def fake_loader(name, *, limit=None, split=None):
+    # Each source emits a few rows tagged with its registry name.
+    for i in range(3):
+      yield {"messages": [{"role": "user", "content": f"{name}-{i}"}], "metadata": {"src": name}}
+
+  monkeypatch.setattr(mod, "load_instruction_messages", fake_loader)
+
+  weights = {
+      "allenai/tulu-3-sft-mixture": 0.85,
+      "smoltalk2-xlam": 0.05,
+      "smoltalk2-hermes-fc": 0.05,
+      "smoltalk2-smolagents": 0.05,
+  }
+  rows = list(mod.load_up_to_shape_mixture(limit=6, seed=0, weights=weights))
+  assert len(rows) == 6
+  for r in rows:
+    assert set(r) == {"messages", "metadata"}
+    assert r["messages"] and r["messages"][0]["role"] == "user"
+  # At least the dominant chat source appears in the blend.
+  sources = {r["metadata"]["src"] for r in rows}
+  assert "allenai/tulu-3-sft-mixture" in sources
+  # Deterministic for a fixed seed.
+  rows2 = list(mod.load_up_to_shape_mixture(limit=6, seed=0, weights=weights))
+  assert [r["metadata"]["src"] for r in rows] == [r["metadata"]["src"] for r in rows2]
+
+
+def test_up_to_shape_mixture_exhausts_all_sources(monkeypatch):
+  # With no limit the stream ends only when every source is exhausted; total rows
+  # == sum of per-source rows (renormalization drops exhausted sources).
+  import sft_data.instruction_datasets as mod
+
+  counts = {"a": 2, "b": 3}
+
+  def fake_loader(name, *, limit=None, split=None):
+    for i in range(counts[name]):
+      yield {"messages": [{"role": "user", "content": f"{name}-{i}"}], "metadata": {"src": name}}
+
+  monkeypatch.setattr(mod, "load_instruction_messages", fake_loader)
+  rows = list(mod.load_up_to_shape_mixture(seed=1, weights={"a": 1.0, "b": 1.0}))
+  assert len(rows) == sum(counts.values())
+  assert sum(r["metadata"]["src"] == "a" for r in rows) == 2
+  assert sum(r["metadata"]["src"] == "b" for r in rows) == 3
 
 
 # ---------------------------------------------------------------------------
