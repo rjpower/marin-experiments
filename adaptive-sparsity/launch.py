@@ -155,6 +155,13 @@ def _make_step() -> ExecutorStep:
     data_kind = _env("SP_DATA", "nemotron")
     data_region = _env("SP_DATA_REGION", "us-east5")
     smoke = _env("SP_SMOKE", "0") == "1"
+    # Performance-tuning knobs (default to the production behavior; only the perf
+    # scaffold flips these). SP_PROFILE turns on the levanter xprof callback;
+    # SP_REMAT / SP_MOE_IMPL / SP_LOG_EVERY expose the throughput levers as env.
+    profile = _env("SP_PROFILE", "0") == "1"
+    remat_mode = _env("SP_REMAT", "recompute_all")
+    moe_impl = _env("SP_MOE_IMPL", "") or None
+    log_every = int(_env("SP_LOG_EVERY", "1"))
 
     if mode not in ("fixed", "adaptive"):
         raise ValueError(f"SPARSITY_MODE must be 'fixed' or 'adaptive', got {mode!r}")
@@ -189,8 +196,11 @@ def _make_step() -> ExecutorStep:
         sparsity_loss_coef=coef if adaptive else 0.0,
         sparsity_temp=temp,
     )
+    # Apply the perf-tuning overrides (remat policy + MoE dispatch backend).
+    model = dataclasses.replace(model, remat_mode=remat_mode, moe_implementation=moe_impl)
     batch = int(_env("SP_BATCH", str(ref_batch)))
     steps = int(_env("SP_STEPS", str(ref_steps)))
+    profiler = ProfilerConfig(enabled=True, start_step=10, num_steps=10) if profile else ProfilerConfig()
 
     active_frac = top_k / num_experts
     if adaptive:
@@ -217,6 +227,7 @@ def _make_step() -> ExecutorStep:
         seed=versioned(seed),
         mp=versioned("params=float32,compute=bfloat16,output=bfloat16"),
         checkpointer=None,
+        profiler=profiler,
         tracker=WandbConfig(
             project="marin_moe",
             tags=["moe", "adaptive-sparsity", mode, f"E{num_experts}", f"k{top_k}"],
@@ -224,14 +235,15 @@ def _make_step() -> ExecutorStep:
             name=None,
         ),
         optimizer=versioned(optimizer),
-        grug_trainer=versioned(GrugTrainerConfig(z_loss_weight=1e-4, ema_beta=None, log_every=1)),
+        grug_trainer=versioned(GrugTrainerConfig(z_loss_weight=1e-4, ema_beta=None, log_every=log_every)),
     )
 
     tokens = batch * steps * 4096
     print(
         f"[arm] {run_id}  mode={mode} E={num_experts} k={top_k} min_k={min_k} "
         f"coef={coef} nominal_active_frac={active_frac:.4%} batch={batch} steps={steps} "
-        f"tokens={tokens/1e9:.1f}B layers={model.num_layers} data={data_kind} budget={budget:g}"
+        f"tokens={tokens/1e9:.1f}B layers={model.num_layers} data={data_kind} budget={budget:g} "
+        f"remat={remat_mode} moe_impl={moe_impl} log_every={log_every} profile={profile}"
     )
     return ExecutorStep(name=f"grug/sparsity/{run_id}", fn=run_inline, config=launch)
 
