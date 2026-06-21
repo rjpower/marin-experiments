@@ -21,7 +21,8 @@ import wandb
 
 PROJECT = "marin_moe"
 _NAME_RE = re.compile(
-    r"sparsity-(?P<mode>fixed|adapt)-d(?P<d>\d+)-E(?P<E>\d+)-k(?P<k>\d+)"
+    r"sparsity-(?P<mode>fixed|adapt|curric)-d(?P<d>\d+)-E(?P<E>\d+)-k(?P<k>\d+)"
+    r"(?:to(?P<kmax>\d+))?"  # curriculum runs are named k<K_min>to<K_max>
     r"(?:-min(?P<min>\d+)-c(?P<coef>[0-9.]+)-t(?P<temp>[0-9.]+))?"
 )
 LOSS = "train/loss"
@@ -55,11 +56,18 @@ def main() -> None:
     rows = []
     for run in runs:
         m = _NAME_RE.search(run.name or "")
+        is_curric = bool(m and m["mode"] == "curric")
         E = int(m["E"]) if m else 0
-        k = int(m["k"]) if m else 0
-        kmin = int(m["min"]) if (m and m["min"]) else (0 if (m and m["mode"] == "adapt") else k)
+        # For curriculum runs the name is k<K_min>to<K_max>; show K_max as the headline k
+        # (the final, widest phase) and K_min as the starting width.
+        k = int(m["kmax"]) if (is_curric and m["kmax"]) else (int(m["k"]) if m else 0)
+        if is_curric:
+            kmin = int(m["k"])
+        else:
+            kmin = int(m["min"]) if (m and m["min"]) else (0 if (m and m["mode"] == "adapt") else k)
         coef = float(m["coef"]) if (m and m["coef"]) else 0.0
-        mode = "adaptive" if (m and m["mode"] == "adapt") else "fixed"
+        mode = ("curriculum" if is_curric
+                else "adaptive" if (m and m["mode"] == "adapt") else "fixed")
         hist = run.history(keys=[LOSS, CE, ACT], pandas=True, samples=20000)
         loss, at = _at_step(hist, args.step, LOSS)
         ce, _ = _at_step(hist, args.step, CE)
