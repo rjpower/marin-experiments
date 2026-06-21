@@ -122,7 +122,15 @@ def _install_buildx() -> None:
 
 
 def _ensure_runsc_runtime_registered() -> None:
-  """Writes the runsc runtime into daemon.json if it isn't already registered."""
+  """Reconciles the runsc runtime in daemon.json to our canonical definition.
+
+  Always overwrites the ``runsc`` entry (not just when absent): a custom task
+  image may ship a STALE daemon.json -- e.g. one missing ``--ignore-cgroups`` --
+  and silently skipping the update would leave runsc unable to start containers
+  ("cannot set up cgroup for root"). dockerd reads daemon.json at startup and
+  :func:`ensure_dockerd` runs this before starting it, so the corrected args take
+  effect. Idempotent: no write if already canonical.
+  """
   existing: dict = {}
   if os.path.exists(_DAEMON_JSON_PATH):
     try:
@@ -130,13 +138,11 @@ def _ensure_runsc_runtime_registered() -> None:
         existing = json.load(f)
     except (OSError, json.JSONDecodeError):
       existing = {}
+  desired = {"path": os.path.join(_BIN_DIR, "runsc"), "runtimeArgs": _RUNSC_RUNTIME_ARGS}
   runtimes = existing.get("runtimes", {})
-  if "runsc" in runtimes:
-    return  # already registered (custom image) -- leave it untouched
-  runtimes["runsc"] = {
-      "path": os.path.join(_BIN_DIR, "runsc"),
-      "runtimeArgs": _RUNSC_RUNTIME_ARGS,
-  }
+  if runtimes.get("runsc") == desired:
+    return  # already canonical
+  runtimes["runsc"] = desired
   existing["runtimes"] = runtimes
   os.makedirs(os.path.dirname(_DAEMON_JSON_PATH), exist_ok=True)
   with open(_DAEMON_JSON_PATH, "w") as f:
