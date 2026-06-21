@@ -23,8 +23,9 @@ Config via env:
     unset = base model, for a machinery smoke only), ``RL_CKPT_DIR`` (where to
     save RL checkpoints).
   * ``RL_STEPS`` (200), ``NUM_GENERATIONS`` (G, 8), ``PROMPTS_PER_BATCH`` (4),
-    ``TASK_LIMIT`` (tasks to train on), ``MAX_TURNS`` (15), ``MAX_NEW_TOKENS``
-    (768), ``MAX_PROMPT_LEN`` (8192), ``TEMPERATURE`` (1.0), ``LR`` (1e-6),
+    ``TASK_LIMIT`` (tasks to train on), ``MAX_TURNS`` (15), ``MAX_RESPONSE_TOKENS``
+    (episode response budget; default MAX_TURNS*512), ``MAX_PROMPT_LEN`` (8192),
+    ``TEMPERATURE`` (1.0), ``LR`` (1e-6),
     ``BETA`` (0.0 KL; 0 => no reference model), ``TP`` (1),
     ``MAX_CONCURRENCY`` (8), ``COMMAND_TIMEOUT`` (60), ``EPISODE_TIMEOUT`` (1200).
 
@@ -101,7 +102,10 @@ def main() -> None:
   task_limit = os.environ.get("TASK_LIMIT")
   task_limit = int(task_limit) if task_limit else None
   max_turns = int(os.environ.get("MAX_TURNS", "15"))
-  max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "768"))
+  # Total response-token budget per EPISODE (shared across turns; the collect
+  # engine decrements it each turn). tunix requires the rollout's
+  # max_tokens_to_generate to EQUAL the learner's max_response_length.
+  max_response_tokens = int(os.environ.get("MAX_RESPONSE_TOKENS", str(max_turns * 512)))
   max_prompt_len = int(os.environ.get("MAX_PROMPT_LEN", "8192"))
   temperature = float(os.environ.get("TEMPERATURE", "1.0"))
   learning_rate = float(os.environ.get("LR", "1e-6"))
@@ -150,9 +154,9 @@ def main() -> None:
   im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
   eos_id = int(tokenizer.eos_token_id)
   rollout_config = base_rollout.RolloutConfig(
-      max_tokens_to_generate=max_new_tokens,
+      max_tokens_to_generate=max_response_tokens,
       max_prompt_length=max_prompt_len,
-      kv_cache_size=max_prompt_len + max_new_tokens + 16,
+      kv_cache_size=max_prompt_len + max_response_tokens + 16,
       temperature=temperature,
       top_p=1.0,  # tunix sampler decodes greedily without top_p
       eos_tokens=[im_end_id, eos_id],
@@ -194,7 +198,7 @@ def main() -> None:
       advantage_estimator="drgrpo",  # Dr.GRPO: mean-centered, no std norm
       loss_agg_mode="sequence-mean-token-scale",  # Dr.GRPO aggregation
       system_prompt="",  # the env folds the Terminus-2 preamble into turn 0
-      max_response_length=max_prompt_len + max_turns * max_new_tokens,
+      max_response_length=max_response_tokens,  # must match rollout max_tokens_to_generate
       max_concurrency=max_concurrency,
       episode_timeout=episode_timeout,
       overlong_filter=False,  # still grade max-steps episodes (keep their reward)
