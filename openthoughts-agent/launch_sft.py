@@ -17,6 +17,13 @@ Config via env:
   * ``DATA_LIMIT`` (unset = all ~15.2k traces; set small for a smoke).
   * ``CKPT_DIR`` (./checkpoints/<model>-agent-sft).
   * ``EVAL_TOKENS`` (384).
+  * ``REMAT`` (decoder | block | none) -- activation rematerialization.
+  * ``FLASH`` (0|1) -- TPU splash attention. Default OFF: tunix's splash kernel
+    shard-maps the activation batch over ``fsdp``, so it needs BATCH_SIZE
+    divisible by the fsdp axis and currently breaks for small batches.
+
+NOTE: ``BATCH_SIZE`` must be divisible by the fsdp axis size
+(``device_count // TP``), since FSDP shards the data batch across that axis.
 
 Submit on a v6e-16 (8B fp32 actor + AdamW wants the larger slice):
 
@@ -91,6 +98,19 @@ def main() -> None:
   data_limit = os.environ.get("DATA_LIMIT")
   data_limit = int(data_limit) if data_limit else None
   eval_tokens = int(os.environ.get("EVAL_TOKENS", "384"))
+  remat = {
+      "decoder": qm.RematConfig.DECODER,
+      "block": qm.RematConfig.BLOCK,
+      "none": qm.RematConfig.NONE,
+  }[os.environ.get("REMAT", "decoder").lower()]
+  use_flash = os.environ.get("FLASH", "0") == "1"
+
+  fsdp = jax.device_count() // tp
+  if batch_size % fsdp != 0:
+    raise ValueError(
+        f"BATCH_SIZE={batch_size} must be divisible by the fsdp axis "
+        f"({fsdp} = device_count {jax.device_count()} // TP {tp})."
+    )
 
   model_spec = get_model_spec(model_name)
   model_dir = os.environ.get("AGENT_MODEL_DIR") or f"./{model_spec.name}"
@@ -114,8 +134,8 @@ def main() -> None:
       mesh=mesh,
       dtype=jnp.bfloat16,
       param_dtype=jnp.float32,
-      remat=qm.RematConfig.DECODER,
-      use_flash_attention=True,
+      remat=remat,
+      use_flash_attention=use_flash,
   )
   print("[ota-sft] LOAD OK", flush=True)
 
