@@ -46,8 +46,27 @@ def make_tunix_model_fn(
   )
   sampler = sampler_lib.Sampler(transformer=model, tokenizer=tokenizer, cache_config=cache_config)
 
+  def _fit_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Trims history to <= max_prompt_length tokens, keeping msg[0] + recent turns.
+
+    The agent context grows every turn (accumulated terminal output); the tunix
+    Sampler uses the ACTUAL prompt length, so an over-long prompt blows the KV
+    cache ("Total sampling steps N must be less than cache size"). Keep the first
+    message (system + task) and drop the oldest following turns until it fits.
+    """
+    if len(messages) <= 1:
+      return messages
+    head, tail = messages[:1], messages[1:]
+    while tail:
+      candidate = head + tail
+      n = len(tokenizer.encode(render_chatml(candidate, add_generation_prompt=True)))
+      if n <= max_prompt_length:
+        return candidate
+      tail = tail[1:]  # drop the oldest non-head turn
+    return head
+
   def model_fn(messages: list[dict[str, str]]) -> str:
-    prompt = render_chatml(messages, add_generation_prompt=True)
+    prompt = render_chatml(_fit_messages(messages), add_generation_prompt=True)
     with mesh:
       out = sampler(
           input_strings=[prompt],

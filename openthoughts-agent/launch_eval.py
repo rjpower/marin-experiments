@@ -29,6 +29,7 @@ Submit (custom image + checkpoint):
 
 import json
 import os
+import traceback
 
 import jax
 from huggingface_hub import snapshot_download
@@ -105,6 +106,7 @@ def main() -> None:
       )
     except Exception as e:  # one task's failure must not kill the sweep
       rec["error"] = f"{type(e).__name__}: {e}"
+      print(f"[ota-eval]   TRACE {task.task_id}:\n{traceback.format_exc()}", flush=True)
     finally:
       if sandbox is not None:
         sandbox.close()
