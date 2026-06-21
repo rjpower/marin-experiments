@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import time
 import urllib.request
 from typing import Protocol
@@ -263,12 +264,25 @@ def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecR
   builder, so a plain ``docker build`` fails without the buildx plugin.
   ``--load`` writes the result into the local image store so ``docker run`` (and
   hence the gVisor sandbox) can use it.
+
+  HuggingFace ``snapshot_download`` stores files as symlinks into a ``blobs/``
+  cache; BuildKit can't follow symlinks that point outside the build context, so
+  we first materialize the context with symlinks dereferenced.
   """
   ensure_dockerd()
-  return _run(
-      ["docker", "buildx", "build", "--load", "-t", tag, context_dir],
-      timeout=timeout,
-  )
+  staging = tempfile.mkdtemp(prefix="ota-build-")
+  ctx = os.path.join(staging, "context")
+  try:
+    shutil.copytree(
+        context_dir, ctx, symlinks=False,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    return _run(
+        ["docker", "buildx", "build", "--load", "-t", tag, ctx],
+        timeout=timeout,
+    )
+  finally:
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 class LocalUnsafeSandbox:
