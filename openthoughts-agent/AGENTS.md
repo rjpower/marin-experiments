@@ -130,6 +130,10 @@ uv run iris --cluster=marin job run --no-wait \
   -e HF_TOKEN "$HF_TOKEN" -e CKPT_DIR gs://.../qwen3-8b-agent-sft \
   -e TASK_LIMIT 5 -- python launch_eval.py
 ```
+**pass@k eval** (the RL gate — find tasks with reward spread): add `-e K_SAMPLES 8
+-e TEMPERATURE 0.8`. It runs each task k times and prints `pass@1`, `pass@k`, and the
+`RL-trainable (0<pass1<1)` task list. Greedy (temp ~0) gives pass@k == pass@1 — you
+need temperature for diversity. Cost ≈ k × the pass@1 sweep.
 
 **Submit an RL run.** Single-host **machinery smoke** first (validates the rollout →
 gVisor → grade → Dr.GRPO loop without multi-host complexity):
@@ -142,10 +146,14 @@ uv run iris --cluster=marin job run --no-wait \
   -e TASK_LIMIT 2 -e NUM_GENERATIONS 4 -e PROMPTS_PER_BATCH 1 -e RL_STEPS 2 \
   -e MAX_TURNS 5 -e MAX_CONCURRENCY 4 -- python launch_rl.py
 ```
-Real run: `AGENT_MODEL qwen3-8b`, `CKPT_DIR` = the (deep) SFT ckpt, a v6e-8/-16 slice,
-`WANDB_PROJECT` set. **For RL to learn, the SFT policy must solve the chosen tasks
-*sometimes* (pass@k > pass@1 > 0)** — otherwise every generation scores 0, advantages
-are 0, and nothing updates (the bimodal wall; see REPORT.md).
+**Real 8B run** (validated config — `ota-rl-8b-fit2` ran this end-to-end): `--tpu
+v6e-16`, `-e AGENT_MODEL qwen3-8b -e TP 8`, `-e CKPT_DIR` = the (deep) SFT ckpt,
+`-e RL_CKPT_DIR` set to save, `--disk 100GB`, `WANDB_PROJECT` set. Start near the fit
+envelope (`MAX_PROMPT_LEN 4096 MAX_RESPONSE_TOKENS 768 MAX_TURNS 3`); larger G / longer
+episodes may need TP=16 or shorter seqs. **For RL to learn, the SFT policy must solve
+the chosen tasks *sometimes* (pass@k > pass@1 > 0)** — otherwise every generation
+scores 0, advantages are 0, and nothing updates (the bimodal wall; see REPORT.md). Use
+the **pass@k eval above** to pick those tasks (`K_SAMPLES`/`TEMPERATURE`).
 
 **Live gVisor smoke** (no model, smallest slice — proves isolation works):
 ```bash
@@ -173,7 +181,7 @@ docker buildx build --platform linux/amd64 -f docker/Dockerfile.agent-task \
 - **SFT** (`launch_sft.py`): `AGENT_MODEL SFT_STEPS BATCH_SIZE LR MAX_SEQ_LEN SEED TP
   DATA_LIMIT CKPT_DIR REMAT FLASH EVAL_GEN RUN_NAME WANDB_PROJECT`.
 - **Eval** (`launch_eval.py`): `AGENT_MODEL CKPT_DIR TASK_LIMIT MAX_TURNS COMMAND_TIMEOUT
-  MAX_NEW_TOKENS TP MAX_PROMPT_LEN TEMPERATURE OTA_SANDBOX`.
+  MAX_NEW_TOKENS TP MAX_PROMPT_LEN TEMPERATURE K_SAMPLES OTA_SANDBOX`.
 - **RL** (`launch_rl.py`): `AGENT_MODEL CKPT_DIR RL_CKPT_DIR RL_STEPS NUM_GENERATIONS
   PROMPTS_PER_BATCH TASK_LIMIT MAX_TURNS MAX_RESPONSE_TOKENS MAX_PROMPT_LEN TEMPERATURE LR
   BETA TP MAX_CONCURRENCY COMMAND_TIMEOUT EPISODE_TIMEOUT RUN_NAME WANDB_PROJECT`.

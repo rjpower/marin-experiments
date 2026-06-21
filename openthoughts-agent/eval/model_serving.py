@@ -45,6 +45,11 @@ def make_tunix_model_fn(
       head_dim=model.config.head_dim,
   )
   sampler = sampler_lib.Sampler(transformer=model, tokenizer=tokenizer, cache_config=cache_config)
+  # Advance the seed every call so generations diverge — across turns AND across
+  # repeated episodes (pass@k). A fixed seed makes every draw identical even at
+  # temperature>0 (the tunix Sampler keys randomness on seed; top_p=1.0 is what
+  # makes it honor temperature+seed at all). Deterministic sequence => reproducible.
+  _state = {"seed": seed}
 
   def _fit_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     """Trims history to <= max_prompt_length tokens, keeping msg[0] + recent turns.
@@ -67,6 +72,8 @@ def make_tunix_model_fn(
 
   def model_fn(messages: list[dict[str, str]]) -> str:
     prompt = render_chatml(_fit_messages(messages), add_generation_prompt=True)
+    call_seed = _state["seed"]
+    _state["seed"] += 1
     with mesh:
       out = sampler(
           input_strings=[prompt],
@@ -76,7 +83,7 @@ def make_tunix_model_fn(
           eos_tokens=[im_end_id, eos_id],
           temperature=temperature,
           top_p=1.0,  # REQUIRED: tunix Sampler decodes greedily without top_p.
-          seed=seed,
+          seed=call_seed,
       )
     return out.text[0]
 

@@ -14,6 +14,11 @@ Config via env:
   * ``TASK_LIMIT`` (unset = all TB-dev tasks; set small to start).
   * ``MAX_TURNS`` (20), ``COMMAND_TIMEOUT`` (60), ``MAX_NEW_TOKENS`` (1024).
   * ``TP`` (1), ``MAX_PROMPT_LEN`` (8192), ``TEMPERATURE`` (0.2).
+  * ``K_SAMPLES`` (1): episodes per task. >1 runs each task K times (fresh sandbox
+    each) and reports pass@1 (mean solve) AND pass@k (any solve). For meaningful
+    pass@k diversity raise ``TEMPERATURE`` (~0.7-1.0) — k identical greedy draws
+    give pass@k == pass@1. This is the RL gate: tasks with 0 < pass@1 < 1 have the
+    reward spread Dr.GRPO needs (see REPORT.md bimodal-wall note).
   * ``OTA_SANDBOX`` (gvisor) -- set ``local`` only for harness debugging.
 
 Submit (custom image + checkpoint):
@@ -61,6 +66,7 @@ def main() -> None:
   max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
   max_prompt_len = int(os.environ.get("MAX_PROMPT_LEN", "8192"))
   temperature = float(os.environ.get("TEMPERATURE", "0.2"))
+  k_samples = int(os.environ.get("K_SAMPLES", "1"))
   tp = int(os.environ.get("TP", "1"))
 
   spec = get_model_spec(model_name)
@@ -78,46 +84,67 @@ def main() -> None:
   )
 
   tasks = load_tb_tasks(limit=task_limit)
-  print(f"[ota-eval] {len(tasks)} TB tasks to evaluate", flush=True)
+  print(f"[ota-eval] {len(tasks)} TB tasks to evaluate, k={k_samples} @ temp={temperature}", flush=True)
 
-  records = []
-  for i, task in enumerate(tasks):
-    print(f"[ota-eval] ({i+1}/{len(tasks)}) task={task.task_id}", flush=True)
-    rec = {"task_id": task.task_id, "solved": False, "score": 0.0, "error": None}
+  def _one_episode(task) -> dict:
+    """Boot a fresh sandbox, run the agent, grade. Isolated per sample."""
+    out = {"solved": False, "score": 0.0, "turns": None, "parse_failures": None, "error": None}
     sandbox = None
     try:
-      build = build_image(task.environment_dir, task.image_tag)
-      if build.exit_code != 0:
-        rec["error"] = f"image build failed: {build.stderr[-500:]}"
-        records.append(rec)
-        continue
       sandbox = GvisorContainerSandbox(task.image_tag)
       episode = run_episode(
           model_fn, sandbox, task.instruction,
           max_turns=max_turns, command_timeout=command_timeout,
       )
       grade = grade_task(sandbox, task)
-      rec.update(
-          solved=grade.solved,
-          score=grade.score,
-          turns=episode.turns,
-          parse_failures=episode.parse_failures,
-          detail=grade.detail,
-      )
-    except Exception as e:  # one task's failure must not kill the sweep
-      rec["error"] = f"{type(e).__name__}: {e}"
+      out.update(solved=grade.solved, score=grade.score,
+                 turns=episode.turns, parse_failures=episode.parse_failures)
+    except Exception as e:  # one sample's failure must not kill the rest
+      out["error"] = f"{type(e).__name__}: {e}"
       print(f"[ota-eval]   TRACE {task.task_id}:\n{traceback.format_exc()}", flush=True)
     finally:
       if sandbox is not None:
         sandbox.close()
-    print(f"[ota-eval]   -> {json.dumps(rec)}", flush=True)
+    return out
+
+  records = []
+  for i, task in enumerate(tasks):
+    print(f"[ota-eval] ({i+1}/{len(tasks)}) task={task.task_id}", flush=True)
+    rec = {"task_id": task.task_id, "k": k_samples, "samples": [],
+           "pass1": 0.0, "passk": False, "best_score": 0.0, "error": None}
+    build = build_image(task.environment_dir, task.image_tag)
+    if build.exit_code != 0:
+      rec["error"] = f"image build failed: {build.stderr[-500:]}"
+      print(f"[ota-eval]   -> {json.dumps(rec)}", flush=True)
+      records.append(rec)
+      continue
+    for s in range(k_samples):
+      sample = _one_episode(task)
+      rec["samples"].append(sample)
+      print(f"[ota-eval]   sample {s+1}/{k_samples} -> "
+            f"solved={sample['solved']} score={sample['score']:.3f} "
+            f"turns={sample['turns']} parse_fail={sample['parse_failures']}", flush=True)
+    solves = [bool(x["solved"]) for x in rec["samples"]]
+    scores = [float(x["score"]) for x in rec["samples"]]
+    rec["pass1"] = sum(solves) / max(len(solves), 1)  # mean solve over k
+    rec["passk"] = any(solves)
+    rec["best_score"] = max(scores) if scores else 0.0
+    rec["spread"] = 0.0 < rec["pass1"] < 1.0  # RL-trainable (reward spread)
+    print(f"[ota-eval]   = task pass1={rec['pass1']:.3f} passk={rec['passk']} "
+          f"spread={rec['spread']}", flush=True)
     records.append(rec)
 
   n = len(records)
-  solved = sum(1 for r in records if r["solved"])
-  mean_score = sum(r["score"] for r in records) / max(n, 1)
-  print(f"[ota-eval] ===== RESULTS =====", flush=True)
-  print(f"[ota-eval] solved {solved}/{n} = {solved/max(n,1):.3f} | mean_score={mean_score:.3f}", flush=True)
+  # micro pass@1 = mean solve over ALL (task,sample); macro pass@k = tasks any-solved.
+  all_solves = [bool(x["solved"]) for r in records for x in r["samples"]]
+  pass1 = sum(all_solves) / max(len(all_solves), 1)
+  passk = sum(1 for r in records if r["passk"]) / max(n, 1)
+  spread_tasks = [r["task_id"] for r in records if r.get("spread")]
+  print(f"[ota-eval] ===== RESULTS ({n} tasks, k={k_samples}) =====", flush=True)
+  print(f"[ota-eval] pass@1={pass1:.3f} (over {len(all_solves)} samples) | "
+        f"pass@{k_samples}={passk:.3f} (tasks any-solved)", flush=True)
+  print(f"[ota-eval] RL-trainable (0<pass1<1): {len(spread_tasks)} tasks "
+        f"{json.dumps(spread_tasks)}", flush=True)
   print(f"[ota-eval] PER_TASK_JSON {json.dumps(records)}", flush=True)
 
 
