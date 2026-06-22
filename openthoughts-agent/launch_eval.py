@@ -12,6 +12,8 @@ selected via `iris job run --task-image ...`, and the SFT checkpoint in CKPT_DIR
 Config via env:
   * ``AGENT_MODEL`` (qwen3-8b), ``CKPT_DIR`` (required: the SFT checkpoint root).
   * ``TASK_LIMIT`` (unset = all TB-dev tasks; set small to start).
+  * ``TASK_OFFSET`` (0): skip the first N tasks. Pair with ``TASK_LIMIT`` to shard a
+    sweep across parallel jobs (e.g. offset 0/14/28/... limit 14 -> 5 disjoint jobs).
   * ``MAX_TURNS`` (20), ``COMMAND_TIMEOUT`` (60), ``MAX_NEW_TOKENS`` (1024).
   * ``TP`` (1), ``MAX_PROMPT_LEN`` (8192), ``TEMPERATURE`` (0.2).
   * ``K_SAMPLES`` (1): episodes per task. >1 runs each task K times (fresh sandbox
@@ -61,6 +63,7 @@ def main() -> None:
   checkpoint_dir = os.environ["CKPT_DIR"]
   task_limit = os.environ.get("TASK_LIMIT")
   task_limit = int(task_limit) if task_limit else None
+  task_offset = int(os.environ.get("TASK_OFFSET", "0"))  # shard: skip first N tasks
   max_turns = int(os.environ.get("MAX_TURNS", "20"))
   command_timeout = float(os.environ.get("COMMAND_TIMEOUT", "60"))
   max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
@@ -83,8 +86,13 @@ def main() -> None:
       temperature=temperature,
   )
 
-  tasks = load_tb_tasks(limit=task_limit)
-  print(f"[ota-eval] {len(tasks)} TB tasks to evaluate, k={k_samples} @ temp={temperature}", flush=True)
+  # Shard for parallel sweeps: load all, then take tasks[offset : offset+limit].
+  # Fan N jobs out with disjoint TASK_OFFSET windows to cover all 70 tasks fast.
+  all_tasks = load_tb_tasks()
+  end = task_offset + task_limit if task_limit else len(all_tasks)
+  tasks = all_tasks[task_offset:end]
+  print(f"[ota-eval] {len(tasks)} TB tasks to evaluate (offset={task_offset} "
+        f"of {len(all_tasks)}), k={k_samples} @ temp={temperature}", flush=True)
 
   def _one_episode(task) -> dict:
     """Boot a fresh sandbox, run the agent, grade. Isolated per sample."""
