@@ -12,11 +12,32 @@ pass@k machinery to drive it.
 
 - **Milestone 1 — complete.** SFT → gVisor eval → grade runs end-to-end on the
   cluster (table below). First eval is an honest capability floor (0/20).
-- **Phase 2 — pipeline complete and validated at 8B; outcome eval in flight.**
-  The deep 3-epoch SFT finished (11,400 steps, final train loss **0.043**), and
-  the entire Dr.GRPO RL loop has run end-to-end at 8B on v6e-16 (TP=8). The
-  pass@k gate eval on the deep checkpoint — which decides whether RL can learn
-  anything — is the one result still computing (5 sharded v6e-8 jobs).
+- **Phase 2 — complete.** The deep 3-epoch SFT finished (11,400 steps, final
+  train loss **0.043**), the entire Dr.GRPO RL loop ran end-to-end at 8B on
+  v6e-16 (TP=8), and the pass@k gate eval on the deep checkpoint is in (below).
+  The gate's verdict: RL has a **thin but real** learning signal (5/70 tasks),
+  and the dominant lever for the pass rate is **more/better SFT data**.
+
+### Gate eval result (deep checkpoint, all 70 TB-dev tasks, k=5 @ temp 0.8)
+
+Fanned out as one v6e-8 job per task (36 live + 34 harvested from a coarser run);
+all graded. The RL gate is **continuous-score spread**, because the RL env reward
+is the continuous grader score (`rl/environment.py`), not the binary solve.
+
+| outcome | tasks |
+|---|---|
+| **fully solved** (`solved`, score ≥ 1.0, any of k) | **0 / 70** |
+| all-zero (no reward at all — dead for RL) | 65 / 70 |
+| **RL-trainable** (continuous score varies across k) | **5 / 70** |
+
+The 5 RL-trainable tasks (each `min=0` → real reward variance for Dr.GRPO):
+`63a70070`(→0.667), `f19460df`(→0.585), `67d895a6`(→0.40), `f91e56f8`(→0.359),
+`ab72149d`(→0.333). **Interpretation:** the *binary* pass@k is 0 everywhere, so a
+binary gate would (wrongly) declare RL impossible. The continuous gate shows the
+deep policy earns *partial* credit with run-to-run variance on ~7% of tasks — a
+usable Dr.GRPO advantage — but caps well below a full solve. So RL on these 5 can
+nudge partial scores up; it cannot, alone, make a task-completing agent. Lifting
+the whole distribution above the completion floor is an SFT-data problem.
 
 The full pipeline runs end-to-end on the cluster:
 
@@ -173,16 +194,21 @@ per step at G=2; node disk caps at 100 GB so RL must stay modest there.
 
 ## Next steps
 
-- **Read the gate eval (in flight).** 5 sharded v6e-8 jobs are running pass@k
-  (k=5, temp 0.8, 10 turns) over all 70 TB-dev tasks on the deep checkpoint. Two
-  outcomes, both useful: (a) some tasks show `0 < pass1 < 1` → those are the RL
-  training set, launch the 8B run on them; (b) still 0 everywhere → the finding is
-  that 3-epoch SFT on 15.2k traces doesn't clear the TB-dev capability floor, and
-  the lever is **more/better SFT data**, not RL (RL would no-op on the bimodal wall).
-- **8B RL run** (machinery ready, validated config: v6e-16, TP=8, `--disk 100GB`,
-  deep ckpt, fit envelope above) — gated on (a) above. A known tension: the
-  memory-fit episode budget (3 turns) is tight for TB tasks; affording more turns
-  needs TP=16 or shorter sequences.
-- **Larger / generated SFT data** — the most likely real lever for the pass rate;
-  generate fresh traces from the agent's own rollouts. **Async RL rollouts** (may
-  modify the tunix fork) to decouple generation from the train step.
+The gate is in: **5 RL-trainable tasks, 0 full solves.** That points the two levers
+clearly:
+
+- **(Primary lever) Larger / better SFT data.** 0/70 full solves after 3 epochs on
+  15.2k traces says the policy is below the *completion* floor on TB-dev, not merely
+  un-tuned. The fix is more competent traces — more of OpenThoughts-Agent-v1-SFT (we
+  trained on a pinned slice), other agent-trace corpora, and traces generated from
+  the agent's own successful rollouts (reject-sampled by the grader). This is what
+  moves all-zero tasks into the trainable band.
+- **(Secondary, ready now) 8B Dr.GRPO on the 5 trainable tasks.** The machinery is
+  validated (v6e-16, TP=8, `--disk 100GB`, deep ckpt, fit envelope above) and these
+  5 tasks have genuine reward spread, so a run would *demonstrably* learn — but the
+  ceiling is bounded (max partial score ~0.67), so treat it as a proof-of-learning /
+  partial-credit lift, not a path to a task-completing agent on its own. Restrict the
+  task set to those 5 ids (or raise the per-episode turn budget past the memory-fit 3
+  via TP=16 / shorter seqs, since TB tasks need more actions than 3).
+- **Async RL rollouts** (may modify the tunix fork) to decouple generation from the
+  train step — the throughput lever once the data lever has raised the trainable set.
