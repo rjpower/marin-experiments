@@ -131,9 +131,20 @@ uv run iris --cluster=marin job run --no-wait \
   -e TASK_LIMIT 5 -- python launch_eval.py
 ```
 **pass@k eval** (the RL gate — find tasks with reward spread): add `-e K_SAMPLES 8
--e TEMPERATURE 0.8`. It runs each task k times and prints `pass@1`, `pass@k`, and the
-`RL-trainable (0<pass1<1)` task list. Greedy (temp ~0) gives pass@k == pass@1 — you
-need temperature for diversity. Cost ≈ k × the pass@1 sweep.
+-e TEMPERATURE 0.8`. It runs each task k times and prints `pass@1`, `pass@k`, per-task
+`score[min/mean/max]`, and the `RL-TRAINABLE` task list. The RL gate is **`score_spread`**
+(the CONTINUOUS grader score varies across the k samples), NOT binary `0<pass1<1`: the RL
+env reward is the continuous score (`rl/environment.py`), so Dr.GRPO gets advantage from
+score variance even with 0 full solves. Greedy (temp ~0) gives no spread — need temperature.
+Cost ≈ k × the pass@1 sweep.
+
+**Fan the eval out (v6e-8s are plentiful).** Eval is sequential within a process (~7 min/
+task at 8B, k=5, 10 turns) so a 70-task sweep crawls. Shard with `TASK_OFFSET`+`TASK_LIMIT`
+across many jobs — finest is one task per job (`TASK_LIMIT 1 TASK_OFFSET <i>`, `--disk 50GB`).
+Each task frees its image after grading (`remove_image`), so 50GB suffices. **zsh gotcha:**
+the Bash tool runs zsh, which does NOT word-split unquoted `$var` — `for i in $LIST` runs
+ONCE with the whole string (silently makes one job named `…-1 2 3 …`). Use a literal list:
+`for i in 11 12 13 …; do`.
 
 **Submit an RL run.** Single-host **machinery smoke** first (validates the rollout →
 gVisor → grade → Dr.GRPO loop without multi-host complexity):
