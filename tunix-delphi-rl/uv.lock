@@ -2495,9 +2495,12 @@ name = "tunix-delphi-rl"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "fastapi", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "google-tunix", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "httpx", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "marin-fray", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "marin-iris", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "uvicorn", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
 
 [package.optional-dependencies]
@@ -2512,10 +2515,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "fastapi" },
     { name = "google-tunix" },
     { name = "google-tunix", extras = ["prod"], marker = "sys_platform == 'linux' and extra == 'tpu'" },
+    { name = "httpx" },
     { name = "marin-fray" },
     { name = "marin-iris" },
+    { name = "uvicorn" },
 ]
 provides-extras = ["tpu"]
 

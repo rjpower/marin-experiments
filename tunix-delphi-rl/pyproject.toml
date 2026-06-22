@@ -11,6 +11,9 @@ dependencies = [
     "google-tunix",
     "marin-iris",
     "marin-fray",
+    "fastapi",
+    "uvicorn",
+    "httpx",
 ]
 
 [project.optional-dependencies]

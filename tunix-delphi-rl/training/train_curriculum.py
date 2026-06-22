@@ -140,12 +140,18 @@ def train_curriculum(
     chat_sft_learning_rate: float = 1e-5,
     chat_sft_max_seq_len: int = 1024,
     chat_sft_use_mixture: bool = True,
+    save_path: str | None = None,
+    save_dtype: str = "bfloat16",
 ) -> CurriculumTrainResult:
   """SFT warm-up (easy levels) -> curriculum Dr.GRPO; per-level held-out pass@k.
 
   ``model_spec`` selects the base model + loaders (default: Delphi). The eos used
   for per-turn stopping comes from ``tokenizer.eos_token_id``, so the same code
   trains Delphi-447M or Qwen3-1.7B-Base unchanged.
+
+  When ``save_path`` is set, the trained actor is exported to an HF safetensors
+  checkpoint (local dir or ``gs://``) after RL completes, in ``save_dtype``; the
+  base snapshot at ``model_dir`` supplies the config + tokenizer files.
   """
   if model_spec is None:
     model_spec = get_model_spec("delphi")
@@ -297,6 +303,13 @@ def train_curriculum(
         k=passk, temperature=passk_temperature, max_new_tokens=eval_max_new_tokens,
         max_prompt_length=max_prompt_length, mesh=mesh, label="after-rl",
     )
+
+  if save_path:
+    from serving.export_hf import save_qwen3_to_hf
+
+    print(f"[curric] exporting trained actor -> {save_path}", flush=True)
+    save_qwen3_to_hf(rl_cluster.actor_trainer.model, save_path, hf_config_dir=model_dir, save_dtype=save_dtype)
+    print(f"[curric] export complete: {save_path}", flush=True)
 
   return CurriculumTrainResult(
       best_solve_history=capture.best_solve_history,
