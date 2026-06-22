@@ -23,6 +23,8 @@ Config via env vars so the coordinator can size the run:
   * ``CURRIC_CHAT_SFT_STEPS`` (0)  -- Stage-0 "up to shape" chat+tool SFT steps (0 skips).
   * ``CURRIC_CHAT_DATASET`` (``allenai/tulu-3-sft-mixture``), ``CURRIC_CHAT_MIXTURE`` (1).
   * ``CURRIC_CHAT_BATCH_SIZE`` (8), ``CURRIC_CHAT_LR`` (1e-5), ``CURRIC_CHAT_MAX_SEQ_LEN`` (1024).
+  * ``CURRIC_SAVE_PATH`` ("")    -- HF-safetensors export dir for the trained actor
+    (local or ``gs://``; empty = no export). ``CURRIC_SAVE_DTYPE`` (``bfloat16``).
   * ``CURRIC_SEED`` (0), ``DELPHI_MODEL_DIR`` (``./delphi``).
 
 Submit on a single-host TPU (the coordinator submits; do NOT submit from here):
@@ -84,6 +86,8 @@ def main() -> None:
   chat_sft_lr = float(os.environ.get("CURRIC_CHAT_LR", "1e-5"))
   chat_sft_max_seq_len = int(os.environ.get("CURRIC_CHAT_MAX_SEQ_LEN", "1024"))
   chat_sft_use_mixture = os.environ.get("CURRIC_CHAT_MIXTURE", "1") not in ("0", "false", "False")
+  save_path = os.environ.get("CURRIC_SAVE_PATH") or None
+  save_dtype = os.environ.get("CURRIC_SAVE_DTYPE", "bfloat16")
   model_name = os.environ.get("CURRIC_MODEL", "delphi")
   model_spec = get_model_spec(model_name)
   model_dir = (
@@ -138,6 +142,8 @@ def main() -> None:
       chat_sft_learning_rate=chat_sft_lr,
       chat_sft_max_seq_len=chat_sft_max_seq_len,
       chat_sft_use_mixture=chat_sft_use_mixture,
+      save_path=save_path,
+      save_dtype=save_dtype,
   )
 
   for i in range(result.steps_ran):
@@ -154,6 +160,8 @@ def main() -> None:
 
   _print_passk("after-sft" if sft_steps > 0 else "few-shot", result.passk_after_sft)
   _print_passk("after-rl", result.passk_after_rl)
+  if save_path:
+    print(f"[curric] saved trained model to {save_path}", flush=True)
   print(f"[curric] CURRICULUM COMPLETE (RL steps={result.steps_ran}, train_levels={train_levels})", flush=True)
 
 

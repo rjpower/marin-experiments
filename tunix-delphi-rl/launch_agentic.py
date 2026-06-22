@@ -25,6 +25,9 @@ Run config is read from env vars so the coordinator can size the TPU run:
   * ``DELPHI_SFT_STEPS`` (default 0; ``t0`` only -- supervised CALC-transcript
     warm-up steps before RL, to make the answer-copy in-distribution)
   * ``DELPHI_MODEL_DIR`` (default ``./delphi`` on the worker)
+  * ``DELPHI_SAVE_PATH`` (default unset; t0/t1/t2 only -- when set, export the
+    trained actor to this HF checkpoint dir after RL, ``gs://`` via gcsfs)
+  * ``DELPHI_SAVE_DTYPE`` (default ``bfloat16``)
 
 Submit on a single-host TPU (the coordinator submits; do NOT submit from here):
 
@@ -120,7 +123,7 @@ def _run_port(*, model_dir, steps, stage, num_generations, batch_size,
 
 def _run_tool_stage(*, train_fn, label, model_dir, steps, num_generations,
                     batch_size, learning_rate, use_rollout_logps,
-                    sft_steps, sft_learning_rate) -> None:
+                    sft_steps, sft_learning_rate, save_path, save_dtype) -> None:
   """Runs and reports a CALC tool stage (T0 single call / T1 chained calls)."""
   result = train_fn(
       model_dir=model_dir,
@@ -131,6 +134,8 @@ def _run_tool_stage(*, train_fn, label, model_dir, steps, num_generations,
       sft_learning_rate=sft_learning_rate,
       use_rollout_logps=use_rollout_logps,
       sft_steps=sft_steps,
+      save_path=save_path,
+      save_dtype=save_dtype,
   )
 
   if not result.reward_history:
@@ -171,6 +176,10 @@ def main() -> None:
   sft_steps = int(os.environ.get("DELPHI_SFT_STEPS", "0"))
   sft_learning_rate = float(os.environ.get("DELPHI_SFT_LR", "1e-4"))
   model_dir = os.environ.get("DELPHI_MODEL_DIR", "./delphi")
+  # When set (t0/t1/t2 only), export the trained actor to an HF checkpoint after
+  # RL so it can be served. gs:// uploads via gcsfs from inside the worker venv.
+  save_path = os.environ.get("DELPHI_SAVE_PATH", "")
+  save_dtype = os.environ.get("DELPHI_SAVE_DTYPE", "bfloat16")
 
   if mode not in ("port", "t0", "t1", "t2"):
     raise ValueError(
@@ -218,6 +227,8 @@ def main() -> None:
         use_rollout_logps=use_rollout_logps,
         sft_steps=sft_steps,
         sft_learning_rate=sft_learning_rate,
+        save_path=save_path,
+        save_dtype=save_dtype,
     )
 
 

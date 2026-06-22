@@ -483,6 +483,8 @@ def _train_agentic_calc(
     sft_prompt_prefix: str = "",
     sft_max_seq_len: int = 80,
     mesh: jax.sharding.Mesh | None = None,
+    save_path: str = "",
+    save_dtype: str = "bfloat16",
 ) -> T0TrainResult:
   """Runs Delphi T0 single-calculator-call GRPO through the AGENTIC tool stack.
 
@@ -689,6 +691,22 @@ def _train_agentic_calc(
   )
 
   learner.train(train_ds, eval_dataset=None)
+
+  # Export the trained actor to an HF checkpoint (mirrors train_curriculum.py).
+  # The qwen3 key-map exporter walks params only and is rope-agnostic, so it
+  # works unchanged on the rope-monkeypatched Delphi actor; ``model_dir`` supplies
+  # Delphi's config.json (with rope_scaling) + tokenizer for the served reload.
+  if save_path:
+    from serving.export_hf import save_qwen3_to_hf
+
+    print(f"[agentic] exporting trained actor -> {save_path} ({save_dtype})", flush=True)
+    save_qwen3_to_hf(
+        rl_cluster.actor_trainer.model,
+        save_path,
+        hf_config_dir=model_dir,
+        save_dtype=save_dtype,
+    )
+    print(f"[agentic] export complete: {save_path}", flush=True)
 
   return T0TrainResult(
       reward_history=capture.reward_history,
