@@ -17,10 +17,12 @@ Config via env:
   * ``MAX_TURNS`` (20), ``COMMAND_TIMEOUT`` (60), ``MAX_NEW_TOKENS`` (1024).
   * ``TP`` (1), ``MAX_PROMPT_LEN`` (8192), ``TEMPERATURE`` (0.2).
   * ``K_SAMPLES`` (1): episodes per task. >1 runs each task K times (fresh sandbox
-    each) and reports pass@1 (mean solve) AND pass@k (any solve). For meaningful
-    pass@k diversity raise ``TEMPERATURE`` (~0.7-1.0) — k identical greedy draws
-    give pass@k == pass@1. This is the RL gate: tasks with 0 < pass@1 < 1 have the
-    reward spread Dr.GRPO needs (see REPORT.md bimodal-wall note).
+    each) and reports pass@1 (mean solve), pass@k (any solve), and per-task score
+    stats. For meaningful diversity raise ``TEMPERATURE`` (~0.7-1.0) — k identical
+    greedy draws give no spread. The **RL gate** is ``score_spread`` (the continuous
+    grader score VARIES across the k samples), NOT binary ``0<pass1<1``: the RL env
+    reward is the continuous score (rl/environment.py), so Dr.GRPO gets a usable
+    advantage whenever scores differ, even with 0 full solves (see REPORT.md).
   * ``OTA_SANDBOX`` (gvisor) -- set ``local`` only for harness debugging.
 
 Submit (custom image + checkpoint):
@@ -137,9 +139,16 @@ def main() -> None:
     rec["pass1"] = sum(solves) / max(len(solves), 1)  # mean solve over k
     rec["passk"] = any(solves)
     rec["best_score"] = max(scores) if scores else 0.0
-    rec["spread"] = 0.0 < rec["pass1"] < 1.0  # RL-trainable (reward spread)
+    rec["score_mean"] = sum(scores) / max(len(scores), 1)
+    rec["spread"] = 0.0 < rec["pass1"] < 1.0  # binary-solve spread (strict)
+    # The RL gate that actually matches the env reward: the env returns the
+    # CONTINUOUS grader score (rl/environment.py), so Dr.GRPO gets a usable
+    # advantage whenever the k scores VARY -- even with 0 full solves. A task
+    # where every sample scores the same (incl. all-zero) gives 0 advantage.
+    rec["score_spread"] = (max(scores) - min(scores) > 1e-9) if scores else False
     print(f"[ota-eval]   = task pass1={rec['pass1']:.3f} passk={rec['passk']} "
-          f"spread={rec['spread']}", flush=True)
+          f"score[min/mean/max]={min(scores):.3f}/{rec['score_mean']:.3f}/{rec['best_score']:.3f} "
+          f"score_spread={rec['score_spread']}", flush=True)
     records.append(rec)
     # Free the image now that this task's samples are graded: vfs doesn't share
     # layers, so keeping every image blows a small disk. Bounds usage to ~1 image.
@@ -151,11 +160,16 @@ def main() -> None:
   pass1 = sum(all_solves) / max(len(all_solves), 1)
   passk = sum(1 for r in records if r["passk"]) / max(n, 1)
   spread_tasks = [r["task_id"] for r in records if r.get("spread")]
+  # The RL go/no-go: tasks whose continuous scores VARY across the k samples
+  # (what Dr.GRPO turns into advantage), regardless of whether any fully solved.
+  score_spread_tasks = [r["task_id"] for r in records if r.get("score_spread")]
   print(f"[ota-eval] ===== RESULTS ({n} tasks, k={k_samples}) =====", flush=True)
   print(f"[ota-eval] pass@1={pass1:.3f} (over {len(all_solves)} samples) | "
         f"pass@{k_samples}={passk:.3f} (tasks any-solved)", flush=True)
-  print(f"[ota-eval] RL-trainable (0<pass1<1): {len(spread_tasks)} tasks "
+  print(f"[ota-eval] binary-solve spread (0<pass1<1): {len(spread_tasks)} tasks "
         f"{json.dumps(spread_tasks)}", flush=True)
+  print(f"[ota-eval] RL-TRAINABLE (continuous score varies across k): "
+        f"{len(score_spread_tasks)} tasks {json.dumps(score_spread_tasks)}", flush=True)
   print(f"[ota-eval] PER_TASK_JSON {json.dumps(records)}", flush=True)
 
 
