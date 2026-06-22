@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tunix-delphi-rl"
+version = "0.1.0"
+description = "Packaging feasibility probe: google-tunix + marin-iris + marin-fray (no marin-levanter)."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "google-tunix",
+    "marin-iris",
+    "marin-fray",
+]
+
+[project.optional-dependencies]
+tpu = ["google-tunix[prod]; sys_platform == 'linux'"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The default run is fast + CPU-only. Anything that loads Delphi weights or runs
+# a JAX training loop is marked ``slow`` and excluded here; run those explicitly
+# with ``-m slow`` on a host that has the model / accelerator.
+addopts = "-m 'not slow'"
+markers = [
+    "slow: tests that download/load model weights or run a JAX training loop (TPU/model required; excluded by default)",
+]
+
+[tool.uv]
+fork-strategy = "fewest"
+prerelease = "allow"
+environments = [
+    "sys_platform == 'darwin'",
+    "sys_platform == 'linux'",
+]
+override-dependencies = [
+    "omegaconf>=2.4.0.dev4",
+    "antlr4-python3-runtime==4.11",
+    "python-multipart>=0.0.22",
+    "wheel>=0.46.2",
+    "datasets>=3.1.0,<4.0.0",
+    "equinox>=0.11.10",
+]
+
+[[tool.uv.index]]
+name = "marin-resiliparse"
+url = "https://marin-community.github.io/chatnoir-resiliparse/simple"
+
+[tool.uv.sources]
+resiliparse = { index = "marin-resiliparse" }
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
