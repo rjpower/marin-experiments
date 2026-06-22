@@ -328,6 +328,18 @@ def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecR
     shutil.rmtree(staging, ignore_errors=True)
 
 
+def remove_image(tag: str, *, timeout: float = 120.0) -> ExecResult:
+  """Removes a built image to bound vfs disk usage.
+
+  dockerd runs with ``--storage-driver=vfs`` (the only driver that comes up nested
+  in the iris task), and vfs does NOT share layers between images -- disk ≈ Σ of
+  every image kept. An eval that builds all 70 TB-dev task images without freeing
+  them needs hundreds of GB; removing each task's image once its samples are graded
+  keeps the footprint to ~one image at a time, so the job fits a small disk.
+  """
+  return _run(["docker", "rmi", "-f", tag], timeout=timeout)
+
+
 class LocalUnsafeSandbox:
   """Plain subprocess execution with NO isolation. Dev/testing only.
 

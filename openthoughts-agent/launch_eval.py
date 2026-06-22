@@ -44,7 +44,7 @@ from huggingface_hub import snapshot_download
 from eval.agent_loop import run_episode
 from eval.grade import grade_task
 from eval.model_serving import make_tunix_model_fn
-from eval.sandbox import GvisorContainerSandbox, build_image
+from eval.sandbox import GvisorContainerSandbox, build_image, remove_image
 from eval.tb_tasks import load_tb_tasks
 from models.checkpoint import restore_sft_model
 from models.registry import get_model_spec
@@ -141,6 +141,9 @@ def main() -> None:
     print(f"[ota-eval]   = task pass1={rec['pass1']:.3f} passk={rec['passk']} "
           f"spread={rec['spread']}", flush=True)
     records.append(rec)
+    # Free the image now that this task's samples are graded: vfs doesn't share
+    # layers, so keeping every image blows a small disk. Bounds usage to ~1 image.
+    remove_image(task.image_tag)
 
   n = len(records)
   # micro pass@1 = mean solve over ALL (task,sample); macro pass@k = tasks any-solved.
