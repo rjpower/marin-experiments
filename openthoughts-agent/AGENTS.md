@@ -13,9 +13,9 @@ stages each have one root entrypoint: `launch_sft.py`, `launch_eval.py`,
 
 | Stage | What | State |
 |------|------|------|
-| 1. SFT | Qwen3-8B on `OpenThoughts-Agent-v1-SFT` (~15.2k Terminus-2 traces) → GCS ckpt | **done**; baseline ckpt at `…/qwen3-8b-agent-sft`; a 3-epoch **deep** run is training to `…/qwen3-8b-agent-sft-deep` |
+| 1. SFT | Qwen3-8B on `OpenThoughts-Agent-v1-SFT` (~15.2k Terminus-2 traces) → GCS ckpt | **done**; baseline ckpt at `…/qwen3-8b-agent-sft`; 3-epoch **deep** run complete (11.4k steps, loss 0.043) at `…/qwen3-8b-agent-sft-deep` |
 | 2. Eval | SFT'd agent on `OpenThoughts-TB-dev` (Terminal-Bench) in a gVisor sandbox | **done + validated**: clean end-to-end, oracle grades 1.0, baseline solved 0/5 (format learned, capability low) |
-| 3. RL | Dr.GRPO (tunix agentic), sync rollouts | **built + validated at 8B**: full loop ran end-to-end single-host (1.7B/v6e-4 TP=4), multi-host (1.7B/v6e-8), AND **8B on v6e-16 TP=8** (`ota-rl-8b-fit2`, restore→rollout→grade→train_step); real run pending deep-SFT ckpt for reward spread |
+| 3. RL | Dr.GRPO (tunix agentic), sync rollouts | **built + validated at 8B**: full loop ran end-to-end single-host (1.7B/v6e-4 TP=4), multi-host (1.7B/v6e-8), AND **8B on v6e-16 TP=8** (`ota-rl-8b-fit2`, restore→rollout→grade→train_step); real run gated on pass@k spread from the deep-ckpt gate eval |
 
 Milestone-1 write-up: `REPORT.md`. PR: rjpower/marin-experiments#9.
 

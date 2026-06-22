@@ -1,13 +1,22 @@
-# OpenThoughts agent on Qwen3-8B — Milestone 1 report
+# OpenThoughts agent on Qwen3-8B — report
 
 **Goal (weaver #240):** build the best OpenThoughts terminal agent on Qwen3-8B
 (https://www.openthoughts.ai/blog/agent), trained with `google-tunix` on the
 marin/iris TPU cluster (v6e-8 / v6e-16). **Milestone 1:** get a basic SFT
 experiment running and evaluated against the OpenThoughts benchmark, with agent
 tool execution isolated in **gVisor** containers launched from inside the iris
-TPU task.
+TPU task. **Phase 2:** deep (multi-epoch) SFT, a Dr.GRPO RL stage, and the
+pass@k machinery to drive it.
 
-## Status: milestone 1 complete
+## Status
+
+- **Milestone 1 — complete.** SFT → gVisor eval → grade runs end-to-end on the
+  cluster (table below). First eval is an honest capability floor (0/20).
+- **Phase 2 — pipeline complete and validated at 8B; outcome eval in flight.**
+  The deep 3-epoch SFT finished (11,400 steps, final train loss **0.043**), and
+  the entire Dr.GRPO RL loop has run end-to-end at 8B on v6e-16 (TP=8). The
+  pass@k gate eval on the deep checkpoint — which decides whether RL can learn
+  anything — is the one result still computing (5 sharded v6e-8 jobs).
 
 The full pipeline runs end-to-end on the cluster:
 
@@ -120,9 +129,11 @@ Built on top of milestone 1 (same branch / PR):
   (`training.common.metrics_logging_options`, gated on `WANDB_PROJECT`). The
   `PeftTrainer` prints no loss to stdout, so this is the only training signal;
   validated live on the deep-SFT job.
-- **Deep SFT** — a 3-epoch run (≈11.4k steps at batch 4) from base into a fresh
-  checkpoint dir, wandb-tracked, resumable via `PeftTrainer.maybe_restore`. The
-  milestone-1 baseline was only ~0.26 epoch.
+- **Deep SFT — done.** A 3-epoch run (**11,400 steps** at batch 4) from base into
+  a fresh checkpoint dir (`…/qwen3-8b-agent-sft-deep`), wandb-tracked, resumable
+  via `PeftTrainer.maybe_restore`. Ran 8h21m on v6e-16; final `train/loss` **0.043**
+  (vs 0.076 at 38%), monotone-decreasing. The milestone-1 baseline was only
+  ~0.26 epoch, so this is ~11× more optimization on the same trace set.
 - **RL stage (Dr.GRPO)** — multi-turn RL via tunix's *agentic* learner
   (`tunix.rl.agentic`), so the gVisor harness is the reward environment:
   - `rl/agent.py` `TerminusAgent` parses the Terminus-2 JSON action (reuses the
@@ -134,23 +145,44 @@ Built on top of milestone 1 (same branch / PR):
   - `launch_rl.py` wires the RLCluster (vanilla rollout — no vLLM), Dr.GRPO config,
     and `QwenChatTemplateParser(enable_thinking=True)` (tokenization verified
     byte-identical to the SFT encoder).
-  - **Validated end-to-end**: the full rollout → 4 concurrent gVisor containers →
+  - **Validated end-to-end at 8B**: the full rollout → concurrent gVisor containers →
     generation → multi-turn env stepping → grading → Dr.GRPO `train_step` loop ran
-    to completion on a single host (1.7B/v6e-4, TP=4) **and** across hosts
-    (1.7B/v6e-8). Multi-host agentic rollout — the main risk, since the tunix
-    learner has no per-host guards — works.
+    to completion on a single host (1.7B/v6e-4, TP=4), across hosts (1.7B/v6e-8),
+    **and at 8B on v6e-16 (TP=8, 4 hosts, restore→rollout→grade→train_step→done)**.
+    Multi-host agentic rollout — the main risk, since the tunix learner has no
+    per-host guards — works, and the TP=4 SFT checkpoint reshards onto TP=8 for RL.
 
-Findings from bringing RL up: tunix enforces `max_tokens_to_generate ==
-max_response_length` and `return_logprobs=True`, and `mini_batch_size` is in prompts
-(must divide `PROMPTS_PER_BATCH`). A real concurrency bug surfaced — G rollouts boot
-containers simultaneously and collided on `pid+ms` names (uuid fix). RL backprop OOMs
-at `remat=NONE` (forced by the sampler) unless TP shards the activations (TP=4 fits
-1.7B on v6e-4; 1.7B OOMs at TP=1, matching prior experience).
+- **pass@k gate eval** (`launch_eval.py` `K_SAMPLES`/`TEMPERATURE`, `TASK_OFFSET`
+  sharding) — runs each task k times with sampling and reports pass@1, pass@k, and
+  the `0 < pass1 < 1` task list. This is the RL **go/no-go**: Dr.GRPO's advantage is
+  reward − group-mean, so a task the policy *always* fails (or always passes) gives
+  zero advantage and zero gradient (the "bimodal wall"). RL can only learn on tasks
+  the deep policy solves *sometimes*. The seed advances per sampler call so the k
+  draws genuinely diverge (the tunix Sampler is otherwise deterministic per seed).
+
+Findings from bringing RL up, each surfaced by a failed smoke: tunix enforces
+`max_tokens_to_generate == max_response_length` and `return_logprobs=True`, and
+`mini_batch_size` is in **prompts** (must divide `PROMPTS_PER_BATCH`, *not*
+prompts×generations). A real concurrency bug surfaced — G rollouts boot containers
+simultaneously and collided on `pid+ms` names (uuid fix). RL backprop OOMs at
+`remat=NONE` (forced because the rollout sampler mutates the KV-cache params, which
+conflicts with remat's trace level) unless TP shards the per-sequence activations
+(TP=4 fits 1.7B on v6e-4 — TP=1 OOMs; TP=8 fits 8B on v6e-16). The 8B fit envelope
+that ran clean: `MAX_PROMPT_LEN 4096 / MAX_RESPONSE_TOKENS 768 / MAX_TURNS 3`, ~4 min
+per step at G=2; node disk caps at 100 GB so RL must stay modest there.
 
 ## Next steps
 
-- **Eval the deep-SFT checkpoint** when it lands — the gate for RL is reward spread
-  (pass@k > pass@1 > 0); the 0/20 baseline has none, so RL would no-op (bimodal wall).
-- **8B RL run** — v6e-16, the deep-SFT ckpt, and the 8B memory-fit ladder (higher TP /
-  shorter seqs at `remat=NONE`). Pick RL tasks the SFT policy solves *sometimes*.
-- **Larger / generated SFT data**; **async RL rollouts** (may modify the tunix fork).
+- **Read the gate eval (in flight).** 5 sharded v6e-8 jobs are running pass@k
+  (k=5, temp 0.8, 10 turns) over all 70 TB-dev tasks on the deep checkpoint. Two
+  outcomes, both useful: (a) some tasks show `0 < pass1 < 1` → those are the RL
+  training set, launch the 8B run on them; (b) still 0 everywhere → the finding is
+  that 3-epoch SFT on 15.2k traces doesn't clear the TB-dev capability floor, and
+  the lever is **more/better SFT data**, not RL (RL would no-op on the bimodal wall).
+- **8B RL run** (machinery ready, validated config: v6e-16, TP=8, `--disk 100GB`,
+  deep ckpt, fit envelope above) — gated on (a) above. A known tension: the
+  memory-fit episode budget (3 turns) is tight for TB tasks; affording more turns
+  needs TP=16 or shorter sequences.
+- **Larger / generated SFT data** — the most likely real lever for the pass rate;
+  generate fresh traces from the agent's own rollouts. **Async RL rollouts** (may
+  modify the tunix fork) to decouple generation from the train step.
