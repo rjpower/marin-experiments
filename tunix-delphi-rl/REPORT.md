@@ -2,7 +2,7 @@
 
 **Marin Research Report · June 2026**
 
-Weaver issues #229 (feasibility) · #5 (agentic tool use) · #7 (agentic coding) · #8 (test-case curriculum → the clear RL win at 1.7B)
+Weaver issues #229 (feasibility) · #5 (agentic tool use) · #7 (agentic coding) · #8 (test-case curriculum → the clear RL win at 1.7B, §13) · the 2B-class capstone: marin's Delphi-1.9B vs Qwen3-1.7B up the chat → tool → agentic ladder (§14)
 
 ---
 
@@ -23,6 +23,8 @@ From there we escalated through five milestones, each a real run on TPU v6e:
 We then escalated once more — a **multi-turn coding agent** with a **test-case-graded reward and a difficulty curriculum**, built specifically to predict that Dr.GRPO would *finally beat SFT* (§11). At **447M it did not** (§12): the redesign **fixed the representation** (SFT now reaches pass@1 = 1.0 on every held-out level, vs. ~1/18 before), but RL moved held-out pass@1 by **exactly zero**, because the 447M genuinely cannot generalize to held-out families at this scale — `pass@16 = 0` there even with proper sampling, so RLVR has **no pass@k-to-pass@1 gap to compress**. (One honest correction along the way: the "*bimodal at every level, even at temperature 1.5*" framing was partly a **measurement bug** — tunix's `Sampler` decodes greedily unless `top_p` is passed, so our eval's *k* "draws" were one identical sequence; the held-out-`= 0` result survives re-measurement, the "no spread anywhere" generalization did not. §12/§13.)
 
 **So we acted on §12's own prescription — bigger base model + compositional problems — and got the clear win (§13).** On **Qwen3-1.7B-Base** (Delphi is a Qwen3, so it loads through the identical native path) with multi-stage problems and *sampled* pass@k, **Dr.GRPO lifts aggregate pass@1 from 0.289 → 0.466 (+61 %)** — the lift largest at pass@1 and shrinking with *k* (textbook pass@k compression), raising pass@16 to 1.0 on trained mid-levels, **and generalizing to held-out levels 7–9 it never trained on** (tier 7 pass@1 0.078 → 0.188). RL is decisive exactly when the model is *partially competent and unreliable*; tunix/iris delivers that win at the 1.7B scale.
+
+**Finally, the capstone (§14): the same ladder on marin's own model.** We walked **Delphi-1.9B** (`delphi-3e20-1.9Bparams-24.7Btokens`, width-matched to Qwen3-1.7B-Base; the live variable is pretraining tokens, **24.7B vs ≈36T, ~1500×**) up conversation → tool-calling → agentic coding against Qwen. **Post-training amplifies pretraining competence and creates none.** The gap is **invisible** where the task is memorizable — both reach chat turn-leak 0/8 in 200 steps; on the fixed coding ladder Delphi 40 ≈ Qwen 37 of 58 — and **decisive** where it demands generalization: few-shot coding pass@1 **0.003 vs 0.29**, and on the graded curriculum the same "up to shape" warm-up leaves Qwen's generalizing RL win intact (pass@1 0.242 → **0.451**, held-out 7–9 still lift) while Delphi never leaves the **0.003** floor. The deciding factor for whether RL helps is the base model's pretraining competence on the target skill — sampled few-shot pass@k before any RL — not the post-training recipe.
 
 > **What "grug-style model into tunix" meant in practice.** We read it as "bring a marin model into tunix," and the cheapest correct path is tunix's native NNX model zoo + a weight loader — **not** porting grug's `equinox.Module`. For Delphi this is exact and free. A *genuinely* grug-only architecture (e.g. an MoE GatedNorm/XSA variant with no HF equivalent) would still need the equinox→nnx port + KV-cache + RoPE-offset (Strategy A in `DESIGN.md`); we scope that as a separate follow-on.
 
@@ -344,7 +346,110 @@ This **empirically confirms** the risk flagged up front in [`RL_HEADROOM.md`](RL
 
 **Verdict (#8).** With a sound measurement (sampled pass@k), a base model above the sub-2B floor, and compositional problems, **Dr.GRPO on tunix/iris produces a clear, generalizing RL win over the few-shot base** — pass@1 +61 % relative, compressing the pass@k gap and transferring to held-out difficulty. This is the positive counterpart to §10/§12: RL is decisive exactly when the model is *partially competent and unreliable*, and tunix's GRPO on iris delivers it at the 1.7B scale.
 
-*Caveat:* eval is `n=8` problems/tier (72 total); the per-tier deltas (+0.13–0.31 on trained tiers) are well beyond sampling noise, but a larger-`n` confirmation would tighten the held-out figures. `train_curriculum` does not checkpoint the actor, so re-eval requires a re-run. *Reproduce:* `CURRIC_MODEL=qwen3 CURRIC_SFT_STEPS=0 CURRIC_TRAIN_LEVELS=1,2,3,4,5,6 CURRIC_EVAL_LEVELS=1,2,3,4,5,6,7,8,9 python launch_curriculum.py` on a v6e-8 (`--memory 200GB`).
+*Caveat:* eval is `n=8` problems/tier (72 total); the per-tier deltas (+0.13–0.31 on trained tiers) are well beyond sampling noise, but a larger-`n` confirmation would tighten the held-out figures. `train_curriculum` does not checkpoint the actor, so re-eval requires a re-run. *Reproduce:* `CURRIC_MODEL=qwen3 CURRIC_SFT_STEPS=0 CURRIC_TRAIN_LEVELS=1,2,3,4,5,6 CURRIC_EVAL_LEVELS=1,2,3,4,5,6,7,8,9 CURRIC_NUM_GENERATIONS=8 CURRIC_BATCH_SIZE=3 CURRIC_MAX_PROMPT=896 CURRIC_MAX_RESPONSE=512 CURRIC_LR=2e-6 python launch_curriculum.py` on a v6e-8 (`--memory 200GB`; the launcher's default `num_gen 16 × batch 8` rollout OOMs HBM on v6e-8, so shrink the shape as shown).
+
+---
+
+## 14. The 2B-class capstone: walking marin's own Delphi up the ladder, vs Qwen3-1.7B
+
+§13 won with Qwen3-1.7B-Base. The obvious question for marin is whether the *same* recipe carries one of marin's *own* models — so we took **Delphi-1.9B** (`marin-community/delphi-3e20-1.9Bparams-24.7Btokens`) and walked it up the full post-training ladder the brief implies: **conversational → tool-calling → agentic coding**, at each rung against Qwen3-1.7B-Base under a controlled comparison.
+
+**The comparison is built to isolate one variable: pretraining data.** Delphi-1.9B is width-matched to Qwen3-1.7B-Base (hidden 2048; Delphi is a Qwen3, so both load through the identical native path of §2/§13). The two differ almost entirely in pretraining token budget: **Delphi 24.7B tokens vs Qwen3 ≈36T**, about a **1500×** gap. Both are base LMs with no chat template. So every rung below is the same question asked at increasing difficulty: *does post-training close a 1500× pretraining gap, or only reveal it?*
+
+**Section takeaway.** Post-training amplifies pretraining competence; it does not create it. The gap is **invisible** at rungs a model can satisfy by memorizing a format or a fixed task set (conversation, the fixed coding ladder), and **decisive** at rungs that demand generalization to held-out problems (the graded curriculum). Same two models, opposite verdicts, depending only on whether the task rewards memorization or generalization.
+
+### 14.1 Conversational rung: format installs equally, content does not
+
+We SFT one model-agnostic plain-text ChatML format (`<|user|>` / `<|assistant|>`, loss masked to assistant content + EOS) on the `allenai/tulu-3-sft-mixture`, identically on both models — `training/chat_sft.py` + `launch_chat_sft.py`, 1500 steps, v6e-8 (`chat-delphi19-full`, `chat-qwen17-full`).
+
+**Format uptake is a tie.** Both base models start at turn-leak 8/8 (they ramble past the assistant turn and hallucinate further turns) and reach **0/8 — bounded, EOS-terminated — within 200 steps**. marin's 1.9B learns the chat *shape* as readily as Qwen. Format is data-cheap.
+
+**Content quality is a clear Qwen win.** On the same 8 held-out prompts, the two tie on easy factual/structured asks (capital of France; a study-tips list; summarize a neural network), and Qwen wins everything that needs knowledge or reasoning:
+
+- "Write a recursive factorial" → Qwen emits a correct recursive `factorial`; Delphi emits a Fibonacci-shaped function that does not compute factorial.
+- "Why is the sky blue?" → Qwen gives Rayleigh scattering; Delphi attributes it to water droplets.
+- "Say good morning in Spanish" → Qwen "¡Buenos días!"; Delphi "Hola" (= hello).
+- A speed/time word problem → Qwen uses the right method; Delphi answers 0.97 mph.
+
+Delphi also degenerates on open-ended generation: asked for a haiku, it emits "The ocean, salt water," repeated twelve times, the classic small/data-limited collapse. Chat behavior is a cheap skin both models wear. The competence underneath comes from pretraining, and only Qwen has it.
+
+### 14.2 Coding rung: Delphi is at the floor, and the bimodal wall reappears at 1.9B
+
+Before spending RL we ran a **few-shot coding probe** (eval-only, the §13 graded ladder; `delphi19-code-probe`): can the base model write a program at all?
+
+| model | few-shot pass@1 | few-shot pass@16 | fraction of generations that even run |
+|---|---|---|---|
+| Delphi-1.9B | **0.003** | **0.042** | **2–6 %** |
+| Qwen3-1.7B-Base | 0.29 | 0.79 | (majority) |
+
+Delphi-1.9B is at the floor — its generations rarely parse as runnable Python, let alone solve the task. Its 24.7B-token pretraining never installed code competence, so there is no few-shot `pass@k > pass@1 > 0` spread for RLVR to compress. This is exactly the precondition §12/§13 identified, now failing for Delphi where it held for Qwen.
+
+**SFT lifts Delphi off the floor but only memorizes.** `delphi19-code-sftrl` (agentic SFT 500 steps on levels 1–6, then curriculum Dr.GRPO 150, eval 1–9):
+
+- After SFT: trained levels **1–6 = 1.000** (fraction and pass@k), held-out levels **7–9 = 0.000**.
+- RL is a **no-op**: the reward is `1.0000` on essentially every step → zero GRPO advantage → no gradient. After-RL aggregate `pass@1 = pass@16 = 0.667` (6/9 levels solved, 3/9 at zero), unchanged from after-SFT.
+
+This reproduces the **447M bimodal wall** (§12) at 1.9B: saturated (= 1) in-distribution, incapable (= 0) on held-out, no pass@k spread anywhere, so RL has nothing to compress. The extra capacity over 447M did not buy held-out generalization; the pretraining-data gap did not move.
+
+### 14.3 Multi-turn agentic capstone on a fixed ladder: non-discriminating
+
+We then built the full "up to shape" multi-turn agent and ran both models head-to-head: load → **chat + tool-use SFT** (tulu-3 + a `smoltalk2` tool-use mixture via `load_up_to_shape_mixture`, 600 steps) → **code-agent SFT** (multi-turn write→run→revise format, 500 steps) → **multi-turn Dr.GRPO** (60 steps, 4 rounds). The task is the **fixed** `coding_tasks` ladder (the §9 ladder, 58 eval tasks), train tiers 1–4, eval 1–5 with tier 5 held out. Greedy multi-turn eval, first-attempt vs best-across-rounds (`delphi19-mt-capstone`, `qwen17-mt-capstone`).
+
+| | Delphi-1.9B after-SFT → after-RL | Qwen3-1.7B after-SFT → after-RL |
+|---|---|---|
+| tier 1 (train) | 10/10 → 10/10 | 9/10 → 10/10 |
+| tier 2 (train) | 8/10 → 9/10 | 10/10 → 10/10 |
+| tier 3 (train) | 9/10 → 9/10 | 7/10 → 8/10 |
+| tier 4 (train) | 10/10 → 10/10 | 10/10 → 8/10 |
+| tier 5 (held-out) | 2/18 → 2/18 | 0/18 → 1/18 |
+| **total (best/58)** | **39 → 40** | **36 → 37** |
+
+The two models are **tied within noise** (Delphi 40, Qwen 37 of 58), which is itself the finding. The fixed ladder is **memorization-dominated on the trained tiers** — `add`/`sum`/`fib`/`factorial` with fixed gold outputs, which both models SFT-saturate, so the pretraining gap is invisible exactly as it was at the chat-format rung — plus a **held-out cliff** at tier 5 (`bubble_sort`/`digital_root`/`fizzbuzz`, structurally novel) that floors both. Two further observations:
+
+- **Multi-turn repair buys almost nothing at 2B.** Best-across-rounds barely exceeds first-attempt (Qwen 37 = 37; Delphi 40 vs 39). Failed tier-5 transcripts spend all four rounds emitting garbled revisions (`"0 else 'FizzBuzz')"`, `"for i in 6)"`) rather than reading the execution feedback and fixing the program. The write→run→revise loop did not install a repair policy at this scale with this recipe.
+- The "up to shape" warm-up successfully installed conversational + tool-call behavior on both models, and **did not change the coding outcome** — consistent with §14.1/§14.2.
+
+### 14.4 The discriminating head-to-head: "up to shape" on the graded curriculum
+
+§14.3 was non-discriminating because the fixed ladder rewards memorization. The task that *does* separate the two models is the **graded curriculum** of §13 — parameterized families with sampled `pass@k`, where Qwen has partial competence everywhere and RL generalizes to held-out levels 7–9. To test whether the conversational/tool warm-up changes that, we **prepended the same "up to shape" Stage-0 (chat + tool-use SFT, 600 steps) to the §13 curriculum recipe and re-ran both models** — otherwise matched to §13 (few-shot base into curriculum Dr.GRPO over levels 1–6, eval 1–9, `num_gen 8 × batch 3`, lr 2e-6, rounds 2, sampled pass@16, eval `n=8`/tier, v6e-8). This adds exactly one variable on top of §13: the warm-up. (Runs `qwen17-curric-ups3` / `delphi19-curric-ups3`, `--memory 500GB` — the host-side micropython grading high-water exceeds 200GB once the chat-SFT prefix raises the resident baseline, the same host-grading cost flagged in §12.)
+
+**Qwen keeps the clear, generalizing RL win; Delphi stays on the floor.** Aggregate pass@k (72 tasks, k=16, temp 1.0), few-shot (post-warm-up) → after-RL:
+
+| | Qwen3-1.7B few-shot → after-RL | Delphi-1.9B few-shot (RL cut) |
+|---|---|---|
+| pass@1 | 0.242 → **0.451** | **0.003** |
+| pass@4 | 0.527 → 0.700 | 0.013 |
+| pass@16 | 0.722 → 0.861 | 0.042 |
+
+For Qwen the warm-up *lowered* the few-shot baseline relative to §13 (pass@1 0.289 → 0.242), but RL recovered it to essentially the §13 after-RL ceiling (**0.451 vs 0.466**) and **still generalized to the held-out levels**: tier 7 pass@1 0.094 → 0.219, tier 8 0.031 → 0.133, tier 9 0.070 → 0.109. The compression signature is intact (lift +0.21 at pass@1, shrinking to +0.14 at pass@16). The up-to-shape warm-up did not change Qwen's wall — the win is robust to it.
+
+For Delphi the warm-up moved coding competence by **zero**: post-warm-up few-shot pass@1 = 0.003, pass@16 = 0.042 — identical to the §14.2 probe, with 1–9 % of generations even running. With no pass@k spread there is nothing for RL to compress, exactly as in §12 and §14.2. We **cut Delphi's RL run after ~4 h** without an after-RL measurement: its floor-level generations never emit a terminating token, so every rollout runs the full 512-token budget twice per round across 24 trajectories and grades slowly on the host (vs Qwen's ~2 h, whose programs terminate early), and the loop had not reached the after-RL eval. The number is therefore unmeasured, but the outcome is fixed by the baseline — a `pass@1 = 0.003` / `pass@16 = 0.042` policy has no spread — and Delphi's curriculum RL was already shown to be a no-op in §14.2 (there `reward = 1.0` every step on the SFT-saturated variant; here it is the mirror case, reward near zero with no variance). Either way the gradient vanishes.
+
+### 14.5 Verdict: post-training amplifies pretraining competence; gap visibility is task-dependent
+
+The discriminating run settles it: the same "up to shape" warm-up is roughly neutral for Qwen (RL still wins and generalizes, 0.242 → 0.451) and useless for Delphi (still 0.003 at the floor). Across all four rungs the constant is that **post-training amplifies what pretraining already seeded and creates nothing new**. Delphi-1.9B matched Qwen on every task a model can pass by memorizing (chat format, the fixed coding ladder's trained tiers) and fell to the floor on every task requiring held-out generalization (the few-shot coding probe, the graded curriculum). RL specifically requires a `pass@k > pass@1 > 0` regime to do its work (§12/§13); Qwen's ≈36T-token base supplies that spread, Delphi's 24.7B-token base does not, and no amount of chat/tool/agentic SFT conjured it. The actionable form: **the deciding factor for whether RL post-training helps is the base model's pretraining competence on the target skill, measured as sampled few-shot `pass@k` before any RL — not the post-training recipe.**
+
+---
+
+## Addendum: the full path
+
+This is the chronological version of the project, including the turns that did not work, kept because the dead-ends are part of the result.
+
+**The brief, and the assumption that turned out wrong.** The task was to evaluate adopting google/tunix on iris and bring a marin "grug-style" model into it, with the expected hard part being a port of grug's `equinox` transformer (forward-only, no KV-cache) into tunix's `flax.nnx` world plus a hand-built sampler. The first thing we checked — Delphi's `config.json` — said `Qwen3ForCausalLM`. Delphi is a dense Qwen3, tunix already ships a native nnx Qwen3 with the full sampler/KV-cache contract, and all 124 safetensors tensors matched tunix's key-map at the byte level. The anticipated multi-week port collapsed to a config + a loader + one bug fix (§2).
+
+**The one real tunix bug.** Loading was 96% right, which on a logit comparison is wrong. tunix's qwen3 `apply_rope` never threads `config.rope_theta` (Delphi uses 500000, not the 1e6 default), and it does not model Llama-3 `rope_scaling` at all — which, contrary to our first guess, is *not* inert at short context. Fixing both yields exact HF parity (top-1 100%, logit MSE 7e-12). We ship it as both an upstreamable patch and a worker-side monkeypatch (§3.1). This bug also affects tunix's llama3.
+
+**De-risking in the cheap order.** Design before code, parity before learning, CPU before TPU. A "print more cats" toy GRPO (fresh tiny Qwen3 rewarded for emitting "cats") learned 0.08 → 1.00 on CPU, then on a v6e-4 iris job — so every later failure could be blamed on the model or task, never the plumbing (§4).
+
+**Arithmetic, and a law we did not expect.** Delphi learned single-digit addition (6% → 65%) and solve-for-x linear algebra (5% → 37%) with a plain exact-match reward. The surprise was the failure pattern: learnability tracked **answer-space density, not symbolic difficulty**. Linear algebra (answer is one of 19 small integers) is *easier* for RL than 2-digit multiplication (thousands of possible answers) because a dense answer space gives the GRPO group non-zero reward variance, hence a gradient. Proximity shaping recovered the flat stages, confirming the stall was missing gradient, not inability (§5).
+
+**Tool use needed RL; coding did not.** Delphi learned genuine multi-step calculator use — up to three chained `CALC(...)` calls at ~100% — but only with a prefix-aligned SFT warm-up; plain RL drove the tool *call* to near-perfect while the *copy-the-result-forward* step stayed at ~0.1, because that copy is out-of-distribution for the base LM and RL only sharpens what the base policy samples (§8). Then the mirror image: given a `micropython` interpreter as grader, Delphi-447M went few-shot 3/50 → SFT 50/50 writing real recursive programs, and Dr.GRPO added nothing — because writing a program is fully demonstrable by SFT, so SFT does the whole job (§9). The cross-experiment rule: RL earns its keep only for a narrow behavior that must be amplified from rare base-model samples (§10). The load-bearing infrastructure finding underneath both: unclipped multi-turn GRPO does not wobble, it crashes — `inf`/`NaN` grads surface as a libtpu `SIGSEGV` — so gradient clipping is mandatory, not a tuning knob.
+
+**The prediction we set out to falsify, and the measurement bug we found doing it.** We built a test-case-graded difficulty curriculum specifically to predict Dr.GRPO would finally beat SFT on hard multi-turn coding. At 447M it did not (§12): SFT reached pass@1 = 1.0 on every held-out level, RL moved held-out pass@1 by exactly zero. The clean diagnosis was almost derailed by a measurement bug — tunix's `Sampler` decodes greedily unless `top_p` is passed, so every pass@k "draw" was the identical argmax sequence, faking `pass@1 = pass@k` everywhere. Re-measured with `top_p = 1.0`, the held-out `= 0` result survived (a genuine capability floor) but the "no spread anywhere" generalization did not. The RL rollout path was never affected; only the eval lens was broken (§12/§13).
+
+**The clear win, on §12's own prescription.** Bigger base model + compositional problems. Qwen3-1.7B-Base on a 1–9 graded curriculum: Dr.GRPO lifted aggregate pass@1 0.289 → 0.466 (+61%), with the three textbook RLVR signatures at once — the lift largest at pass@1 and shrinking with k (compression), pass@16 → 1.0 on trained mid-levels (ceiling raised), and held-out levels 7–9 lifting too (generalization). RL is decisive exactly when the model is partially competent and unreliable, and tunix/iris delivers it at 1.7B (§13).
+
+**The capstone: the same ladder on marin's own model.** Walking Delphi-1.9B up conversation → tool-calling → agentic coding against Qwen3-1.7B-Base (§14) reduced to a single controlled question — does post-training close a 1500× pretraining-token gap? — and answered it the same way at every rung: the gap is invisible where the task can be memorized and decisive where it demands generalization. The iris/TPU plumbing and the tunix RL math worked unchanged from the first toy to the last capstone; the binding constraint, in every milestone, was the base LM's pretraining priors.
 
 ---
 
