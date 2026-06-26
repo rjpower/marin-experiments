@@ -53,8 +53,48 @@ def _build_kvstore_spec(path: str) -> dict:
         raise ValueError(f"Unsupported URI scheme for tensorstore: {parsed.scheme!r} in {path!r}")
 
 
+def _configure_fsspec_virtual_hosted() -> None:
+    """levanter also uses fsspec/s3fs (NOT tensorstore) for cache metadata + mkdirs. s3fs/botocore
+    default to PATH-STYLE against a custom endpoint, which cwobject rejects. botocore reads the
+    addressing style from the shared AWS config file, so write one forcing virtual-hosted and
+    point AWS_CONFIG_FILE at it. (boto/s3fs/aiobotocore all honor it; tensorstore does not, but
+    that side is handled by the empty-bucket spec above.)"""
+    cfg_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "cw_aws_config")
+    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
+    try:
+        with open(cfg_path, "w") as f:
+            f.write(f"[default]\nregion = {region}\ns3 =\n    addressing_style = virtual\n")
+        os.environ["AWS_CONFIG_FILE"] = cfg_path
+    except Exception as e:  # best-effort
+        print(f"[cw_patch] could not write AWS config: {e}", flush=True)
+
+
+def _patch_mkdirs() -> None:
+    """s3 has no real directories; on a virtual-host-only store (cwobject) the bucket already
+    exists and ``makedirs`` may try (and fail) to ``create_bucket``. Reads/writes create keys
+    directly, so swallow bucket/region create errors instead of crashing the cache open."""
+    try:
+        import levanter.utils.fsspec_utils as _fsu
+    except Exception:
+        return
+    _orig = _fsu.mkdirs
+
+    def _safe_mkdirs(path):
+        try:
+            _orig(path)
+        except Exception as e:
+            msg = str(e)
+            if str(path).startswith(("s3://", "s3a://")) or any(
+                t in msg for t in ("Bucket", "bucket", "Region", "PathStyle", "CreateBucket")
+            ):
+                return
+            raise
+
+    _fsu.mkdirs = _safe_mkdirs
+
+
 def apply() -> None:
-    """Monkeypatch every import site of build_kvstore_spec. Idempotent."""
+    """Monkeypatch every import site of build_kvstore_spec + configure fsspec. Idempotent."""
     import levanter.tensorstore_serialization as _tss
     _tss.build_kvstore_spec = _build_kvstore_spec
     # jagged_array did `from levanter.tensorstore_serialization import build_kvstore_spec`,
@@ -65,7 +105,10 @@ def apply() -> None:
     except Exception:
         pass
     if _virtual_hosted_enabled():
-        print(f"[cw_patch] virtual-hosted S3 ENABLED (endpoint={os.environ.get('AWS_ENDPOINT_URL')})", flush=True)
+        _configure_fsspec_virtual_hosted()
+        _patch_mkdirs()
+        print(f"[cw_patch] virtual-hosted S3 ENABLED (endpoint={os.environ.get('AWS_ENDPOINT_URL')}, "
+              f"AWS_CONFIG_FILE={os.environ.get('AWS_CONFIG_FILE')})", flush=True)
 
 
 # apply on import for convenience
