@@ -83,6 +83,25 @@ Loss-vs-tokens so far: spr1 — 49M→6.12, 95M→4.47, 144M→4.41, 425M→3.73
 5. **PRs**: open a marin PR (cwobject/virtual-host data-path support) via sub-agent; open the
    megagpt-speedrun PR (don't merge); `weaver issue close 310` when done.
 
+## Status update (2026-06-26 ~17:10Z) — PRODUCTION LAUNCHED + cwobject train-path FIXED
+- **24h PRODUCTION pretrain launched**: `megagpt-prod-pre` — E64/b16, **R2 full nemotron**
+  (`SP_DATA=datakit`), **cosine-WSD** (`SP_WARMUP=0.02 SP_MIN_LR=0.0`, decay-to-0 over the run),
+  `SP_TOKENS=7.0e9` ⇒ 106,812 steps ≈ 18.5h clean @105k tok/s. Perplexity/bpb headline taken at
+  end. Then **SFT cooldown** (`SP_DATA=sft SP_INIT_FROM=<ckpt> SP_SCHEDULE=linear SP_REWARMUP
+  ~0.03 SP_MIN_LR=0` ~3.5h) → chat model. R2 path proven by spr1 (same geom, 1.6 it/s clean).
+- **cwobject training path FIXED + root-caused.** The leak: iris seeds `fsspec.config.conf['s3']`
+  (from `FSSPEC_S3_*` env) with the **R2 endpoint**; fsspec injects that into every
+  `S3FileSystem` as EXPLICIT kwargs, beating our `AWS_ENDPOINT_URL` override → executor
+  `write_infos` PutObject hit **R2** with the 16-char CW key → `InvalidArgument: access key length
+  16, should be 32`. (Two earlier dead-ends: `AWS_ENDPOINT_URL_S3` — iris doesn't set it; s3fs
+  `client_kwargs['endpoint_url']` — collides with `init_kwargs` → "multiple values".) Fix in
+  `cw_patch.py`: (a) import cw_patch FIRST in launch.py; (b) `_override_fsspec_conf()` rewrites
+  `fsspec.config.conf['s3']` → cwobject; (c) `_patch_s3fs_client()` FORCEs top-level
+  endpoint_url/key/secret + virtual addressing + us-east-1 and pops any client_kwargs endpoint_url;
+  (d) region forced us-east-1 (iris sets it "auto"). Verified locally under the exact worker env
+  (FSSPEC_S3_ENDPOINT_URL=R2 injected) AND on the worker: `cwA5` passes `write_infos` with 0 S3
+  errors. Canary confirming first training step; then E64/E256/E128 sweep on cwobject proofpile.
+
 ## Status update (2026-06-26 ~16:10Z)
 - cwobject is **working end-to-end**: tensorstore 0.1.84 (override marin-levanter's <0.1.82 cap)
   + `cw_patch.py` (empty-bucket virtual-host tensorstore spec; s3fs forced to virtual via an

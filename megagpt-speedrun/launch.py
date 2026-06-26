@@ -53,6 +53,11 @@ import os
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+# MUST be imported BEFORE marin/levanter so its in-process S3 env override + s3fs client patch are
+# installed before any cached boto/s3fs session is created at their import time (otherwise an s3fs
+# instance gets cached pointing at iris's R2 endpoint and our cwobject writes leak to R2).
+import cw_patch  # noqa: F401  -- redirects S3 to cwobject (virtual-hosted) when LEVANTER_S3_VIRTUAL_HOSTED=1
+
 import jmp
 from fray.cluster import ResourceConfig
 from levanter.callbacks.profiler import ProfilerConfig
@@ -66,7 +71,6 @@ from marin.execution.executor import executor_main
 from marin.execution.types import ExecutorStep, this_output_path, versioned
 from marin.training.training import temporary_checkpoint_base_path
 
-import cw_patch  # noqa: F401  -- monkeypatches build_kvstore_spec for cwobject virtual-hosted S3
 from data import (
     build_fineweb_edu_mix,
     build_nemotron_cw_mix,
