@@ -149,6 +149,13 @@ def build_train_loader(
         axis_resources={"__BATCH__": _BATCH_AXES},
         batch_axis_name="__BATCH__",
         allow_nondivisible_batch_size=False,
+        # Deeper prefetch to ride out cold first-touch reads at block-shuffle window
+        # boundaries. The real win is the read cache (LEVANTER_TS_CACHE_LIMIT, set in
+        # launch_cw.sh) sized to hold the whole run's ~21GB working set in RAM; this
+        # buffer just smooths the warmup reads that fill it. Buffered batches are tiny
+        # device arrays (b8: ~0.25MB each), so 128 is ~32MB HBM -- safe.
+        max_buffered_batches=128,
+        prefetch_size=64,
     )
 
 

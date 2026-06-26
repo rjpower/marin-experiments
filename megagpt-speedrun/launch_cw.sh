@@ -24,6 +24,15 @@ ARGS=(
   # materialization that OOMs (hundreds of GiB) at this deeply-sparse 15B geometry. The
   # triton kernel streams it. (dispatch.py forwards RAGGED_DOT_IMPL to the train task.)
   -e RAGGED_DOT_IMPL triton
+  # TensorStore read cache pool. The tokenized cache stores 64 seqs / 1MB chunk, and reads
+  # coalesce per-chunk through this pool. The default 1GB is SMALLER than one block-shuffle
+  # window's ~2GB working set -> chunks get evicted before their 64 seqs are consumed -> R2
+  # re-fetch thrash -> the periodic data-loader stalls (and, worst case, a hung R2 GET that
+  # blocks the whole batch for hours). This run only touches ~21GB of unique data total, so a
+  # 32GB pool holds the entire working set in RAM (worker has 512GB): each chunk is fetched
+  # from R2 ~once, then served from memory. Keep the block shuffle (full scatter would hit a
+  # distinct chunk per seq = ~64x more R2 GETs).
+  -e LEVANTER_TS_CACHE_LIMIT 34359738368
   -e SP_TOKENS "$TOKENS" -e SP_GROUP "$GROUP"
 )
 [[ -n "$STEPS" ]] && ARGS+=( -e SP_STEPS "$STEPS" )
