@@ -66,7 +66,13 @@ from marin.execution.executor import executor_main
 from marin.execution.types import ExecutorStep, this_output_path, versioned
 from marin.training.training import temporary_checkpoint_base_path
 
-from data import build_fineweb_edu_mix, build_nemotron_datakit_mix, build_nemotron_mix
+import cw_patch  # noqa: F401  -- monkeypatches build_kvstore_spec for cwobject virtual-hosted S3
+from data import (
+    build_fineweb_edu_mix,
+    build_nemotron_cw_mix,
+    build_nemotron_datakit_mix,
+    build_nemotron_mix,
+)
 from heuristic import MoeAdamHHeuristic, build_from_heuristic, compute_flops_per_token
 from model import GrugModelConfig
 from train import GrugRunConfig, GrugTrainerConfig, _run_grug_local
@@ -347,6 +353,13 @@ def _make_step() -> ExecutorStep:
         # The real CoreWeave pretraining data: nemotron datakit flat parquet on R2
         # (llama3 vocab 128256). smoke -> a single high-quality split for a fast path check.
         data = build_nemotron_datakit_mix(smoke=smoke)
+    elif data_kind == "cw":
+        # SAME caches as `datakit`, but read from the CoreWeave cluster-local cwobject mirror
+        # (much faster than R2; no cross-stream contention -> enables concurrent runs). Requires
+        # the cwobject env (AWS_*=CW creds, AWS_ENDPOINT_URL, LEVANTER_S3_VIRTUAL_HOSTED=1) and a
+        # completed mirror. SP_CW_COMPONENTS (comma list) limits to mirrored components.
+        only = [c.strip() for c in _env("SP_CW_COMPONENTS", "").split(",") if c.strip()]
+        data = build_nemotron_cw_mix(smoke=smoke, only=only or None)
     elif data_kind == "sft":
         # SFT cooldown mixture (chat, assistant-only loss): tulu-3 + smoltalk + OpenThoughts-Agent,
         # tokenized inline from HF on the worker -> R2. Pair with SP_INIT_FROM (resume the pretrain
@@ -360,7 +373,7 @@ def _make_step() -> ExecutorStep:
         # gs:// caches -- NOT readable on CoreWeave (R2-only); kept for TPU/GCP parity.
         data = build_nemotron_mix(region=data_region)
     else:
-        raise ValueError(f"SP_DATA must be 'datakit', 'sft', 'fineweb', or 'nemotron', got {data_kind!r}")
+        raise ValueError(f"SP_DATA must be 'datakit', 'cw', 'sft', 'fineweb', or 'nemotron', got {data_kind!r}")
 
     launch = GrugMoeLaunchConfig(
         model=versioned(model),

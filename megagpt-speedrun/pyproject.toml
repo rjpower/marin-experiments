@@ -83,6 +83,10 @@ override-dependencies = [
     "wheel>=0.46.2",
     "datasets>=3.1.0,<4.0.0",
     "equinox>=0.11.10",
+    # marin-levanter caps tensorstore <0.1.82, but 0.1.84 (google/tensorstore#285) is
+    # REQUIRED to address CoreWeave cwobject (empty bucket + virtual-hosted endpoint;
+    # cwobject rejects path-style). Override the cap -- 0.1.84 is API-compatible.
+    "tensorstore>=0.1.84",
 ]
 
 # The marin-* dev wheels resolve from PyPI (marin-core, marin-levanter, ... as

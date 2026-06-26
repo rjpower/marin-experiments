@@ -148,14 +148,47 @@ _NEMOTRON_R2_COMPONENTS: dict[str, tuple[str, float]] = {
 _NEMOTRON_R2_SMOKE = {"nemotron_cc/hq_actual": ("tokenized/nemotron_cc/hq_actual-5af4cc", 1.0)}
 
 
-def _r2_cache_component(rel: str, tags: list[str]) -> DatasetComponent:
-    """A Levanter component over an R2 ``tokenized/`` TreeCache root (split appended -> /train)."""
+def _r2_cache_component(rel: str, tags: list[str], prefix: str = _R2_TOK_PREFIX) -> DatasetComponent:
+    """A Levanter component over a ``tokenized/`` TreeCache root (split appended -> /train).
+
+    ``prefix`` selects the store: ``_R2_TOK_PREFIX`` (Cloudflare R2, default) or
+    ``_CW_TOK_PREFIX`` (CoreWeave cwobject mirror -- read with the cwobject env + the
+    LEVANTER_S3_VIRTUAL_HOSTED virtual-hosted patch).
+    """
     return DatasetComponent(
         source=None,
-        cache_dir=InputName.hardcoded(f"{_R2_TOK_PREFIX}/{rel}"),
+        cache_dir=InputName.hardcoded(f"{prefix}/{rel}"),
         format=TextLmDatasetFormat(),
         tags=tags,
         flat_cache=False,  # cache_root/<split>; the train split has the shard_ledger.json
+    )
+
+
+# cwobject mirror prefix: mirror_to_cw.py copies R2 ``marin/tokenized/<rel>`` ->
+# ``marin-us-east-02a/marin/tokenized/<rel>`` (same rel paths / cache hashes as R2).
+_CW_TOK_PREFIX = "s3://marin-us-east-02a/marin"
+
+
+def build_nemotron_cw_mix(smoke: bool = False, only: list[str] | None = None):
+    """Nemotron mixture read from the cwobject mirror (cluster-local). Identical caches/weights
+    to ``build_nemotron_datakit_mix``; only the storage prefix differs. ``only`` restricts to a
+    subset of component names (use the components that have finished mirroring)."""
+    table = _NEMOTRON_R2_SMOKE if smoke else _NEMOTRON_R2_COMPONENTS
+    if only:
+        table = {k: v for k, v in table.items() if k in only}
+        if not table:
+            raise ValueError(f"build_nemotron_cw_mix: none of {only} in {list(_NEMOTRON_R2_COMPONENTS)}")
+    components = {
+        name: _r2_cache_component(rel, name.split("/"), prefix=_CW_TOK_PREFIX)
+        for name, (rel, _) in table.items()
+    }
+    weights = {name: w for name, (_, w) in table.items()}
+    return LmDataConfig(
+        tokenizer=MARIN_TOKENIZER,
+        cache_dir=None,
+        components=components,
+        train_weights=[(0, weights)],
+        auto_build_caches=False,
     )
 
 
