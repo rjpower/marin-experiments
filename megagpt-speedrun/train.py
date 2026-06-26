@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -115,6 +116,18 @@ def build_train_dataset(
 ) -> MixtureDataset[GrugLmExample]:
     pos = Axis("position", max_seq_len)
     mix_key, shuffle_key = jax.random.split(key)
+    # Throughput-benchmark mode: random in-memory data, no storage/dataloader cold-start, so the
+    # measured tok/s is pure compute (not data I/O). Loss is meaningless -- benchmarks only.
+    if os.environ.get("SP_SYNTH_DATA", "").strip().lower() in ("1", "true", "yes"):
+        from synth_data import make_synthetic_mixture
+
+        return make_synthetic_mixture(
+            seq_len=max_seq_len,
+            vocab_size=data_config.the_tokenizer.vocab_size,
+            key=mix_key,
+            stop_strategy=data_config.stop_strategy,
+            block_size=data_config.mixture_block_size,
+        )
     weights = data_config.train_weights
     if isinstance(weights, list):
         weights = rescale_mixture_schedule_for_batch_schedule(weights, batch_schedule)

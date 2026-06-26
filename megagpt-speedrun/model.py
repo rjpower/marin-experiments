@@ -105,8 +105,11 @@ def _batch_reshard(x: jax.Array) -> jax.Array:
     return reshard(x, _batch_spec())
 
 
-def _layer_attention_masks(mask: AttentionMask, *, sliding_window: int) -> tuple[AttentionMask, AttentionMask]:
-    return mask.with_sliding_window(sliding_window // 2), mask.with_sliding_window(sliding_window)
+def _layer_attention_masks(
+    mask: AttentionMask, *, sliding_window: int, local_window: int = 0
+) -> tuple[AttentionMask, AttentionMask]:
+    local = local_window if local_window > 0 else sliding_window // 2
+    return mask.with_sliding_window(local), mask.with_sliding_window(sliding_window)
 
 
 @dataclass(frozen=True)
@@ -154,6 +157,13 @@ class GrugModelConfig:
     head_dim: int | None = None
     max_seq_len: int = 4096
     sliding_window: int = 4096
+    global_attn_every: int = 4
+    """Global/local attention interleave: every Nth layer uses GLOBAL (full sliding_window)
+    attention, the rest use a small LOCAL window. Period = global_attn_every (4 -> 3 local:1
+    global, the legacy pattern; 6 -> 5:1; 8 -> 7:1). Larger = fewer global layers = cheaper attn."""
+    local_window: int = 0
+    """Window size for the LOCAL (non-global) layers. 0 -> sliding_window // 2 (legacy). Set small
+    (e.g. 512/1024) to make local layers cheap regardless of seq length."""
     layer_norm_eps: float = 1e-5
     initializer_std: float = 0.02
     qk_mult: float = 1.0
@@ -743,7 +753,9 @@ class Transformer(eqx.Module):
 
         if not isinstance(mask, AttentionMask):
             mask = AttentionMask.causal()
-        short_mask, long_mask = _layer_attention_masks(mask, sliding_window=cfg.sliding_window)
+        short_mask, long_mask = _layer_attention_masks(
+            mask, sliding_window=cfg.sliding_window, local_window=cfg.local_window
+        )
 
         if cfg.remat_mode == "save_moe":
             remat_policy = jax.checkpoint_policies.save_only_these_names(*MOE_REMAT_SAVE_NAMES)
@@ -752,7 +764,8 @@ class Transformer(eqx.Module):
 
         moe_router_stats: list[dict[str, jax.Array]] = []
         for i, block in enumerate(self.blocks):
-            layer_mask = long_mask if i % 4 == 3 else short_mask
+            g = max(1, cfg.global_attn_every)
+            layer_mask = long_mask if (i % g) == (g - 1) else short_mask
             hidden, router_stats = eqx.filter_checkpoint(block, policy=remat_policy)(hidden, layer_mask)
             moe_router_stats.append(router_stats)
 

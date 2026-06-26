@@ -221,6 +221,12 @@ def _make_step() -> ExecutorStep:
     # depends on D/tokens/batch, not I); iso-token budgeting uses the reference (heuristic-I)
     # model, so the token count is unchanged and only wall-clock FLOPs grow.
     intermediate = int(_env("SP_INTERMEDIATE", "0"))
+    # Global/local attention interleave (a top attention-throughput lever): SP_GLOBAL_EVERY = the
+    # period N so every Nth layer is GLOBAL (full sliding_window) and the rest are LOCAL. 4 -> the
+    # legacy 3 local:1 global; 6 -> 5:1; 8 -> 7:1. SP_LOCAL_WINDOW sets the local-layer window
+    # (0 -> sliding_window//2). Smaller window + larger period = much cheaper attention.
+    global_every = int(_env("SP_GLOBAL_EVERY", "0"))
+    local_window = int(_env("SP_LOCAL_WINDOW", "0"))
 
     # LR-schedule overrides (for WSD pretrain->cooldown phasing). The heuristic fixes the LR
     # *magnitude* (from D/tokens/batch) and a default warmup=0.1 + linear-decay-to-0 shape.
@@ -324,6 +330,10 @@ def _make_step() -> ExecutorStep:
     )
     if intermediate > 0:
         overrides["intermediate_dim"] = intermediate
+    if global_every > 0:
+        overrides["global_attn_every"] = global_every
+    if local_window > 0:
+        overrides["local_window"] = local_window
     model = dataclasses.replace(model, **overrides)
     batch = int(_env("SP_BATCH", str(ref_batch)))
     steps = int(_env("SP_STEPS", str(ref_steps)))
