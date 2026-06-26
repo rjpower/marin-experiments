@@ -18,6 +18,10 @@ KUBECONFIG=~/.kube/coreweave-iris-gpu uv run iris --cluster=cw-us-east-02a job <
 - Worker log timestamps are **UTC**; your laptop may be UTC-4. Don't try to reconcile the
   data-loader "N seconds" timer against submit time — it counts from when the loader thread
   started (after process init / during compile), not from step 0.
+- **`job logs <name>` mixes the prior killed attempt's tail with the new run's logs** (same job
+  name → same stream). After a kill+relaunch you'll see the dead job's last `Data loading…`
+  warnings *above* the new job's startup lines. Don't diagnose a hang off those stale lines —
+  check that recent `train …it` step numbers are **advancing** (and look at the line timestamps).
 
 ## MONITOR FOR SILENT DATA-LOADING HANGS  ← the one that bit us
 
