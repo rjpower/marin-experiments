@@ -83,6 +83,23 @@ Loss-vs-tokens so far: spr1 — 49M→6.12, 95M→4.47, 144M→4.41, 425M→3.73
 5. **PRs**: open a marin PR (cwobject/virtual-host data-path support) via sub-agent; open the
    megagpt-speedrun PR (don't merge); `weaver issue close 310` when done.
 
+## Status update (2026-06-26 ~16:10Z)
+- cwobject is **working end-to-end**: tensorstore 0.1.84 (override marin-levanter's <0.1.82 cap)
+  + `cw_patch.py` (empty-bucket virtual-host tensorstore spec; s3fs forced to virtual via an
+  AWS config file; tolerant `mkdirs`). Verified: `TreeStore.open` loads the mirrored proofpile
+  cache from cwobject (11.3M rows) and decodes correct llama3 tokens.
+- Mirror (`megagpt-cwmirror`): smallest-first, ~220 MB/s. proofpile_2 (173 GB) DONE;
+  starcoderdata (691 GB) copying; `MIRROR_MAX_GB=600` stops after those two (~865 GB bootstrap).
+  Giant nemotron tiers (1.4–3.6 TB each) deferred.
+- marin PR **#6686** open: `build_kvstore_spec` virtual-hosted support (env-gated, backwards-compat).
+- Config sweep on cwobject proofpile (same-data, constant LR, 5.4B horizon): `cwA`=E64/b16,
+  `cwB`=E256/b8 launched; will add cwC=E128/b16, cwD=E64/b32. spr1 (R2 nemotron E64/b16) kept
+  as the nemotron reference (loss 3.35 @ 753M tok).
+- Decision pending: E64/b16 (fast, fits, ~105k tok/s) vs E256/b8 (better loss/token ~6%, ~82k
+  tok/s; E256/b16 OOMs). cwobject sweep settles it on clean concurrent wall-clock.
+- Data plan: experiments on cwobject (fast, concurrent); **24h production on R2 full nemotron
+  mix** (proven solo) unless a nemotron tier is mirrored in time.
+
 ## Ops gotchas
 - Monitor for SILENT data-loader hangs (job stays "running", step frozen, "Data loading is
   taking a long time" warnings; `--max-retries` does NOT recover). See `ops.md`.

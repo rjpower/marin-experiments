@@ -53,6 +53,42 @@ def _build_kvstore_spec(path: str) -> dict:
         raise ValueError(f"Unsupported URI scheme for tensorstore: {parsed.scheme!r} in {path!r}")
 
 
+def _override_s3_env_in_process() -> None:
+    """iris injects AWS_ENDPOINT_URL (the cluster's R2 endpoint) at a layer that OVERRIDES the
+    job's ``-e`` flags, so we cannot point the process at cwobject from the launcher. Override it
+    IN-PROCESS here (cw_patch is imported first in launch.py, before any s3 client / the marin
+    executor runs). The intended endpoint comes from ``CW_S3_ENDPOINT`` (a non-AWS_-named var
+    iris leaves alone); creds come from ``CW_KEY_ID``/``CW_KEY_SECRET``. After this, the WHOLE
+    process (marin executor + checkpoints + data, via env-based s3fs/tensorstore) talks cwobject.
+    iris's own R2 state lives in a separate agent process and is unaffected."""
+    ep = os.environ.get("CW_S3_ENDPOINT", "https://cwobject.com")
+    os.environ["AWS_ENDPOINT_URL"] = ep
+    if os.environ.get("CW_KEY_ID") and os.environ.get("CW_KEY_SECRET"):
+        os.environ["AWS_ACCESS_KEY_ID"] = os.environ["CW_KEY_ID"]
+        os.environ["AWS_SECRET_ACCESS_KEY"] = os.environ["CW_KEY_SECRET"]
+    os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+
+
+def _patch_s3fs_makedirs() -> None:
+    """s3fs.makedirs (called by BOTH levanter's fsspec_utils AND fsspec-core's open_files) tries
+    to ``create_bucket``. cwobject's bucket already exists and CreateBucket may be rejected; s3
+    has no real directories anyway (writes create keys directly). Make makedirs a tolerant no-op
+    on errors so cache opens / executor writes don't crash."""
+    try:
+        import s3fs
+    except Exception:
+        return
+    _orig = s3fs.S3FileSystem.makedirs
+
+    def _safe(self, path, exist_ok=True):
+        try:
+            return _orig(self, path, exist_ok=exist_ok)
+        except Exception:
+            return None  # bucket exists / CreateBucket unsupported -> keys are written directly
+
+    s3fs.S3FileSystem.makedirs = _safe
+
+
 def _configure_fsspec_virtual_hosted() -> None:
     """levanter also uses fsspec/s3fs (NOT tensorstore) for cache metadata + mkdirs. s3fs/botocore
     default to PATH-STYLE against a custom endpoint, which cwobject rejects. botocore reads the
@@ -105,9 +141,13 @@ def apply() -> None:
     except Exception:
         pass
     if _virtual_hosted_enabled():
+        _override_s3_env_in_process()
         _configure_fsspec_virtual_hosted()
         _patch_mkdirs()
+        _patch_s3fs_makedirs()
+        klen = len(os.environ.get("AWS_ACCESS_KEY_ID", ""))
         print(f"[cw_patch] virtual-hosted S3 ENABLED (endpoint={os.environ.get('AWS_ENDPOINT_URL')}, "
+              f"key_len={klen}, MARIN_PREFIX={os.environ.get('MARIN_PREFIX')}, "
               f"AWS_CONFIG_FILE={os.environ.get('AWS_CONFIG_FILE')})", flush=True)
 
 

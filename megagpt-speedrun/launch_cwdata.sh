@@ -29,11 +29,14 @@ ARGS=(
   -e RAGGED_DOT_IMPL triton
   -e LEVANTER_TS_CACHE_LIMIT 34359738368
   # --- cwobject data path ---
+  # NB: iris injects AWS_ENDPOINT_URL (R2) with precedence over -e, so we pass the cwobject
+  # endpoint + creds under non-AWS_ names (CW_S3_ENDPOINT / CW_KEY_*); cw_patch applies them
+  # IN-PROCESS (before the marin executor runs) so the whole process talks cwobject.
   -e SP_DATA cw -e SP_CW_COMPONENTS "$CWCOMP"
-  -e AWS_ENDPOINT_URL https://cwobject.com
-  -e AWS_ACCESS_KEY_ID "$CW_KEY_ID" -e AWS_SECRET_ACCESS_KEY "$CW_KEY_SECRET"
-  -e AWS_DEFAULT_REGION us-east-1
   -e LEVANTER_S3_VIRTUAL_HOSTED 1
+  -e CW_S3_ENDPOINT https://cwobject.com
+  -e CW_KEY_ID "$CW_KEY_ID" -e CW_KEY_SECRET "$CW_KEY_SECRET"
+  -e AWS_DEFAULT_REGION us-east-1
   -e MARIN_PREFIX s3://marin-us-east-02a/marin   # checkpoints/output -> cwobject too
   -e SP_TOKENS "$TOKENS" -e SP_GROUP "$GROUP"
 )
