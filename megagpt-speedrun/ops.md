@@ -31,9 +31,26 @@ KUBECONFIG=~/.kube/coreweave-iris-gpu uv run iris --cluster=cw-us-east-02a job <
 W… root Data loading is taking a long time: 14480.0 seconds. Waiting for 256 items.
 ```
 
-**What it is.** A stuck data fetch (a dead Ray data-fetch actor, or an R2 object read that
-hangs with no timeout). The loader prefetches ahead, so the job *steps for a while* (we got to
-~step 284) off the buffer, then blocks forever on the one batch that never arrives.
+**ROOT CAUSE (found 2026-06-26) — undersized TensorStore read cache.** The tokenized cache
+stores **64 sequences per ~1MB chunk** (`DEFAULT_CHUNK_SIZE = 256*1024` tokens / 4096 seq_len),
+and `jagged_array.get_batch` reads all of a batch's rows concurrently (`ts.Batch()` +
+`asyncio.gather`) through a **shared `cache_pool`** whose size is `LEVANTER_TS_CACHE_LIMIT`
+(default **1 GB**). The default block shuffle (`BlockShuffleConfig(io_block_size=256,
+window_blocks=512)`) keeps a batch's reads inside a 131k-seq window whose working set is **~2 GB**
+(2048 chunks). 2 GB working set > 1 GB pool ⇒ chunks are **evicted before their 64 seqs are
+consumed** ⇒ the same chunk is re-fetched from R2 over and over (thrash). That thrash is the
+periodic `queue_size=0` stall; the catastrophic case is one cold R2 GET that never returns,
+blocking the whole `gather()` for hours (the loader prefetches ahead, so the job *steps for a
+while* off the buffer, then blocks forever on the one batch that never arrives).
+
+**THE FIX (permanent, in `launch_cw.sh`).** Size the read cache to hold the run's whole working
+set: `-e LEVANTER_TS_CACHE_LIMIT 34359738368` (32 GB; worker has 512 GB RAM). A 24h run at
+global-batch 8 touches only ~21 GB of *unique* data total, so every chunk is fetched from R2
+~once then served from RAM — no thrash, no repeated cold GETs. Also deepened the loader prefetch
+(`max_buffered_batches=128, prefetch_size=64` in `train.py:build_train_loader`) to absorb warmup
+reads. **Do NOT "fix" this by switching to a full-permutation shuffle (`LmDataConfig.shuffle=True`)**
+— that scatters reads to a *distinct* chunk per sequence (~64× more R2 GETs) and makes it worse.
+Keep the block shuffle; it gives the read locality the cache_pool relies on.
 
 **Why it's dangerous.** The job stays in state `running` and **nothing crashes**, so
 `--max-retries` does NOT recover it. It will sit there burning all 8 H100s indefinitely. A
