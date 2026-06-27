@@ -1,0 +1,130 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "megagpt-speedrun"
+version = "0.1.0"
+description = "Scaled-up NanoGPT speedrun: largest deeply-sparse grug MoE on 8xH100 (CoreWeave), reduced-vocab head to move compute into experts, best perplexity in 24h + SFT cooldown."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # The marin umbrella is published to PyPI as `marin-core` (the `marin` name
+    # only exists as stale GitHub-release wheels; see the find-links note below).
+    "marin-core",
+    "marin-levanter",
+    # haliax and fray are imported directly (model.py uses haliax; the launcher
+    # and trainer use fray.cluster.ResourceConfig), so declare them rather than
+    # relying on the levanter/iris transitive closure.
+    "marin-haliax",
+    "marin-fray",
+    # [controller] pulls the kubernetes client so the LOCAL iris CLI can reach the
+    # CoreWeave k8s control plane (cw-us-east-02a). Without it `cluster status` /
+    # `job run` against a k8s cluster raise "Install iris[controller] to use
+    # CloudK8sService". The remote worker doesn't need it, but it's harmless there.
+    "marin-iris[controller]",
+    "marin-zephyr",
+    "marin-rigging",
+    # marin.datakit.normalize imports the dupekit module unconditionally; it is
+    # provided by the marin-dupekit distribution, which marin does not pull in
+    # itself, so declare it here.
+    "marin-dupekit",
+]
+
+# Iris's remote worker runs `uv sync --all-packages --no-group dev`, which
+# errors if the dev group doesn't exist. Define an empty one so --no-group
+# has a group to exclude.
+[project.optional-dependencies]
+# This project runs on 8xH100 (CoreWeave cw-us-east-02a): submit with `--extra gpu`,
+# which the iris worker turns into `uv sync --extra gpu`. We mirror **marin-levanter[gpu]**
+# exactly (jax[cuda13] + cublas + cutlass-dsl + flash-attn-4) so the FA4 attention
+# backends (`gpu_fa4_cute` / `gpu_fa4_thd`) are available -- reference_attention
+# materializes the full [B,H,S,S] scores (slow AND the per-device OOM at seq>=2048), so
+# the big-seq MoE needs FA4. KEY: take FA4 from *levanter*, not marin-core[gpu] -- the
+# latter additionally pins torch==2.11.0 (whose cublas pin fights nvidia-cublas>=13.2),
+# whereas marin-levanter[gpu] keeps torch out of the gpu extra, so the FA4 stack resolves
+# cleanly. nvidia-cutlass-dsl + companions come from the explicit `nvidia` index
+# (https://pypi.nvidia.com); see [tool.uv.sources]/[[tool.uv.index]] below.
+gpu = [
+    "jax[cuda13]==0.10.0; sys_platform == 'linux'",
+    "nvidia-cublas>=13.2.0.9; sys_platform == 'linux'",
+    "nvidia-nccl-cu13>=2.28.3; sys_platform == 'linux'",
+    # FA4 forward (cute) + backward (flash_attn.cute.flash_bwd_*) kernels for H100.
+    "nvidia-cutlass-dsl[cu13]>=4.5.2,<4.6; sys_platform == 'linux'",
+    # PIN ==4.0.0b16: levanter's FA4 backward port (_fa4_cute_kernels.py) is written against
+    # b16's flash_attn.cute API; b17->b19 added required mScaleP/softmax_scale args to
+    # FlashAttentionBackwardPreprocess.__call__ -> TypeError in the bwd. marin's lock is also
+    # frozen at b16. A floor range (>=b16) resolves to the latest (b19) and breaks.
+    "flash-attn-4[cu13]==4.0.0b16; sys_platform == 'linux'",
+    # flash-attn-4 transitively needs torch. CRITICAL: pin torch==2.11.0 AND route it to
+    # the pytorch-cu128 index (see [tool.uv.sources] below) -- exactly as marin-core[gpu]
+    # does. Plain PyPI torch==2.11.0 pulls cuda-toolkit 13.0.2 -> nvidia-cublas==13.1.0.3,
+    # which conflicts with jax[cuda13]'s nvidia-cublas>=13.2. The +cu128 build instead
+    # carries self-contained CUDA-12 libs (cudnn-cu12 9.19, nccl-cu12, cuda-toolkit 12.8),
+    # which DON'T touch the cu13 nvidia-cublas and coexist with jax cu13 (cuDNN works).
+    "torch==2.11.0; sys_platform == 'linux'",
+]
+
+[dependency-groups]
+dev = []
+
+[tool.uv]
+fork-strategy = "fewest"
+prerelease = "allow"
+environments = [
+    "sys_platform == 'darwin'",
+    "sys_platform == 'linux'",
+]
+# Mirrored from submodules/marin/pyproject.toml; omitting these makes uv
+# resolution fail in the same way it does for marin itself.
+override-dependencies = [
+    "omegaconf>=2.4.0.dev4",
+    "antlr4-python3-runtime==4.11",
+    "python-multipart>=0.0.22",
+    "wheel>=0.46.2",
+    "datasets>=3.1.0,<4.0.0",
+    "equinox>=0.11.10",
+    # marin-levanter caps tensorstore <0.1.82, but 0.1.84 (google/tensorstore#285) is
+    # REQUIRED to address CoreWeave cwobject (empty bucket + virtual-hosted endpoint;
+    # cwobject rejects path-style). Override the cap -- 0.1.84 is API-compatible.
+    "tensorstore>=0.1.84",
+]
+
+# The marin-* dev wheels resolve from PyPI (marin-core, marin-levanter, ... as
+# 0.2.x.devYYYYMMDDHHMM, published nightly). We intentionally do NOT add the
+# GitHub `*-latest` release find-links here: those serve `0.99.dev<date>` wheels
+# that (a) are frozen at 2026-05-29 and (b) outrank the fresh PyPI `0.2.x.dev`
+# wheels by version, so including them silently pins stale marin code.
+
+# marin depends on resiliparse>=0.17.2 which only exists on this custom index.
+# Mirrored from submodules/marin/lib/marin/pyproject.toml. Without it, uv
+# resolves resiliparse from PyPI which caps at 0.16.0 and resolution fails.
+[[tool.uv.index]]
+name = "marin-resiliparse"
+url = "https://marin-community.github.io/chatnoir-resiliparse/simple"
+
+# nvidia-cutlass-dsl (the FA4 CuTe DSL) and its companion wheels are only on the
+# NVIDIA index, not PyPI. Mirrored from marin/pyproject.toml.
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+# torch's CUDA-12.8 build (self-contained CUDA-12 libs that coexist with jax cu13)
+# lives only on the pytorch cu128 index. Mirrored from marin/lib/marin/pyproject.toml.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+resiliparse = { index = "marin-resiliparse" }
+nvidia-cutlass-dsl = { index = "nvidia" }
+nvidia-cutlass-dsl-libs-base = { index = "nvidia" }
+nvidia-cutlass-dsl-libs-cu13 = { index = "nvidia" }
+torch = [{ index = "pytorch-cu128", extra = "gpu", marker = "sys_platform == 'linux'" }]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
