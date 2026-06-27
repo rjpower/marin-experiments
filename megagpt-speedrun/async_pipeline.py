@@ -474,8 +474,26 @@ def build_async_pipeline(
     # Compile per-stage fns
     fns = [_StageFns(s, num_stages, stage_statics[s], cfg, stage_masks[s], remat) for s in range(num_stages)]
 
-    # Put params on respective devices
-    stage_arrays = [_put_on(stage_arrays_host[s], submeshes[s]) for s in range(num_stages)]
+    # Put params on respective devices.  CRITICAL: the model is initialized on a single
+    # device (device 0); _split_transformer's eqx.partition returns the SAME array objects
+    # as the model, so the full 7.62B-param model (~30 GB f32) sits on device 0.  Placing
+    # each stage with device_put creates a per-device copy, but device 0 would still hold
+    # the entire original model AND stage 0's copy + optimizer -> OOM during warmup
+    # (observed: 1.12 GiB alloc failure with device 0 ~full).  Pull each stage to host,
+    # delete the device-0 source, then place from host so device 0 only ever holds stage 0.
+    stage_arrays = []
+    for s in range(num_stages):
+        host_s = jax.tree_util.tree_map(
+            lambda x: np.asarray(x) if eqx.is_array(x) else x, stage_arrays_host[s]
+        )
+        for leaf in jax.tree_util.tree_leaves(stage_arrays_host[s]):
+            try:
+                leaf.delete()  # free this stage's slice of the full model from device 0
+            except Exception:
+                pass
+        stage_arrays.append(_put_on(host_s, submeshes[s]))
+        del host_s
+    del stage_arrays_host
 
     # Per-stage AdamW optimizers
     per_opt = [optax.adamw(learning_rate=lr, b1=0.9, b2=0.95) for _ in range(num_stages)]

@@ -326,6 +326,9 @@ def run_pp_async():
         remat=cfg["remat"],
     )
     print(f"[PP] pipeline built in {time.perf_counter() - t_build:.1f}s", flush=True)
+    # build_async_pipeline has freed the full model's device-0 storage (per-stage params
+    # are now on their own devices); drop the now-hollow reference.
+    del model
 
     # Warmup
     warmup_steps = num_stages + 2
