@@ -1,13 +1,56 @@
-# Async Pipeline Parallelism — Results
+# Pipeline Parallelism — Results
 
-## STATUS: COMPLETE — NEGATIVE RESULT (measured)
+## STATUS: throughput still loses to EP+FSDP — but the cause is NOT "can't overlap"
 
-Async no-flush pipeline parallelism (P=8 stages, 1 H100/stage, experts-local,
-params-resident, per-stage Muon) was built, verified for schedule correctness, and
-**measured on a real 8×H100 node**. It does **not** beat the EP+FSDP baseline — it is
-~5.7× slower. The bottleneck is structural (single-threaded eager JAX dispatch cannot
-overlap 8 device streams), not a tunable. Recommendation: **do not pursue PP** for this
-model/hardware; keep the EP+FSDP pretrain (`run2-e128k8`, 187K tok/s, 15.1% MFU).
+CORRECTION to an earlier draft of this doc: I previously claimed the eager-dispatch PP
+serialization was "structural — single-threaded eager JAX dispatch cannot overlap 8
+device streams." **That claim was wrong, and the overlap probe disproves it.**
+
+### The overlap probe (ppx1, 8×H100, bare matmuls) — eager dispatch DOES overlap
+| probe | result |
+|-------|--------|
+| PROBE1 2-GPU overlap | **1.99×** (near-perfect; eager dispatch overlaps) |
+| PROBE2 cross-GPU `device_put` | **async, does NOT block** the host thread |
+| PROBE3 8-hop *dependent chain* | 7.85× (serial — what the old async tick effectively was) |
+| PROBE4 8mb×8stage **mb-major** | **PIPELINES, 100% overlap eff** (1547ms vs serial 6550ms) |
+| PROBE5 same on real submesh+`set_mesh` | **PIPELINES** (set_mesh is not the culprit) |
+
+So the execution model overlaps fine **with big single-kernel stages**. The old async
+result was a broken *schedule* (one batch rippling = PROBE3's serial chain), not the model.
+
+### But the REAL model still won't overlap (the actual wall)
+A gradient-exact SYNC microbatched GPipe pipeline (`sync_pipeline.py`, validated:
+pipeline-vs-autodiff-oracle grads relL2=3.3e-10, M-invariant) was measured on 8×H100:
+
+| run | geometry | overlap_factor | tok/s | MFU |
+|-----|----------|----------------|-------|-----|
+| EP+FSDP baseline | B16 | — | **187,000** | **15.1%** |
+| ppsync1 | B16 / M16 (mb=1) | 1.33× | 15,807 | 0.38% |
+| ppsync2 | B128 / M16 (mb=8) | 1.32× | 39,441 | 0.95% |
+| (old async, broken sched) | B16 | ~1.0× | 32,702 | 0.79% |
+
+The `overlap_factor` (serial-per-op vs overlapped step time) is **~1.3× for the real
+model regardless of microbatch size**, vs **100% (≈5.6×)** for the probe's bare matmuls.
+The difference is the per-stage workload: the probe is ONE big GEMM/stage; a real stage is
+2 transformer layers = dozens of small kernels (qkv/attn-FA4/o-proj/router/ragged-dot/norms,
+×2, ×remat-recompute). Eager Python dispatch of that many small kernels across 8 devices is
+**host-dispatch-bound** — the host cannot issue kernels fast enough to keep 8 GPUs busy, so
+they barely overlap (1.3×). Bigger microbatches feed the experts better (MFU 0.38→0.95%) but
+do **not** fix overlap (1.33→1.32×). This is consistent with grug-moe-pp's prior finding
+("residual gap is MFU + recompute, not bubble") and its TPU result (overlapping PP ≈ 0.78×
+FSDP single-host; only wins across DCN).
+
+### Implication
+Micro-vs-async schedule is NOT the lever (both hit ~1.3× overlap / <1% MFU). The lever is
+**compiling the whole pipeline into one XLA program** (a `shard_map` over a `stage` axis with
+`ppermute` activation handoff) so XLA — not the Python host — schedules the cross-stage
+overlap with a single launch. That is what `grug-moe-pp/pipeline.py` does (on TPU); on a
+single 8×H100 node it is still expected to *lose* to EP+FSDP on throughput (single-host),
+winning only the **memory** game (batches/models that OOM FSDP). See the original (now
+superseded) negative-result text below for the old async-only measurements.
+
+---
+## (superseded) earlier async-only writeup
 
 All numbers below are MEASURED (`[PP_THRUPUT]`/`[PP_RESULTS]` log lines), at the exact
 production geometry (16L × 1536D × 128E/8K, B=16, S=4096, synthetic data SP_SYNTH_DATA=1).

@@ -195,6 +195,14 @@ SWEEPS = {
             "SP_PP_MICROBATCH": "32", "SP_EXPERTS": "128", "SP_TOPK": "8", "SP_BATCH": "64",
             "SP_PP_MUON": "1", "SP_PP_REMAT": "1", "SP_STEPS": "40",
         },
+        # mb=8 (B=128/M=16): BIG per-stage kernels (overlap not dispatch-bound) AND experts
+        # fed at baseline density (128 seqs/expert-ish) -- the regime where PP can actually
+        # hit MFU. This is the decisive throughput run vs the 187K/15.1% anchor.
+        "e128k8b128m16": {
+            "SP_PP_MODE": "sync", "SP_PP_STAGES": "8", "SP_EP": "1",
+            "SP_PP_MICROBATCH": "16", "SP_EXPERTS": "128", "SP_TOPK": "8", "SP_BATCH": "128",
+            "SP_PP_MUON": "1", "SP_PP_REMAT": "1", "SP_STEPS": "16",
+        },
     },
     "pp_async": {
         # Primary benchmark: production E128/K8 geometry (7.62B model) under async PP
