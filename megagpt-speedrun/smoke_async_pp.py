@@ -177,106 +177,95 @@ def build_linear_pipeline(num_stages: int, D: int, V: int, lr: float = 1e-2):
 
     dloss_one = jnp.ones(())
     dz_zero = jnp.zeros(())
+    last = num_stages - 1
 
-    # State: (stage_arrays, stage_opt_st, inter_acts, bwd_bufs, last_label_buf, tick)
+    def _to(x, s):
+        return jax.device_put(x, NamedSharding(submeshes[s], P()))
+
+    def _apply_opt(s, dparams, stage_arrays, stage_opt_st):
+        updates, new_opt = per_opt[s].update(dparams, stage_opt_st[s], stage_arrays[s])
+        stage_arrays[s] = optax.apply_updates(stage_arrays[s], updates)
+        stage_opt_st[s] = new_opt
+
+    # 1F1B state: forward AND backward each advance ONE hop per tick (mirrors
+    # async_pipeline.build_async_pipeline). fwd_in[s]/bwd_in[s] = activation/cotangent
+    # that arrived at stage s last tick; act_fifo[s] = saved fwd inputs awaiting bwd
+    # (depth 2*(P-1-s)); label_pipe = labels flowing to the last stage (depth P-1).
     init_state = {
         "stage_arrays": stage_arrays,
         "stage_opt_st": stage_opt_st,
-        "inter_acts": [None] * num_stages,
-        "bwd_bufs": [collections.deque() for _ in range(num_stages)],
-        "last_label_buf": collections.deque(),
+        "fwd_in": [None] * num_stages,
+        "bwd_in": [None] * num_stages,
+        "act_fifo": [collections.deque() for _ in range(num_stages)],
+        "label_pipe": collections.deque(),
         "tick": 0,
     }
 
     def step(state, batch_tokens_np, loss_weight_np):
         stage_arrays = list(state["stage_arrays"])
         stage_opt_st = list(state["stage_opt_st"])
-        inter_acts = list(state["inter_acts"])
-        bwd_bufs = state["bwd_bufs"]
-        last_label_buf = state["last_label_buf"]
+        fwd_in = state["fwd_in"]
+        bwd_in = state["bwd_in"]
+        act_fifo = state["act_fifo"]
+        label_pipe = state["label_pipe"]
         tick = state["tick"]
 
         B, S = batch_tokens_np.shape
         labels_np = np.concatenate(
             [batch_tokens_np[:, 1:], np.zeros((B, 1), np.int32)], axis=1
         ).astype(np.int32)
+        label_pipe.append((labels_np, loss_weight_np))
 
-        # Push labels/weights for this tick
-        last_label_buf.append((labels_np, loss_weight_np))
+        new_fwd_in = [None] * num_stages
+        new_bwd_in = [None] * num_stages
+        loss = None
 
-        # --- FORWARD SWEEP ---
-        new_inter_acts = [None] * num_stages
-
-        # Stage 0
-        tok_s0 = jax.device_put(batch_tokens_np, NamedSharding(submeshes[0], P()))
-        h0, _z0 = fns[0].forward(stage_arrays[0], tok_s0)
-        new_inter_acts[0] = h0
-        bwd_bufs[0].append(tok_s0)
+        # --- FORWARD HOPS (+ last stage's immediate backward) ---
+        tok0 = _to(batch_tokens_np, 0)
+        h0, _z0 = fns[0].forward(stage_arrays[0], tok0)
+        act_fifo[0].append(tok0)
+        if num_stages > 1:
+            new_fwd_in[1] = _to(h0, 1)
 
         for s in range(1, num_stages):
-            prev_act = inter_acts[s - 1]
-            if prev_act is None:
+            a = fwd_in[s]
+            if a is None:
                 continue
-            act_in = jax.device_put(prev_act, NamedSharding(submeshes[s], P()))
-            bwd_bufs[s].append(act_in)
-            if s < num_stages - 1:
-                hs, _zs = fns[s].forward(stage_arrays[s], act_in)
-                new_inter_acts[s] = hs
-            # else: stage P-1 does NOT run forward here (backward uses correct labels)
-
-        # --- BACKWARD SWEEP (P-1 → 0) ---
-        loss = None
-        cotangent = None
-
-        for s in reversed(range(num_stages)):
-            depth = num_stages - 1 - s
-            if len(bwd_bufs[s]) <= depth:
-                cotangent = None
-                continue
-
-            old_fwd_in = bwd_bufs[s].popleft()
-
-            if s == num_stages - 1:
-                old_lbl_np, old_lw_np = last_label_buf.popleft()
-                old_lbl = jax.device_put(old_lbl_np, NamedSharding(submeshes[s], P()))
-                old_lw = jax.device_put(old_lw_np, NamedSharding(submeshes[s], P()))
-                old_fwd_in_m = jax.device_put(old_fwd_in, NamedSharding(submeshes[s], P()))
-                dparams, dx = fns[s].backward(
-                    stage_arrays[s], old_fwd_in_m, old_lbl, old_lw, dloss_one, dz_zero
-                )
-                # Compute loss for logging
-                loss_v, _zv = fns[s].forward(stage_arrays[s], old_fwd_in_m, old_lbl, old_lw)
-                loss = float(jax.device_get(loss_v))
-                cotangent = dx
-
-            elif s == 0:
-                if cotangent is None:
-                    bwd_bufs[s].appendleft(old_fwd_in)
-                    continue
-                old_fwd_in_m = jax.device_put(old_fwd_in, NamedSharding(submeshes[s], P()))
-                dy = jax.device_put(cotangent, NamedSharding(submeshes[s], P()))
-                dparams = fns[s].backward(stage_arrays[s], old_fwd_in_m, dy, dz_zero)
-                cotangent = None
-
+            if s < last:
+                hs, _zs = fns[s].forward(stage_arrays[s], a)
+                act_fifo[s].append(a)
+                new_fwd_in[s + 1] = _to(hs, s + 1)
             else:
-                if cotangent is None:
-                    bwd_bufs[s].appendleft(old_fwd_in)
-                    continue
-                old_fwd_in_m = jax.device_put(old_fwd_in, NamedSharding(submeshes[s], P()))
-                dy = jax.device_put(cotangent, NamedSharding(submeshes[s], P()))
-                dparams, dx = fns[s].backward(stage_arrays[s], old_fwd_in_m, dy, dz_zero)
-                cotangent = dx
+                lbl_np, lw_np = label_pipe.popleft()
+                lbl = _to(lbl_np, s)
+                lw = _to(lw_np, s)
+                loss_v, _zv = fns[s].forward(stage_arrays[s], a, lbl, lw)
+                dparams, dx = fns[s].backward(stage_arrays[s], a, lbl, lw, dloss_one, dz_zero)
+                loss = float(jax.device_get(loss_v))
+                _apply_opt(s, dparams, stage_arrays, stage_opt_st)
+                if s > 0:
+                    new_bwd_in[s - 1] = _to(dx, s - 1)
 
-            updates, new_opt_st = per_opt[s].update(dparams, stage_opt_st[s], stage_arrays[s])
-            stage_arrays[s] = optax.apply_updates(stage_arrays[s], updates)
-            stage_opt_st[s] = new_opt_st
+        # --- BACKWARD HOPS for stages 0..last-1 ---
+        for s in range(last):
+            c = bwd_in[s]
+            if c is None:
+                continue
+            old_in = act_fifo[s].popleft()
+            if s == 0:
+                dparams = fns[0].backward(stage_arrays[0], old_in, c, dz_zero)
+            else:
+                dparams, dx = fns[s].backward(stage_arrays[s], old_in, c, dz_zero)
+                new_bwd_in[s - 1] = _to(dx, s - 1)
+            _apply_opt(s, dparams, stage_arrays, stage_opt_st)
 
         new_state = {
             "stage_arrays": stage_arrays,
             "stage_opt_st": stage_opt_st,
-            "inter_acts": new_inter_acts,
-            "bwd_bufs": bwd_bufs,
-            "last_label_buf": last_label_buf,
+            "fwd_in": new_fwd_in,
+            "bwd_in": new_bwd_in,
+            "act_fifo": act_fifo,
+            "label_pipe": label_pipe,
             "tick": tick + 1,
         }
         return new_state, loss
@@ -344,7 +333,13 @@ def test_basic_schedule(num_stages: int = 4, num_ticks: int = 30, verbose: bool 
 
 
 def test_staleness_profile(num_stages: int = 4):
-    """Verify per-stage delay profile: all stages fire at tick P-1 together."""
+    """Verify the 1F1B per-stage delay profile.
+
+    Forward reaches stage s at tick s; the last stage fwd+bwd at tick P-1.
+    Cotangents then flow UP one stage per tick, so stage s's FIRST optimizer
+    update is at tick (P-1) + (P-1-s) = 2*(P-1) - s. Last stage is freshest
+    (tick P-1); stage 0 is stalest (tick 2*(P-1)).
+    """
     print(f"\n[test_staleness] num_stages={num_stages}")
     D, V, B, S = 16, 64, 2, 4
     state, step_fn = build_linear_pipeline(num_stages, D, V)
@@ -352,7 +347,7 @@ def test_staleness_profile(num_stages: int = 4):
     prev_arrays = [jax.tree_util.tree_leaves(a) for a in state["stage_arrays"]]
     first_update_tick = [None] * num_stages
 
-    for t in range(num_stages * 3):
+    for t in range(num_stages * 4):
         batch = np.random.randint(0, V, (B, S)).astype(np.int32)
         lw = np.ones((B, S), np.float32)
         state, loss = step_fn(state, batch, lw)
@@ -368,18 +363,19 @@ def test_staleness_profile(num_stages: int = 4):
                     first_update_tick[s] = t
         prev_arrays = curr_arrays
 
+    expected = [2 * (num_stages - 1) - s for s in range(num_stages)]
     print(f"  first update tick per stage: {first_update_tick}")
-    print(f"  expected (all at tick P-1={num_stages - 1}): {[num_stages - 1] * num_stages}")
+    print(f"  expected 1F1B (2*(P-1)-s):    {expected}")
 
-    expected = num_stages - 1
     ok = True
     for s in range(num_stages):
         actual = first_update_tick[s]
-        if actual != expected:
-            print(f"  [FAIL] stage {s}: first update at tick {actual}, expected {expected}")
+        if actual != expected[s]:
+            print(f"  [FAIL] stage {s}: first update at tick {actual}, expected {expected[s]}")
             ok = False
         else:
-            print(f"  [OK] stage {s}: delay = P-1 = {num_stages - 1} ✓")
+            delay = actual - s  # ticks from this stage's forward to its update
+            print(f"  [OK] stage {s}: first update tick {actual} (grad delay {delay} ticks) ✓")
 
     return ok
 
@@ -419,8 +415,15 @@ def test_loss_decreases(num_stages: int = 4, num_ticks: int = 100):
     return all(np.isfinite(l) for l in losses)
 
 
-def test_buffer_consistency(num_stages: int = 4, num_ticks: int = 20):
-    """Verify buffer lengths are consistent (no accumulation)."""
+def test_buffer_consistency(num_stages: int = 4, num_ticks: int = 30):
+    """Verify the 1F1B in-flight buffers reach their bounded steady-state depths.
+
+    In steady state, act_fifo[s] holds exactly the saved forward inputs whose
+    backward hasn't arrived yet = the round-trip latency 2*(P-1-s). label_pipe
+    holds the labels of batches between stage 0 and the last stage = P-1.
+    These are BOUNDED (each tick pushes 1 and pops 1 once steady) -- the test
+    confirms no unbounded accumulation.
+    """
     print(f"\n[test_buffers] num_stages={num_stages}, num_ticks={num_ticks}")
     D, V, B, S = 16, 32, 2, 4
     state, step_fn = build_linear_pipeline(num_stages, D, V)
@@ -431,24 +434,22 @@ def test_buffer_consistency(num_stages: int = 4, num_ticks: int = 20):
         lw = np.ones((B, S), np.float32)
         state, loss = step_fn(state, batch, lw)
 
-    # In steady state (after warmup), bwd_bufs should have 0 items
-    # (each tick pushes 1 and pops 1). During warmup, items accumulate.
-    # At tick num_ticks, bwd_bufs[s] should have depth[s] = P-1-s items
-    # that are waiting for future backwards (the pipeline tail flush).
-    print("  bwd_buf lengths (at end of run):")
+    print("  act_fifo depths (at end of run):")
     ok = True
     for s in range(num_stages):
-        buf_len = len(state["bwd_bufs"][s])
-        expected = num_stages - 1 - s  # items still in flight at end
-        print(f"    stage {s}: len={buf_len}, expected≈{expected}")
-        if buf_len > expected + 1:
-            print(f"  [WARN] stage {s} has more items than expected ({buf_len} > {expected + 1})")
-            # ok = False  # Don't fail, this is a soft check
+        buf_len = len(state["act_fifo"][s])
+        expected = 2 * (num_stages - 1 - s)  # round-trip latency
+        flag = "" if buf_len == expected else "  <-- MISMATCH"
+        print(f"    stage {s}: len={buf_len}, expected={expected}{flag}")
+        if abs(buf_len - expected) > 1:
+            ok = False
 
-    label_buf_len = len(state["last_label_buf"])
-    print(f"  last_label_buf: {label_buf_len} items (expected ≈ {num_stages - 1})")
+    label_len = len(state["label_pipe"])
+    print(f"  label_pipe: {label_len} items (expected {num_stages - 1})")
+    if abs(label_len - (num_stages - 1)) > 1:
+        ok = False
 
-    print(f"[OK] test_buffers completed")
+    print(f"[{'OK' if ok else 'FAIL'}] test_buffers")
     return ok
 
 

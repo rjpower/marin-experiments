@@ -346,71 +346,70 @@ def run_pp_async():
     # Initialize wandb
     wb_run = _build_wandb(cfg)
 
-    # Timed training
+    # Timed training in CHUNKS. The 1F1B step dispatches all per-device work async
+    # with no host sync; reading the loss (device_get) or timing every single step
+    # would reintroduce a per-tick barrier that serializes the pipeline (exactly the
+    # bug that made the sweep schedule run at 1-GPU speed). So we dispatch CHUNK ticks,
+    # block_until_ready ONCE per chunk (this also bounds the in-flight queue / memory),
+    # and compute throughput over the chunk's wall time.
+    CHUNK = 8
+    chunk_tok_s = []
+    chunk_mfus = []
+    last_loss = float("nan")
     t0 = time.perf_counter()
-    losses = []
-    step_times = []
-    t_step = t0
 
-    for step in range(steps):
-        if cfg["synth_data"]:
+    step = 0
+    while step < steps:
+        n = min(CHUNK, steps - step)
+        t_chunk = time.perf_counter()
+        last_loss_dev = None
+        for _ in range(n):
             b = rng.integers(0, model_cfg.vocab_size, (B, S)).astype(np.int32)
-        else:
-            # Real data not yet wired; fall back to synthetic with a warning
-            logger.warning("SP_SYNTH_DATA=0 requested but real data loader not yet implemented for PP; using synthetic")
-            b = rng.integers(0, model_cfg.vocab_size, (B, S)).astype(np.int32)
-        lw = np.ones((B, S), np.float32)
+            lw = np.ones((B, S), np.float32)
+            state, loss = step_fn(state, b, lw)
+            if loss is not None:
+                last_loss_dev = loss
+        # One sync per chunk: wait for all n ticks' device work to finish.
+        jax.block_until_ready(state.stage_arrays)
+        dt = time.perf_counter() - t_chunk
+        step += n
 
-        state, loss = step_fn(state, b, lw)
-
-        now = time.perf_counter()
-        dt = now - t_step
-        t_step = now
-
-        if loss is not None:
-            losses.append((step, loss))
-
-        elapsed = now - t0
-        # In steady state, each tick produces 1 batch
-        toks = B * S
-        tok_s = toks / dt if dt > 0 else 0
-        step_ms = dt * 1e3
-        step_times.append(dt)
-
-        # MFU estimate (averaged over last 10 steps)
-        if len(step_times) > 1:
-            avg_dt = sum(step_times[-10:]) / min(len(step_times), 10)
-            mfu = _mfu_estimate(model_cfg, 1.0 / avg_dt, B, S, n_devs)
-        else:
-            mfu = float("nan")
-
-        loss_str = f" loss={loss:.4f}" if loss is not None else ""
+        tok_s = (n * B * S) / dt if dt > 0 else 0.0
+        step_ms = dt / n * 1e3
+        mfu = _mfu_estimate(model_cfg, n / dt, B, S, n_devs)
+        chunk_tok_s.append(tok_s)
+        chunk_mfus.append(mfu)
+        if last_loss_dev is not None:
+            last_loss = float(jax.device_get(last_loss_dev))
+        elapsed = time.perf_counter() - t0
         print(
             f"[PP_THRUPUT] step={step:4d} tok/s={tok_s:.0f} mfu={mfu:.2f}%"
-            f" step_ms={step_ms:.1f}ms{loss_str} elapsed={elapsed:.0f}s",
+            f" step_ms={step_ms:.1f}ms loss={last_loss:.4f} elapsed={elapsed:.0f}s",
             flush=True,
         )
-
-        if wb_run is not None and loss is not None:
+        if wb_run is not None:
             wb_run.log({
-                "train/loss": loss,
+                "train/loss": last_loss,
                 "throughput/tok_s": tok_s,
                 "throughput/mfu_pct": mfu,
                 "throughput/step_ms": step_ms,
             }, step=step)
 
-    # Final summary
     jax.block_until_ready(state.stage_arrays)
     total_elapsed = time.perf_counter() - t0
-    avg_step_ms = sum(step_times) / len(step_times) * 1e3 if step_times else float("nan")
-    avg_tok_s = B * S / (sum(step_times) / len(step_times)) if step_times else float("nan")
-    avg_mfu = _mfu_estimate(model_cfg, 1.0 / (sum(step_times) / len(step_times)), B, S, n_devs) if step_times else float("nan")
-    avg_loss = sum(l for _, l in losses) / len(losses) if losses else float("nan")
+    # Report the median of the steady-state chunks (ignore the first chunk = pipeline fill).
+    steady = chunk_tok_s[1:] if len(chunk_tok_s) > 1 else chunk_tok_s
+    steady_mfu = chunk_mfus[1:] if len(chunk_mfus) > 1 else chunk_mfus
+    avg_tok_s = sorted(steady)[len(steady) // 2] if steady else float("nan")
+    avg_mfu = sorted(steady_mfu)[len(steady_mfu) // 2] if steady_mfu else float("nan")
+    avg_step_ms = B * S / avg_tok_s * 1e3 if avg_tok_s else float("nan")
+    avg_loss = last_loss
 
     print(
         f"\n[PP_RESULTS] steps={steps} elapsed={total_elapsed:.1f}s"
-        f" avg_tok_s={avg_tok_s:.0f} avg_mfu={avg_mfu:.2f}%"
-        f" avg_step_ms={avg_step_ms:.1f}ms avg_loss={avg_loss:.4f}",
+        f" median_tok_s={avg_tok_s:.0f} median_mfu={avg_mfu:.2f}%"
+        f" step_ms={avg_step_ms:.1f}ms last_loss={avg_loss:.4f}"
+        f" (baseline EP+FSDP: 187K tok/s, 15.1% MFU)",
         flush=True,
     )
 

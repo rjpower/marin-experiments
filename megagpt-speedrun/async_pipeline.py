@@ -409,22 +409,28 @@ def orthogonalize_tree(tree):
 
 
 class AsyncPipelineState(NamedTuple):
-    """Full mutable state for the async pipeline.
+    """Full mutable state for the async 1F1B pipeline.
 
     stage_arrays:   list[pytree]    per-stage weight arrays (on respective devices)
     stage_opt_st:   list            per-stage optax optimizer states
-    inter_acts:     list[arr|None]  pending activation between adjacent stages
-                                    inter_acts[s] = last output of stage s
-                                    (input to stage s+1 in the NEXT tick)
-    bwd_bufs:       list[deque]     per-stage FIFO of fwd_inputs for backward
-    last_label_buf: deque           FIFO of (labels_np, lw_np) pushed every tick
+    fwd_in:         list[arr|None]  activation that ARRIVED at stage s from stage s-1
+                                    last tick (consumed by stage s's forward this tick).
+                                    fwd_in[0] is unused (stage 0 embeds the new batch).
+    bwd_in:         list[arr|None]  cotangent that ARRIVED at stage s from stage s+1
+                                    last tick (consumed by stage s's backward this tick).
+    act_fifo:       list[deque]     per-stage FIFO of saved forward INPUTS (already on
+                                    device s) awaiting their backward. depth[s]=2*(P-1-s).
+    label_pipe:     deque           FIFO of (labels_np, lw_np); pushed when a batch enters
+                                    stage 0, popped (P-1 ticks later) when it reaches the
+                                    last stage. The last stage's fwd+bwd run in the SAME tick.
     tick:           int             global tick counter (0-indexed)
     """
     stage_arrays: list
     stage_opt_st: list
-    inter_acts: list
-    bwd_bufs: list
-    last_label_buf: object
+    fwd_in: list
+    bwd_in: list
+    act_fifo: list
+    label_pipe: object
     tick: int
 
 
@@ -505,145 +511,131 @@ def build_async_pipeline(
 
     muon_fn = jax.jit(orthogonalize_tree) if muon else None
 
+    last = num_stages - 1
+
+    def _apply_opt(s, dparams, stage_arrays, stage_opt_st):
+        """Per-stage local optimizer update (Muon orthogonalize + AdamW), on device s."""
+        with set_mesh(submeshes[s]):
+            if muon_fn is not None:
+                dparams = muon_fn(dparams)
+            updates, new_opt = per_opt[s].update(dparams, stage_opt_st[s], stage_arrays[s])
+            stage_arrays[s] = optax.apply_updates(stage_arrays[s], updates)
+        stage_opt_st[s] = new_opt
+
     initial_state = AsyncPipelineState(
         stage_arrays=stage_arrays,
         stage_opt_st=stage_opt_st,
-        inter_acts=[None] * num_stages,
-        bwd_bufs=[collections.deque() for _ in range(num_stages)],
-        last_label_buf=collections.deque(),
+        fwd_in=[None] * num_stages,
+        bwd_in=[None] * num_stages,
+        act_fifo=[collections.deque() for _ in range(num_stages)],
+        label_pipe=collections.deque(),
         tick=0,
     )
 
     def step(state: AsyncPipelineState, batch_tokens_np: np.ndarray, loss_weight_np: np.ndarray):
-        """One async pipeline tick.
+        """One async 1F1B pipeline tick (TRUE overlap across all P devices).
 
-        Accepts HOST numpy arrays for batch_tokens and loss_weight to avoid
-        JAX tracing overhead on host-side buffer management.  The per-stage
-        forwards are dispatched as JAX async computations (no global barrier
-        between stages during the forward sweep).
+        Unlike a forward-sweep-then-sequential-backward-sweep schedule (which
+        serializes the backward across devices -> only 1 GPU active at a time),
+        this advances BOTH the forward and backward by exactly ONE hop per tick:
 
-        Returns (new_state, loss) where loss is None during warmup (first P-1 ticks).
+          - Stage s FORWARD consumes fwd_in[s] (arrived from s-1 last tick), saves
+            its input to act_fifo[s], and ships its output to fwd_in[s+1] (next tick).
+          - Stage s (< last) BACKWARD consumes bwd_in[s] (arrived from s+1 last tick),
+            pops the matching saved input from act_fifo[s], applies its local
+            optimizer, and ships dx to bwd_in[s-1] (next tick).
+          - The LAST stage runs forward THEN its own backward in the same tick
+            (it seeds the cotangent from the loss; nothing downstream to wait for).
+
+        Every device therefore does ~1 forward + 1 backward + 1 opt per tick, all
+        dispatched async with no host sync, so the 8 GPUs run concurrently.
+
+        Cotangents flow up one stage per tick, so stage s applies its gradient with
+        delay 2*(P-1-s) ticks (stage 0 stalest, last stage fresh) -- a larger but
+        still bounded staleness than the sweep schedule (the price of real overlap).
+
+        Returns (new_state, loss_device_scalar | None). The loss is a DEVICE scalar
+        (do NOT device_get it every tick -- that reintroduces a per-tick barrier);
+        the caller reads it periodically.
         """
-        # Unpack mutable state (these are Python lists/deques, not JAX traced values)
         stage_arrays = list(state.stage_arrays)
         stage_opt_st = list(state.stage_opt_st)
-        inter_acts = list(state.inter_acts)  # snapshot: stage s+1 uses inter_acts[s] from PREV tick
-        bwd_bufs = state.bwd_bufs
-        last_label_buf = state.last_label_buf
+        fwd_in = state.fwd_in       # arrived last tick
+        bwd_in = state.bwd_in       # arrived last tick
+        act_fifo = state.act_fifo
+        label_pipe = state.label_pipe
         tick = state.tick
 
         B, S = batch_tokens_np.shape
         labels_np = np.concatenate(
             [batch_tokens_np[:, 1:], np.zeros((B, 1), np.int32)], axis=1
         ).astype(np.int32)
+        label_pipe.append((labels_np, loss_weight_np))
 
-        # Push labels for this batch (popped during stage P-1 backward)
-        last_label_buf.append((labels_np, loss_weight_np))
+        new_fwd_in = [None] * num_stages
+        new_bwd_in = [None] * num_stages
+        loss_dev = None
 
-        # ======================================================================
-        # 1. FORWARD SWEEP
-        #    Stage 0: always runs (embeds new batch)
-        #    Stage s>0: runs iff inter_acts[s-1] was set in previous tick
-        #    Stage P-1: only buffers its incoming activation; no loss fwd here
-        #               (backward re-runs fwd internally via vjp for correct labels)
-        # ======================================================================
-
-        new_inter_acts = [None] * num_stages
-
-        # Stage 0 always runs
-        tok_s0 = _put_batch(batch_tokens_np, submeshes[0])
+        # ----- FORWARD HOPS (+ last stage's immediate backward) -----
+        # Stage 0 always forwards the freshly arrived batch.
+        tok0 = _put_batch(batch_tokens_np, submeshes[0])
         with set_mesh(submeshes[0]):
-            h0, _z0 = fns[0].forward(stage_arrays[0], tok_s0)
-        new_inter_acts[0] = h0
-        bwd_bufs[0].append(tok_s0)   # fwd_input for stage 0's future backward
+            h0, _z0 = fns[0].forward(stage_arrays[0], tok0)
+        act_fifo[0].append(tok0)
+        if num_stages > 1:
+            new_fwd_in[1] = _transport(h0, submeshes[1])
+        else:
+            # Degenerate single-stage case: treat stage 0 as the last stage.
+            pass
 
         for s in range(1, num_stages):
-            prev_act = inter_acts[s - 1]  # from END of PREVIOUS tick
-            if prev_act is None:
-                # Still warming up: stage s hasn't received its first activation
-                continue
-            act_in = _transport(prev_act, submeshes[s])
-            bwd_bufs[s].append(act_in)  # save for backward
-
-            if s < num_stages - 1:
+            a = fwd_in[s]
+            if a is None:
+                continue  # pipeline still filling
+            if s < last:
                 with set_mesh(submeshes[s]):
-                    hs, _zs = fns[s].forward(stage_arrays[s], act_in)
-                new_inter_acts[s] = hs
-            # else: s == num_stages - 1 — skip fwd (backward uses correct labels)
-
-        # ======================================================================
-        # 2. BACKWARD SWEEP (stages P-1 → 0, sequential cotangent chain)
-        #    All stages fire simultaneously once the pipeline is full (tick >= P-1).
-        #    During warmup (tick < P-1), bwd_bufs don't have enough items yet.
-        # ======================================================================
-
-        loss = None
-        cotangent = None  # dx propagated upstream; None = downstream not ready
-
-        for s in reversed(range(num_stages)):
-            depth = num_stages - 1 - s   # how many items to age before backward fires
-            if len(bwd_bufs[s]) <= depth:
-                # Warmup: not enough buffered fwd_inputs yet
-                cotangent = None  # can't use upstream cotangent if downstream didn't fire
-                continue
-
-            old_fwd_in = bwd_bufs[s].popleft()  # oldest fwd_input at stage s
-            mesh = submeshes[s]
-
-            if s == num_stages - 1:
-                # Seed backward from head loss
-                old_lbl_np, old_lw_np = last_label_buf.popleft()
-                old_lbl = _put_batch(old_lbl_np, mesh)
-                old_lw = _put_batch(old_lw_np, mesh)
-                old_fwd_in_m = _transport(old_fwd_in, mesh)
-                with set_mesh(mesh):
-                    dparams, dx = fns[s].backward(
-                        stage_arrays[s], old_fwd_in_m, old_lbl, old_lw, dloss_one, dz_scalar
-                    )
-                    # Re-run fwd for loss logging (same jit cache, no extra compile)
-                    loss_v, z_v = fns[s].forward(stage_arrays[s], old_fwd_in_m, old_lbl, old_lw)
-                loss = float(jax.device_get(loss_v + z_v * z_coef))
-                cotangent = dx
-
-            elif s == 0:
-                if cotangent is None:
-                    # Shouldn't happen in steady state; skip if somehow None
-                    bwd_bufs[s].appendleft(old_fwd_in)  # put back
-                    continue
-                dy = _transport(cotangent, mesh)
-                old_fwd_in_m = _transport(old_fwd_in, mesh)
-                with set_mesh(mesh):
-                    dparams = fns[s].backward(stage_arrays[s], old_fwd_in_m, dy, dz_scalar)
-                cotangent = None  # stage 0 has no upstream
-
+                    hs, _zs = fns[s].forward(stage_arrays[s], a)
+                act_fifo[s].append(a)
+                new_fwd_in[s + 1] = _transport(hs, submeshes[s + 1])
             else:
-                if cotangent is None:
-                    bwd_bufs[s].appendleft(old_fwd_in)  # put back
-                    continue
-                dy = _transport(cotangent, mesh)
-                old_fwd_in_m = _transport(old_fwd_in, mesh)
+                # LAST stage: forward (with labels) then immediately backward.
+                lbl_np, lw_np = label_pipe.popleft()
+                mesh = submeshes[s]
+                lbl = _put_batch(lbl_np, mesh)
+                lw = _put_batch(lw_np, mesh)
                 with set_mesh(mesh):
-                    dparams, dx = fns[s].backward(stage_arrays[s], old_fwd_in_m, dy, dz_scalar)
-                cotangent = dx
+                    loss_v, z_v = fns[s].forward(stage_arrays[s], a, lbl, lw)
+                    dparams, dx = fns[s].backward(stage_arrays[s], a, lbl, lw, dloss_one, dz_scalar)
+                loss_dev = loss_v + z_v * z_coef
+                _apply_opt(s, dparams, stage_arrays, stage_opt_st)
+                if s > 0:
+                    new_bwd_in[s - 1] = _transport(dx, submeshes[s - 1])
 
-            # ================================================================
-            # 3. OPTIMIZER STEP (per-stage, local Muon)
-            # ================================================================
-            if muon_fn is not None:
-                dparams = muon_fn(dparams)
-            updates, new_opt_st = per_opt[s].update(dparams, stage_opt_st[s], stage_arrays[s])
-            stage_arrays[s] = optax.apply_updates(stage_arrays[s], updates)
-            stage_opt_st[s] = new_opt_st
+        # ----- BACKWARD HOPS for stages 0..last-1 (cotangent arrived last tick) -----
+        for s in range(last):  # 0 .. last-1
+            c = bwd_in[s]
+            if c is None:
+                continue  # cotangent hasn't reached this stage yet
+            old_in = act_fifo[s].popleft()  # matching saved forward input (on device s)
+            mesh = submeshes[s]
+            with set_mesh(mesh):
+                if s == 0:
+                    dparams = fns[0].backward(stage_arrays[0], old_in, c, dz_scalar)
+                else:
+                    dparams, dx = fns[s].backward(stage_arrays[s], old_in, c, dz_scalar)
+                    new_bwd_in[s - 1] = _transport(dx, submeshes[s - 1])
+            _apply_opt(s, dparams, stage_arrays, stage_opt_st)
 
         new_state = AsyncPipelineState(
             stage_arrays=stage_arrays,
             stage_opt_st=stage_opt_st,
-            inter_acts=new_inter_acts,
-            bwd_bufs=bwd_bufs,
-            last_label_buf=last_label_buf,
+            fwd_in=new_fwd_in,
+            bwd_in=new_bwd_in,
+            act_fifo=act_fifo,
+            label_pipe=label_pipe,
             tick=tick + 1,
         )
-        return new_state, loss
+        return new_state, loss_dev
 
     return initial_state, step, submeshes
 
