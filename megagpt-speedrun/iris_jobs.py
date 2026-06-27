@@ -174,6 +174,28 @@ SWEEPS = {
     # Safety: unique pp-* prefix for all job names; check client.list_jobs(prefix="/power/")
     # before and after submit to verify no interference with run2-e128k8/spr1.
     # ---------------------------------------------------------------------------
+    # Decisive GPU overlap probe (bare matmuls, seconds): does eager per-stage dispatch +
+    # cross-device device_put + set_mesh OVERLAP the 8 GPUs when driven microbatch-major?
+    # PROBE4/PROBE5 are the tell. Cheap; run this BEFORE building a microbatched pipeline.
+    "pp_probe": {
+        "probe": {"SP_PP_MODE": "probe"},
+    },
+    # SYNC microbatched (gradient-exact GPipe) PP -- the CORRECT overlapping pipeline.
+    # Production E128/K8 geometry; SP_EP=1 (experts local). Reports overlap_factor +
+    # tok/s + MFU vs the 187K/15.1% EP+FSDP anchor. M = microbatches (overlap fill).
+    "pp_sync": {
+        "e128k8m16": {
+            "SP_PP_MODE": "sync", "SP_PP_STAGES": "8", "SP_EP": "1",
+            "SP_PP_MICROBATCH": "16", "SP_EXPERTS": "128", "SP_TOPK": "8", "SP_BATCH": "16",
+            "SP_PP_MUON": "1", "SP_PP_REMAT": "1", "SP_STEPS": "40",
+        },
+        # Larger global batch (PP's memory win lets us run batches FSDP can't): B=64, M=32.
+        "e128k8b64m32": {
+            "SP_PP_MODE": "sync", "SP_PP_STAGES": "8", "SP_EP": "1",
+            "SP_PP_MICROBATCH": "32", "SP_EXPERTS": "128", "SP_TOPK": "8", "SP_BATCH": "64",
+            "SP_PP_MUON": "1", "SP_PP_REMAT": "1", "SP_STEPS": "40",
+        },
+    },
     "pp_async": {
         # Primary benchmark: production E128/K8 geometry (7.62B model) under async PP
         # Compare directly to run2-e128k8 at 187K tok/s. SP_EP=1 = experts local per stage.

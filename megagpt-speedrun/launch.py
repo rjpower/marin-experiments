@@ -531,6 +531,24 @@ if __name__ == "__main__":
         run_pp_async()
         sys.exit(0)
 
+    # SYNC microbatched (gradient-exact GPipe) pipeline parallelism -- the CORRECT
+    # overlapping PP (see sync_pipeline.py / pp_overlap_probe.py). Measures overlap
+    # factor + tok/s + MFU vs the EP+FSDP anchor.
+    if os.environ.get("SP_PP_MODE", "") == "sync":
+        import sys
+        from train_pp import run_pp_sync
+        run_pp_sync()
+        sys.exit(0)
+
+    # GPU overlap probe: bare-matmul micro-probes that decide whether eager per-stage
+    # dispatch + cross-device device_put + set_mesh can OVERLAP the 8 GPUs when driven
+    # the correct (microbatch-major) way -- the prerequisite for any real PP speedup.
+    if os.environ.get("SP_PP_MODE", "") == "probe":
+        import sys
+        import pp_overlap_probe
+        pp_overlap_probe.main()
+        sys.exit(0)
+
     # Fast worker-side diagnostics that reuse the normal job bundle but skip the
     # full training pipeline (e.g. SP_DIAG=ragged probes the MoE grouped-matmul
     # backend that drives the 278 GiB OOM).

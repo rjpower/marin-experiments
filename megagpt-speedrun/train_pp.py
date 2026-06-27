@@ -63,6 +63,7 @@ def _parse_env():
     e = os.environ.get
     return {
         "num_stages":   int(e("SP_PP_STAGES", "8")),
+        "microbatches": int(e("SP_PP_MICROBATCH", "16")),
         "lr":           float(e("SP_PP_LR", "3e-4")),
         "muon":         e("SP_PP_MUON", "1") == "1",
         "remat":        e("SP_PP_REMAT", "1") == "1",
@@ -430,7 +431,133 @@ def run_pp_async():
     }
 
 
+def run_pp_sync():
+    """SYNC microbatched (gradient-exact GPipe) PP throughput benchmark.
+
+    Called from launch.py when SP_PP_MODE=sync. Builds the sync pipeline
+    (sync_pipeline.build_sync_pipeline), measures the overlap factor (serial vs
+    overlapped step time), then times throughput and reports tok/s + MFU vs the
+    187K/15.1% EP+FSDP anchor. Emits [PP_THRUPUT]/[PP_RESULTS] lines.
+    """
+    import sync_pipeline
+
+    cfg = _parse_env()
+    num_stages = cfg["num_stages"]
+    M = cfg["microbatches"]
+    B = cfg["batch_size"]
+    S = cfg["seq_len"]
+    steps = cfg["steps"]
+    n_devs = jax.device_count()
+    if n_devs < num_stages:
+        num_stages = n_devs
+    if B % M != 0:
+        # round M down to a divisor of B
+        while B % M != 0 and M > 1:
+            M -= 1
+    print(f"[PP_CONFIG] mode=sync stages={num_stages} M={M} B={B} S={S} steps={steps} "
+          f"experts={cfg['experts']} topk={cfg['topk']} hidden={cfg['hidden_dim']} "
+          f"mb={B // M} (per-microbatch seqs)", flush=True)
+
+    model_cfg = _build_model_config(cfg)
+    if model_cfg.num_layers % num_stages != 0:
+        adj = (model_cfg.num_layers // num_stages) * num_stages
+        model_cfg = dataclasses.replace(model_cfg, num_layers=adj)
+
+    key = jax.random.PRNGKey(int(os.environ.get("SP_SEED", "0")))
+    init_mesh = Mesh(np.array([[[[jax.devices()[0]]]]]),
+                     ("replica_dcn", "data", "expert", "model"),
+                     axis_types=(AxisType.Explicit,) * 4)
+    with set_mesh(init_mesh):
+        print("[PP] initializing model...", flush=True)
+        model = Transformer.init(model_cfg, key=key)
+        print(f"[PP] model initialized: {model_cfg.num_layers}L × {model_cfg.hidden_dim}D × "
+              f"{model_cfg.num_experts}E/{model_cfg.num_experts_per_token}K", flush=True)
+
+    print("[PP] building sync pipeline...", flush=True)
+    t_build = time.perf_counter()
+    sa, opt_st, step_fn, submeshes, _grads = sync_pipeline.build_sync_pipeline(
+        model, num_stages=num_stages, num_microbatches=M,
+        lr=cfg["lr"], muon=cfg["muon"], remat=cfg["remat"],
+    )
+    print(f"[PP] pipeline built in {time.perf_counter() - t_build:.1f}s", flush=True)
+    del model
+
+    rng = np.random.default_rng(42)
+    def _batch():
+        return (rng.integers(0, model_cfg.vocab_size, (B, S)).astype(np.int32),
+                np.ones((B, S), np.float32))
+
+    print("[PP] warming up (JIT compile)...", flush=True)
+    for _ in range(2):
+        b, lw = _batch()
+        _loss, sa, opt_st = step_fn(sa, opt_st, b, lw)
+    jax.block_until_ready(sa)
+    print("[PP] warmup complete", flush=True)
+
+    # ----- OVERLAP FACTOR: serial (block per stage-op) vs overlapped step time -----
+    b, lw = _batch()
+    sync_pipeline._SERIALIZE[0] = True
+    t = time.perf_counter()
+    g_s, _l = _grads(sa, b, lw)
+    jax.block_until_ready((g_s, _l))
+    serial_ms = (time.perf_counter() - t) * 1e3
+    sync_pipeline._SERIALIZE[0] = False
+    t = time.perf_counter()
+    g_o, _l = _grads(sa, b, lw)
+    jax.block_until_ready((g_o, _l))
+    overlap_ms = (time.perf_counter() - t) * 1e3
+    overlap_factor = serial_ms / overlap_ms if overlap_ms > 0 else 0.0
+    print(f"[PP_OVERLAP] serial_step={serial_ms:.0f}ms overlapped_step={overlap_ms:.0f}ms "
+          f"overlap_factor={overlap_factor:.2f}x (1.0=no overlap; higher=stages overlap)", flush=True)
+
+    wb_run = _build_wandb(cfg)
+
+    CHUNK = 4
+    chunk_tok_s, chunk_mfus = [], []
+    last_loss = float("nan")
+    t0 = time.perf_counter()
+    step = 0
+    while step < steps:
+        n = min(CHUNK, steps - step)
+        t_chunk = time.perf_counter()
+        last_loss_dev = None
+        for _ in range(n):
+            b, lw = _batch()
+            last_loss_dev, sa, opt_st = step_fn(sa, opt_st, b, lw)
+        jax.block_until_ready(sa)
+        dt = time.perf_counter() - t_chunk
+        step += n
+        tok_s = (n * B * S) / dt if dt > 0 else 0.0
+        step_ms = dt / n * 1e3
+        mfu = _mfu_estimate(model_cfg, n / dt, B, S, n_devs)
+        chunk_tok_s.append(tok_s); chunk_mfus.append(mfu)
+        if last_loss_dev is not None:
+            last_loss = float(jax.device_get(last_loss_dev))
+        print(f"[PP_THRUPUT] step={step:4d} tok/s={tok_s:.0f} mfu={mfu:.2f}% "
+              f"step_ms={step_ms:.1f}ms loss={last_loss:.4f} elapsed={time.perf_counter()-t0:.0f}s", flush=True)
+        if wb_run is not None:
+            wb_run.log({"train/loss": last_loss, "throughput/tok_s": tok_s,
+                        "throughput/mfu_pct": mfu, "throughput/step_ms": step_ms}, step=step)
+
+    steady = chunk_tok_s[1:] if len(chunk_tok_s) > 1 else chunk_tok_s
+    steady_mfu = chunk_mfus[1:] if len(chunk_mfus) > 1 else chunk_mfus
+    med_tok_s = sorted(steady)[len(steady) // 2] if steady else float("nan")
+    med_mfu = sorted(steady_mfu)[len(steady_mfu) // 2] if steady_mfu else float("nan")
+    print(f"\n[PP_RESULTS] mode=sync M={M} steps={steps} median_tok_s={med_tok_s:.0f} "
+          f"median_mfu={med_mfu:.2f}% overlap_factor={overlap_factor:.2f}x last_loss={last_loss:.4f} "
+          f"(baseline EP+FSDP: 187K tok/s, 15.1% MFU)", flush=True)
+    if wb_run is not None:
+        wb_run.log({"summary/median_tok_s": med_tok_s, "summary/median_mfu": med_mfu,
+                    "summary/overlap_factor": overlap_factor})
+        wb_run.finish()
+    return {"median_tok_s": med_tok_s, "median_mfu": med_mfu, "overlap_factor": overlap_factor}
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    import sys
+    if os.environ.get("SP_PP_MODE", "") == "sync":
+        print(f"[PP_DONE] {run_pp_sync()}")
+        sys.exit(0)
     result = run_pp_async()
     print(f"[PP_DONE] {result}")
