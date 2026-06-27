@@ -186,17 +186,53 @@ def _split_transformer(transformer: Transformer, num_stages: int):
 # ---------------------------------------------------------------------------
 
 
-def _build_stage_masks(cfg: GrugModelConfig, num_stages: int) -> list:
-    """Per-stage list of (per-block) AttentionMask tuples."""
+def _build_stage_masks(cfg: GrugModelConfig, num_stages: int, *, doc_len: int = 1024) -> list:
+    """Per-stage list of (per-block) AttentionMask tuples.
+
+    The FA4 CuTe attention backend REQUIRES packed segment_ids on the mask
+    (gpu_fa4_cute raises NotImplementedError when mask.segment_ids is None).
+    We attach segment_ids matching the synthetic-data benchmark loader
+    (synth_data.py): ~doc_len-token documents -> several segments per sequence
+    (block-diagonal attention), so the async-PP attention FLOPs match the
+    EP+FSDP baseline's exactly. with_sliding_window preserves segment_ids, so
+    the local/global window variants inherit them.
+    """
+    seq_len = cfg.max_seq_len
+    chunk = max(1, min(int(doc_len), seq_len))
+    seg = jnp.asarray((np.arange(seq_len) // chunk).astype(np.int32))
+    max_segments = (seq_len + chunk - 1) // chunk
+
     num_layers = cfg.num_layers
     lps = num_layers // num_stages
-    base = AttentionMask.causal()
+    base = AttentionMask.causal().with_segment_ids(seg, max_segments=max_segments)
     short_mask, long_mask = _layer_attention_masks(
         base, sliding_window=cfg.sliding_window, local_window=cfg.local_window
     )
     g = max(1, getattr(cfg, "global_attn_every", 4))
     per_layer = [long_mask if (i % g == g - 1) else short_mask for i in range(num_layers)]
     return [tuple(per_layer[s * lps : (s + 1) * lps]) for s in range(num_stages)]
+
+
+# ---------------------------------------------------------------------------
+# Mixed precision (matches baseline mp policy params=fp32, compute=bf16)
+# ---------------------------------------------------------------------------
+
+# The FA4 CuTe attention kernel ONLY accepts bf16/fp16 inputs (see train.py:636-639:
+# "params are stored in param dtype (fp32) but the FA4 attention kernel only accepts
+# bf16/fp16, and training casts via mp.cast_to_compute inside the train step").
+# We store f32 master weights per stage (for the optimizer / Muon) and cast to bf16
+# inside each stage's forward; the vjp upcasts grads back to f32 automatically.
+_COMPUTE_DTYPE = jnp.bfloat16
+
+
+def _cast_compute(tree):
+    """Cast floating-point leaves to the compute dtype (bf16); leave ints/None alone."""
+    return jax.tree_util.tree_map(
+        lambda x: x.astype(_COMPUTE_DTYPE)
+        if (eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating))
+        else x,
+        tree,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +298,9 @@ class _StageFns:
             embed_static, block_static = static[1], static[2]
 
             def _fwd(arrays, token_ids):
+                # Cast f32 master weights -> bf16 compute (FA4 needs bf16); vjp upcasts
+                # the grad back to f32 so the optimizer/Muon operate on f32 master weights.
+                arrays = _cast_compute(arrays)
                 embed_arr, blk_arr = arrays
                 h = _embed_prefix(embed_arr, embed_static, token_ids, spec)
                 return _apply_blocks(blk_arr, block_static, h, masks, remat)
@@ -281,6 +320,7 @@ class _StageFns:
             head_static, block_static = static[1], static[2]
 
             def _fwd(arrays, hidden_in, labels, lw):
+                arrays = _cast_compute(arrays)  # bf16 compute (see _cast_compute)
                 head_arr, blk_arr = arrays
                 h, z = _apply_blocks(blk_arr, block_static, hidden_in, masks, remat)
                 ce = _head_suffix(head_arr, head_static, h, labels, lw, spec)
@@ -300,6 +340,7 @@ class _StageFns:
             (block_static,) = (static[1],)
 
             def _fwd(arrays, hidden_in):
+                arrays = _cast_compute(arrays)  # bf16 compute (see _cast_compute)
                 (blk_arr,) = arrays
                 return _apply_blocks(blk_arr, block_static, hidden_in, masks, remat)
 

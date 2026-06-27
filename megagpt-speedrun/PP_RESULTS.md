@@ -1,137 +1,108 @@
-# Async Pipeline Parallelism Results
+# Async Pipeline Parallelism — Results
 
-## Summary
+## STATUS: NO MEASURED THROUGHPUT YET
 
-Async no-flush pipeline parallelism (P=8 stages, 1 H100 per stage) eliminates
-the two largest EP+FSDP overheads: ep_a2a (29%) and fsdp_comm (15%).
-Per-stage Muon (Newton-Schulz orthogonalization local to each device) replaces
-the cross-device Muon without any all-reduce on the ortho update.
+**There are currently zero measured `[PP_THRUPUT]` readings.** The first batch of
+8-GPU jobs all OOM'd during compilation (root cause below, now fixed). Everything
+in the "Predictions" section is a PARAMETRIC MODEL, not a measurement. Do not cite
+it as a result. This file will only report measured numbers once a job emits real
+`[PP_THRUPUT]` lines.
 
-**Baseline (EP+FSDP, run2-e128k8)**: ~187K tok/s, 15.1% MFU at E128/K8/b16.
+## Root Cause of the First Failure (diagnosed from real logs)
 
-## Architecture
-
-```
-Stage s (1 H100):
-  params:  L/P = 2 transformer layers, all E=128 experts (no EP)
-  forward: receives hidden from stage s-1 via NVLink P2P
-  backward: receives cotangent from stage s+1, computes local grad
-  optimizer: per-stage Muon (Newton-Schulz) + AdamW for norms/router
-  staleness: stage s sees grad from (P-1-s) ticks ago
-             stage 0: τ=7 (stalest), stage 7: τ=0 (fresh)
-```
-
-## Schedule Correctness (CPU Smoke Test)
-
-**Test**: `smoke_async_pp.py --stages 8 --ticks 40 --staleness`
-**Backend**: 8 fake CPU devices (JAX CPU, linear einsum model)
-
-| Test | Result |
-|------|--------|
-| Warmup (ticks 0..P-2): loss=None | ✓ PASS |
-| Post-warmup (tick P-1+): loss=numeric | ✓ PASS |
-| All 33 post-warmup losses finite | ✓ PASS |
-| All 8 stages' params updated | ✓ PASS |
-| bwd_buf depths = P-1-s for all s | ✓ PASS (exact) |
-| All 8 stages first fire at tick P-1=7 | ✓ PASS |
-| last_label_buf = P-1=7 items at end | ✓ PASS |
-
-**Staleness profile matches grug_stage_tau**: all stages fire simultaneously at
-tick P-1, exactly as predicted by `delay_optim.grug_stage_tau(num_layers=8, num_stages=8)`.
-
-## Parametric Model Predictions (from h100_pp_model.py)
-
-Based on profiled EP+FSDP step decomposition (E128/K8/b16):
-- compute: 31% | ep_a2a: 29% | fsdp_comm: 15% | opt: 10% | bubble: 15%
-
-PP eliminates ep_a2a + fsdp_comm = 44% of step time.
-
-| Configuration | Predicted |
-|---------------|-----------|
-| Raw PP speedup (vs EP+FSDP) | ~1.9× |
-| Staleness tax (per-stage τ profile, 15k steps) | ~1.16× |
-| Net PP speedup | ~1.64× |
-| Expected tok/s at E128/K8/b16 | ~307K tok/s |
-| Expected MFU | ~24.8% |
-
-Note: actual results depend on P2P transfer overhead (~10% estimated),
-optimizer parallelism, and JIT compilation overhead.
-
-## H100 Benchmark Jobs (Submitted, Results Pending)
-
-| Job ID | Config | Status |
-|--------|--------|--------|
-| /power/pp2-e128k8p8 | E128/K8/b16/Muon | pending |
-| /power/pp2-e64k8p8 | E64/K8/b16/Muon | pending |
-| /power/pp2-e128k8p8nomunon | E128/K8/b16/AdamW | pending |
-
-Monitor: `uv run python monitor.py pp2 --gpus 8 --warmup 10 --watch 120`
-
-## Results (TBD — fill when H100 jobs complete)
-
-### Primary: E128/K8/b16 + Muon (/power/pp2-e128k8p8)
+All three `pp2-*` jobs died at compile with `RESOURCE_EXHAUSTED: Out of memory
+trying to allocate 16.00GiB`. The actual allocation site (from the job log):
 
 ```
-tok/s: TBD      (baseline: 187K)
-MFU:   TBD%    (baseline: 15.1%)
-step_ms: TBD   (baseline: ~440ms)
-avg_loss: TBD
+jit(forward)/checkpoint/Block/CausalSelfAttention/bqhd,bkhd->bhqk/dot_general
+%gemm_fusion_dot.27 = f32[256,4096,4096]
 ```
 
-### Secondary: E64/K8/b16 + Muon (/power/pp2-e64k8p8)
+That is the **attention score matrix** `[B*H, S, S]` in **f32**, NOT the logits:
+`256 × 4096 × 4096 × 4 bytes = 16 GiB`. The OOM was at **stage 0** (attention),
+not the last stage. Three compounding bugs in the PP path, all now fixed:
 
+1. **`attention_implementation` defaulted to `None`** → `reference_attention`,
+   which materializes the full `[B*H,S,S]` score matrix. The EP+FSDP baseline sets
+   `SP_ATTN=gpu_fa4_cute` (FlashAttention-4, never materializes the matrix).
+   FIX: build the model config via the same `MoeAdamHHeuristic` + override path as
+   `launch.py`, setting `attention_implementation="gpu_fa4_cute"`.
+
+2. **f32 compute** (no mixed precision). Baseline runs `compute=bfloat16`; the FA4
+   kernel ONLY accepts bf16/fp16 inputs (train.py:636-639). FIX: store f32 master
+   weights per stage, cast to bf16 inside each stage's forward (`_cast_compute`);
+   the vjp upcasts grads back to f32 for the optimizer/Muon.
+
+3. **No packed `segment_ids`** on the attention mask. `gpu_fa4_cute` raises
+   `NotImplementedError` when `mask.segment_ids is None`. FIX: `_build_stage_masks`
+   now attaches segment_ids matching the synthetic-data loader (~1024-token docs).
+
+Bonus geometry fix: the hardcoded `num_heads=16` gave the wrong `B*H`; the
+heuristic-built config uses the production 12 heads / 3 KV heads / I=768 / 16 layers,
+so the PP benchmark now runs at the EXACT same geometry as the run2-e128k8 anchor.
+
+Note: the relayed diagnosis (full-logits CE materialization) was incorrect for this
+failure — the logs show it was the attention score matrix at stage 0. The CE head
+was already using the chunked `fused_linear_softmax_cross_entropy_loss`.
+
+## Verification Plan (economical: 1-GPU before 8-GPU)
+
+1. **CPU schedule smoke** (`smoke_async_pp.py`): PASS 4/4 — schedule correctness,
+   staleness profile (all 8 stages fire at tick P-1=7), buffer depths exact.
+   (Linear einsum model; does not exercise FA4/Pallas.)
+2. **1-GPU stage smoke** (`iris_jobs.py pp_smoke --gpus H100x1`, SP_PP_SMOKE=1):
+   builds production-geometry model, runs fwd+bwd for first/mid/last stage types on
+   ONE device at real per-stage shape. Confirms the attention fix fits per-device
+   memory WITHOUT burning an 8-GPU node. STATUS: <pending>
+3. **8-GPU throughput** (`iris_jobs.py pp_async --gpus H100x8`): only after (2) passes.
+   STATUS: <pending>
+
+## Parametric PREDICTIONS (NOT measurements — from h100_pp_model.py)
+
+Profiled EP+FSDP step decomposition (E128/K8/b16): compute 31% | ep_a2a 29% |
+fsdp_comm 15% | opt 10% | bubble 15%. PP eliminates ep_a2a+fsdp_comm = 44%.
+
+| Quantity | Predicted (unverified) |
+|----------|------------------------|
+| Raw PP speedup | ~1.9× |
+| Staleness tax (per-stage τ, 15k steps) | ~1.16× |
+| Net speedup | ~1.64× |
+| tok/s at E128/K8/b16 | ~307K (baseline 187K) |
+| MFU | ~24.8% (baseline 15.1%) |
+
+These are hypotheses to be confirmed or refuted by measurement.
+
+## MEASURED RESULTS
+
+_(empty — no `[PP_THRUPUT]` reading yet)_
+
+### Primary: E128/K8/b16 + Muon
 ```
-tok/s: TBD
-MFU:   TBD%
-step_ms: TBD
+tok/s:    <pending>     (baseline 187K)
+MFU:      <pending>     (baseline 15.1%)
+step_ms:  <pending>
+avg_loss: <pending>
 ```
 
-### Muon vs AdamW isolation (/power/pp2-e128k8p8nomunon)
+## Go/No-Go Criteria (to be evaluated against MEASURED numbers)
 
-```
-tok/s (no Muon): TBD
-MFU (no Muon):   TBD%
-Muon overhead:   TBD%
-```
+- GO if measured tok/s ≥ 250K (≥1.34× over 187K) OR MFU ≥ 20%.
+- NO-GO (valid negative result) if PP cannot beat EP+FSDP after the fix — report
+  the measured numbers and the bottleneck (P2P, sequential backward, opt overhead).
 
-## Memory Profile (Expected)
+## Deliverables Still Outstanding
 
-With P=8 stages, each stage holds 2 layers × 128 experts × 768×1536×3 bytes
-= ~2 GB in BF16 parameters per stage + optimizer states (~4 GB) + activations
-during backward (~2 GB) = ~8 GB per stage.
-
-All 8 H100s have 80 GB HBM each, so memory constraint is non-binding.
-The production EP+FSDP baseline requires ~40 GB for model params alone
-(before optimizer states), so PP's per-stage memory is dramatically lower.
-
-## Staleness Token Tax (Expected, from delayed-gradient-pp/REPORT.md)
-
-| τ_max | Measured (delay_optim pp6 profile) | With weight-prediction |
-|-------|-------------------------------------|------------------------|
-| P-1=7 | ~1.33× at 6k steps, ~1.16× at 15k | ~1.23× at 15k |
-
-PP-async's staleness profile (all stages fire at P-1=7) matches the pp6
-profile from delayed-gradient-pp exactly. The 1.16× token tax at 15k steps
-means we need ~16% more tokens to match non-stale baseline quality.
-
-Net throughput advantage even accounting for staleness:
-  ~1.64× net speedup × 1/1.16× staleness = ~1.41× tokens/wall-time
-
-## Go/No-Go Decision (Pending H100 Results)
-
-Decision criteria:
-- GO if actual tok/s ≥ 250K (1.34× over 187K baseline)
-- GO if MFU ≥ 20% (vs 15.1% baseline)
-- NO-GO if P2P overhead > 25% of step time (would negate the benefit)
-- NO-GO if memory OOMs on any arm
+- [ ] A real `[PP_THRUPUT]` reading (tok/s + MFU) at E128/K8.
+- [ ] Staleness token-tax: loss-vs-tokens of async-PP vs the non-pipelined baseline.
+- [ ] Whether experts-local frees HBM for chonkier experts (memory headroom probe).
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `async_pipeline.py` | Core implementation: schedule, buffers, Muon |
+| `async_pipeline.py` | Core: schedule, buffers, per-stage Muon, bf16 cast, segment_ids |
 | `smoke_async_pp.py` | CPU schedule correctness tests (PASS 4/4) |
-| `train_pp.py` | H100 training entry point (SP_PP_MODE=async) |
-| `iris_jobs.py` | `pp_async` sweep: 4 arms (e128k8p8, e64k8p8, nomunon, b32) |
+| `train_pp.py` | H100 entry point + `gpu_smoke()` (SP_PP_SMOKE=1, 1-GPU) |
+| `iris_jobs.py` | `pp_smoke` (1-GPU verify) + `pp_async` (8-GPU benchmark) sweeps |
 | `launch.py` | SP_PP_MODE=async dispatch hook |
-| `h100_pp_model.py` | Parametric throughput model (predictions above) |
+| `h100_pp_model.py` | Parametric model (predictions only) |

@@ -145,6 +145,17 @@ SWEEPS = {
                 "SP_SCHEDULE": "linear", "SP_MIN_LR": "0", "SP_WARMUP": "0.02",
                 "SP_TOKENS": "13500000000", "SP_STEPS": "20000"},
     },
+    # CHEAP 1-GPU verification (submit with --gpus H100x1) BEFORE any 8-GPU PP run.
+    # SP_PP_SMOKE=1 builds the production-geometry model, splits it, and runs fwd+bwd
+    # for the first/mid/last stage types on ONE device at the real per-stage shape.
+    # Confirms the attention-OOM fix (gpu_fa4_cute + bf16 + packed segment_ids) without
+    # burning an 8-GPU node. Prints [PP_SMOKE] PASS/FAIL.
+    "pp_smoke": {
+        "e128k8": {
+            "SP_PP_MODE": "async", "SP_PP_SMOKE": "1", "SP_PP_STAGES": "8", "SP_EP": "1",
+            "SP_NO_DIST": "1", "SP_EXPERTS": "128", "SP_TOPK": "8", "SP_BATCH": "16",
+        },
+    },
     # ---------------------------------------------------------------------------
     # Async pipeline-parallel (PP) throughput sweep.
     #

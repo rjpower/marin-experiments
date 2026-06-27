@@ -52,7 +52,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, AxisType
 # Module-level imports of local files (uploaded with workspace to worker)
 from levanter.grug.sharding import compact_grug_mesh
 from haliax.partitioning import set_mesh
-from model import Transformer, GrugModelConfig
+from model import Transformer, GrugModelConfig, _batch_spec
 from async_pipeline import build_async_pipeline
 
 logger = logging.getLogger(__name__)
@@ -83,25 +83,39 @@ def _parse_env():
 
 
 def _build_model_config(cfg: dict):
-    """Build GrugModelConfig from the parsed config dict."""
-    from model import GrugModelConfig
-    return GrugModelConfig(
-        vocab_size=cfg["vocab_size"],
-        hidden_dim=cfg["hidden_dim"],
-        embed_dim=cfg["embed_dim"],
-        intermediate_dim=cfg["intermediate"],
-        shared_expert_intermediate_dim=0,  # no shared expert for PP (simplifies stage split)
+    """Build GrugModelConfig matching the EP+FSDP baseline geometry EXACTLY.
+
+    Uses the same MoeAdamHHeuristic + override path as launch.py so the async-PP
+    throughput is measured at the identical model geometry as the run2-e128k8
+    anchor (num_layers/num_heads/num_kv_heads/intermediate are heuristic-derived;
+    hardcoding them previously gave 16 heads -> the wrong B*H and a geometry
+    mismatch). The critical fix vs the OOM'd jobs:
+
+      attention_implementation="gpu_fa4_cute"
+
+    Without it the model defaults to None -> reference_attention, which
+    materializes the full f32 [B*H, S, S] score matrix (16 GiB at b16/seq4096)
+    and OOMs at stage 0. The baseline never does this (BASE sets SP_ATTN=gpu_fa4_cute).
+    """
+    from heuristic import MoeAdamHHeuristic
+
+    model = MoeAdamHHeuristic().build_model_config(
+        cfg["hidden_dim"],
+        seq_len=cfg["seq_len"],
         num_experts=cfg["experts"],
         num_experts_per_token=cfg["topk"],
-        num_layers=cfg["num_layers"],
-        num_heads=16,
-        num_kv_heads=16,
-        max_seq_len=cfg["seq_len"],
-        sliding_window=cfg["seq_len"],
-        global_attn_every=4,
-        router_z_loss_coef=0.001,
-        remat_mode="recompute_all" if cfg["remat"] else "save_moe",
+        embed_dim=cfg["embed_dim"],
     )
+    overrides = dict(
+        remat_mode="recompute_all" if cfg["remat"] else "save_moe",
+        # The fix: FlashAttention-4 CuTe backend (never materializes [B*H,S,S]).
+        attention_implementation="gpu_fa4_cute",
+        moe_implementation=None,  # auto-resolve -> triton ragged_dot on GPU (matches baseline)
+    )
+    if cfg["intermediate"] > 0:
+        overrides["intermediate_dim"] = cfg["intermediate"]
+    model = dataclasses.replace(model, **overrides)
+    return model
 
 
 def _build_wandb(cfg: dict):
@@ -148,6 +162,109 @@ def _mfu_estimate(model_cfg, steps_per_sec: float, B: int, S: int, num_devices: 
         return float("nan")
 
 
+def gpu_smoke():
+    """Single-GPU smoke: verify the per-stage workload fits + runs (no 8-GPU burn).
+
+    Triggered by SP_PP_SMOKE=1. Builds the production-geometry model, splits it,
+    and runs forward+backward for the FIRST (embed+attention), a MID, and the LAST
+    (head+CE) stage type on ONE device at the real per-stage shape (b16, seq4096,
+    2 layers, 128 experts, gpu_fa4_cute, bf16). This directly reproduces the
+    per-device memory the 8-GPU run will use, so it confirms the attention-OOM fix
+    (gpu_fa4_cute + bf16 + segment_ids) WITHOUT burning an 8-GPU node.
+
+    Prints [PP_SMOKE] lines; exits non-zero on OOM / non-finite grads.
+    """
+    import equinox as eqx
+    from async_pipeline import (
+        _StageFns, _split_transformer, _build_stage_masks,
+        _make_stage_mesh, _put_on, _put_batch, orthogonalize_tree,
+    )
+
+    cfg = _parse_env()
+    B, S = cfg["batch_size"], cfg["seq_len"]
+    num_stages = cfg["num_stages"]
+    model_cfg = _build_model_config(cfg)
+    print(f"[PP_SMOKE] geometry: {model_cfg.num_layers}L hidden={model_cfg.hidden_dim} "
+          f"heads={model_cfg.num_heads}/{model_cfg.num_kv_heads} I={model_cfg.intermediate_dim} "
+          f"E={model_cfg.num_experts}/K{model_cfg.num_experts_per_token} attn={model_cfg.attention_implementation}",
+          flush=True)
+
+    dev = jax.devices()[0]
+    init_mesh = Mesh(np.array([[[[dev]]]]), ("replica_dcn", "data", "expert", "model"),
+                     axis_types=(AxisType.Explicit,) * 4)
+    with set_mesh(init_mesh):
+        model = Transformer.init(model_cfg, key=jax.random.PRNGKey(0))
+    print("[PP_SMOKE] model initialized", flush=True)
+
+    stage_arrays_host, stage_statics = _split_transformer(model, num_stages)
+    stage_masks = _build_stage_masks(model_cfg, num_stages)
+    mesh = _make_stage_mesh(dev)
+
+    rng = np.random.default_rng(0)
+    tok = rng.integers(1, model_cfg.vocab_size, (B, S)).astype(np.int32)
+    labels = np.concatenate([tok[:, 1:], np.zeros((B, 1), np.int32)], axis=1).astype(np.int32)
+    lw = np.ones((B, S), np.float32)
+    dz = jnp.asarray(model_cfg.router_z_loss_coef / model_cfg.num_layers, jnp.float32)
+
+    # Test the 3 distinct stage types: first (0), mid (1), last (P-1).
+    test_stages = sorted(set([0, 1, num_stages - 1]))
+    ok = True
+    with set_mesh(mesh):
+        tok_d = _put_batch(tok, mesh)
+        lbl_d = _put_batch(labels, mesh)
+        lw_d = _put_batch(lw, mesh)
+
+        for s in test_stages:
+            fns = _StageFns(s, num_stages, stage_statics[s], model_cfg, stage_masks[s], remat=cfg["remat"])
+            arrays = _put_on(stage_arrays_host[s], mesh)
+            try:
+                if s == 0:
+                    h, z = fns.forward(arrays, tok_d)
+                    jax.block_until_ready((h, z))
+                    print(f"[PP_SMOKE] stage{s}(first) fwd OK: hidden={h.shape}/{h.dtype} z={float(z):.4f}", flush=True)
+                    dparams = fns.backward(arrays, tok_d, jnp.ones_like(h), dz)
+                    dparams = orthogonalize_tree(dparams)
+                    jax.block_until_ready(dparams)
+                    g0 = jax.tree_util.tree_leaves(dparams)[0]
+                    finite = bool(jnp.all(jnp.isfinite(g0)))
+                    print(f"[PP_SMOKE] stage{s}(first) bwd OK: grad0={g0.shape} finite={finite}", flush=True)
+                    ok = ok and finite
+                elif s == num_stages - 1:
+                    # Need a hidden input; reuse stage-0 output shape (bf16 [B,S,hidden]).
+                    hin = jax.device_put(
+                        jnp.asarray(rng.standard_normal((B, S, model_cfg.hidden_dim)) * 0.1, jnp.bfloat16),
+                        NamedSharding(mesh, _batch_spec()))
+                    loss, z = fns.forward(arrays, hin, lbl_d, lw_d)
+                    jax.block_until_ready((loss, z))
+                    print(f"[PP_SMOKE] stage{s}(last) fwd OK: loss={float(loss):.4f} z={float(z):.4f}", flush=True)
+                    dparams, dx = fns.backward(arrays, hin, lbl_d, lw_d, jnp.ones((), jnp.float32), dz)
+                    jax.block_until_ready((dparams, dx))
+                    g0 = jax.tree_util.tree_leaves(dparams)[0]
+                    finite = bool(jnp.all(jnp.isfinite(g0))) and bool(jnp.all(jnp.isfinite(dx)))
+                    print(f"[PP_SMOKE] stage{s}(last) bwd OK: dx={dx.shape}/{dx.dtype} finite={finite}", flush=True)
+                    ok = ok and finite
+                else:
+                    hin = jax.device_put(
+                        jnp.asarray(rng.standard_normal((B, S, model_cfg.hidden_dim)) * 0.1, jnp.bfloat16),
+                        NamedSharding(mesh, _batch_spec()))
+                    h, z = fns.forward(arrays, hin)
+                    jax.block_until_ready((h, z))
+                    print(f"[PP_SMOKE] stage{s}(mid) fwd OK: hidden={h.shape}/{h.dtype}", flush=True)
+                    dparams, dx = fns.backward(arrays, hin, jnp.ones_like(h), dz)
+                    jax.block_until_ready((dparams, dx))
+                    g0 = jax.tree_util.tree_leaves(dparams)[0]
+                    finite = bool(jnp.all(jnp.isfinite(g0)))
+                    print(f"[PP_SMOKE] stage{s}(mid) bwd OK: dx={dx.shape}/{dx.dtype} finite={finite}", flush=True)
+                    ok = ok and finite
+            except Exception as e:
+                print(f"[PP_SMOKE] stage{s} FAILED: {type(e).__name__}: {str(e)[:300]}", flush=True)
+                ok = False
+            del arrays
+
+    print(f"[PP_SMOKE] {'PASS' if ok else 'FAIL'}: per-stage fwd+bwd at production shape", flush=True)
+    return ok
+
+
 def run_pp_async():
     """Main entry point for async PP training.
 
@@ -155,6 +272,11 @@ def run_pp_async():
     Initializes the model, builds the async pipeline, runs training steps,
     logs throughput/loss, and exits.
     """
+    if os.environ.get("SP_PP_SMOKE", "0") == "1":
+        ok = gpu_smoke()
+        import sys
+        sys.exit(0 if ok else 1)
+
     cfg = _parse_env()
     num_stages = cfg["num_stages"]
     B = cfg["batch_size"]
