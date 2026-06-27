@@ -43,15 +43,27 @@ an SFT cooldown. This is the "reflect on how to extend to 24h" step.
 - Checkpoint frequently (rolling) so cooldown can `SP_INIT_FROM` the latest and an iris retry
   resumes.
 
-## Launch sketch
+## Launch sketch — ACTUAL commands in flight (2026-06-26)
 ```
-# pretrain (R2, ~20h, WSD)
-./launch_cw.sh megagpt-24h-pre 7500000000 "" megagpt-24h \
-  -e SP_EXPERTS 64 -e SP_FIT_BATCH 16 -e SP_SCHEDULE cosine -e SP_WARMUP 0.02 -e SP_MIN_LR 0.1
-# SFT cooldown (after pretrain), init from its checkpoint:
-./launch_cw.sh megagpt-24h-sft 800000000 "" megagpt-24h \
-  -e SP_EXPERTS 64 -e SP_FIT_BATCH 16 -e SP_DATA sft -e SP_SCHEDULE linear -e SP_MIN_LR 0 \
-  -e SP_REWARMUP 0.02 -e SP_INIT_FROM s3://marin-na/marin/.../megagpt-24h-pre/checkpoints
+# PRETRAIN — LAUNCHED 17:07Z as megagpt-prod-pre (E64/b16, R2 nemotron, cosine-to-0):
+./launch_cw.sh megagpt-prod-pre 7000000000 "" megagpt-prod \
+  -e SP_EXPERTS 64 -e SP_FIT_BATCH 16 -e SP_SCHEDULE cosine -e SP_WARMUP 0.02 -e SP_MIN_LR 0.0
+# -> run-id sparsity-fixed-d1536-E64-k8-de512-s0-st106812-f5d380 ; 106812 steps (~18.5h).
+# CHECKPOINTS (R2):
+#   s3://marin-na/marin/grug/sparsity/sparsity-fixed-d1536-E64-k8-de512-s0-st106812-f5d380/checkpoints
+
+# SFT COOLDOWN — run AFTER prod-pre completes (init weights-only from its checkpoints dir):
+./launch_cw.sh megagpt-prod-sft 700000000 "" megagpt-prod \
+  -e SP_EXPERTS 64 -e SP_FIT_BATCH 16 -e SP_DATA sft \
+  -e SP_SCHEDULE linear -e SP_MIN_LR 0 -e SP_REWARMUP 0.03 \
+  -e SP_INIT_FROM s3://marin-na/marin/grug/sparsity/sparsity-fixed-d1536-E64-k8-de512-s0-st106812-f5d380/checkpoints
+# NB: SP_INIT_FROM grafts weights only (fresh optimizer, step 0); SAME geometry required.
+# Before launching SFT: smoke-test SP_DATA=sft tokenizes (tulu3+smoltalk+OpenThoughts-Agent -> R2).
+
+# POST-HOC perplexity/bpb headline (load final ckpt, eval on held-out paloma c4_en/wikitext_103):
+#   python -m levanter.main.eval_lm --config.checkpoint_path=<ckpt> \
+#     --config.data.tokenizer=marin-community/marin-tokenizer \
+#     --config.data.components.paloma_c4_en.cache_dir=<paloma c4_en cache>  (see eval notes)
 ```
 
 ## Open items before launch

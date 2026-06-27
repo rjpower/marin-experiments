@@ -120,6 +120,11 @@ Loss-vs-tokens so far: spr1 — 49M→6.12, 95M→4.47, 144M→4.41, 425M→3.73
   mix** (proven solo) unless a nemotron tier is mirrored in time.
 
 ## Ops gotchas
+- **COLD-START ≠ stall**: the FIRST logged `Progress on:train` "step" takes ~6 min (shows
+  `rate:~370s/it`) because the loader cold-fills a 1024-item shuffle buffer + 64-prefetch before
+  step 1. It then JUMPS to steady-state (1.6 it/s R2 E64, 1.3 cwobject E64). Do NOT diagnose this
+  as contention and kill jobs (I almost did — the kill was correctly blocked; was unnecessary).
+  Concurrent prod-pre(R2)+spr1(R2)+mirror(R2-read)+sweep(cwobject) all hit full rate once warm.
 - Monitor for SILENT data-loader hangs (job stays "running", step frozen, "Data loading is
   taking a long time" warnings; `--max-retries` does NOT recover). See `ops.md`.
 - Parser: step lines can read `2.16kit` — expand `k` before comparing.

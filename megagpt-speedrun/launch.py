@@ -53,6 +53,18 @@ import os
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+# XLA's per-fusion autotune (and kernel) sub-cache is written via C++ tsl::Env, which only understands
+# LOCAL paths -- it CANNOT write the s3://-backed JAX_COMPILATION_CACHE_DIR that marin sets on the
+# CoreWeave workers. On the streaming `batched_xla` GPU cross-entropy (levanter>=0.2.28) the LM-head
+# matmuls become __triton_gemm fusions that XLA must autotune, and the failed s3:// cache write is
+# FATAL: "Could not get config for HLO ... UNIMPLEMENTED: File system scheme 's3' not implemented" ->
+# "Failed to get configs for N instructions" -> train_step compile dies. marin's resolve_training_env
+# disables the sub-cache for remote caches, but the grug `_run_grug_local` path bypasses it. Replicate
+# the fix HERE, before jax is imported. No-op when the cache is local/unset. (See
+# marin.training.training._disable_xla_autotune_subcache.)
+if "://" in os.environ.get("JAX_COMPILATION_CACHE_DIR", ""):
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES", "none")
+
 # MUST be imported BEFORE marin/levanter so its in-process S3 env override + s3fs client patch are
 # installed before any cached boto/s3fs session is created at their import time (otherwise an s3fs
 # instance gets cached pointing at iris's R2 endpoint and our cwobject writes leak to R2).
@@ -67,6 +79,7 @@ from levanter.optim import OptimizerConfig
 from levanter.tracker import TrackerConfig
 from levanter.tracker.wandb import WandbConfig
 from levanter.trainer import TrainerConfig
+from levanter.distributed import DistributedConfig
 from marin.execution.executor import executor_main
 from marin.execution.types import ExecutorStep, this_output_path, versioned
 from marin.training.training import temporary_checkpoint_base_path
@@ -74,12 +87,13 @@ from marin.training.training import temporary_checkpoint_base_path
 from data import (
     build_fineweb_edu_mix,
     build_nemotron_cw_mix,
+    build_nemotron_datakit_eval_mix,
     build_nemotron_datakit_mix,
     build_nemotron_mix,
 )
 from heuristic import MoeAdamHHeuristic, build_from_heuristic, compute_flops_per_token
 from model import GrugModelConfig
-from train import GrugRunConfig, GrugTrainerConfig, _run_grug_local
+from train import GrugEvalConfig, GrugRunConfig, GrugTrainerConfig, _run_grug_local
 
 
 @dataclass(frozen=True)
@@ -124,6 +138,13 @@ def run_inline(config: GrugMoeLaunchConfig) -> None:
         use_explicit_mesh_axes=True,
         require_accelerator=True,
         allow_nondivisible_batch_size=False,
+        # Single-GPU benchmark jobs (SP_NO_DIST=1) skip jax.distributed init entirely: a 1-device
+        # process needs no coordinator, and iris co-locates many H100x1 jobs on one 8-GPU node where
+        # they would otherwise collide on the node-local JAX coordinator port (segfault / "different
+        # incarnation" abort). Multi-GPU jobs leave this True so iris.runtime.jax_init runs normally.
+        distributed=DistributedConfig(
+            initialize_jax_distributed=(os.environ.get("SP_NO_DIST", "0") != "1")
+        ),
         # Weights-only init from a prior checkpoint (SFT cooldown <- pretrain); None for pretrain.
         # train.py grafts only the model params (keeps step=0 + fresh optimizer) when this is set
         # and the run has no checkpoint of its own yet.
@@ -143,18 +164,59 @@ def run_inline(config: GrugMoeLaunchConfig) -> None:
             keep=None,
         ),
     )
+    # Eval wiring (post-hoc bpb headline). Pretrain/cooldown run with eval=None (convergence metric is
+    # train/loss; no validation split in the mixtures). SP_EVAL=1 holds out SP_VAL_SEQS sequences per
+    # component as a held-out validation set and attaches a bpb evaluator; with SP_EVAL_ONLY=1 train.py
+    # evals the loaded checkpoint once and exits (no training). Defaults keep training behaviour identical.
+    data = config.data
+    eval_cfg = None
+    if os.environ.get("SP_EVAL") == "1":
+        val_seqs = int(os.environ.get("SP_VAL_SEQS", "256"))
+        eval_bs = int(os.environ.get("SP_EVAL_BS", "16"))
+        max_eb = os.environ.get("SP_EVAL_MAXB", "")
+        data = dataclasses.replace(data, num_validation_sequences={n: val_seqs for n in data.components})
+        eval_cfg = GrugEvalConfig(
+            eval_batch_size=eval_bs,
+            steps_per_eval=10**9,  # never fires during training; the SP_EVAL_ONLY path calls it directly
+            max_eval_batches=(int(max_eb) if max_eb else None),
+            eval_current=True,
+            eval_ema=False,
+            compute_bpb=True,
+        )
     grug_trainer = dataclasses.replace(config.grug_trainer, trainer=trainer)
     run_config = GrugRunConfig(
         model=config.model,
-        data=config.data,
+        data=data,
         resources=config.resources,
         optimizer=config.optimizer,
         trainer=grug_trainer,
-        # No validation sets in the FineWeb-Edu mixture; convergence metric is train/loss.
-        eval=None,
+        eval=eval_cfg,
         k_schedule=config.k_schedule,
     )
     _run_grug_local(run_config)
+
+    # jax.profiler writes to worker-local logs/<run_id>/profiler (ephemeral). Upload it to the run's
+    # output_path (R2/cwobject) via the SAME fsspec/s3fs stack that writes checkpoints, so the
+    # xplane.pb + trace.json.gz survive the worker. Primary process only.
+    if config.profiler.is_enabled:
+        import glob
+
+        import fsspec
+        import jax
+
+        if jax.process_index() == 0:
+            local_root = os.path.join("logs", config.run_id, "profiler")
+            dst = config.output_path.rstrip("/") + "/profiler"
+            n = 0
+            for lpath in glob.glob(os.path.join(local_root, "**"), recursive=True):
+                if not os.path.isfile(lpath):
+                    continue
+                rpath = dst + "/" + os.path.relpath(lpath, local_root)
+                fs, _ = fsspec.core.url_to_fs(rpath)
+                with open(lpath, "rb") as f, fs.open(rpath, "wb") as g:
+                    g.write(f.read())
+                n += 1
+            print(f"[profiler] uploaded {n} files {local_root} -> {dst}", flush=True)
 
 
 def _env(key: str, default: str) -> str:
@@ -337,7 +399,15 @@ def _make_step() -> ExecutorStep:
     model = dataclasses.replace(model, **overrides)
     batch = int(_env("SP_BATCH", str(ref_batch)))
     steps = int(_env("SP_STEPS", str(ref_steps)))
-    profiler = ProfilerConfig(enabled=True, start_step=10, num_steps=10) if profile else ProfilerConfig()
+    # Capture a few STEADY-STATE steps (compile is step 0; SP_SYNTH_DATA has no loader warmup, so
+    # step ~20 is firmly steady). Small window -> small xplane/trace, fast to load. Env-tunable.
+    prof_start = int(_env("SP_PROF_START", "20"))
+    prof_steps = int(_env("SP_PROF_STEPS", "3"))
+    profiler = (
+        ProfilerConfig(enabled=True, start_step=prof_start, num_steps=prof_steps)
+        if profile
+        else ProfilerConfig()
+    )
 
     # Build the curriculum (active_k, end_step) phases from the cumulative token
     # fractions, with the final phase ending exactly at the total step count.
@@ -362,11 +432,23 @@ def _make_step() -> ExecutorStep:
     if embed_dim is not None:
         arm = f"{arm}-de{embed_dim}"
     run_id = f"sparsity-{arm}-s{seed}-st{steps}"
+    # The marin executor is content-addressed: an identical run_id -> identical step name +
+    # output_path -> the step is SKIPPED ("already succeeded") and reuses the cached artifact.
+    # That's correct for resumable production runs, but for BENCHMARK sweeps it silently returns
+    # stale results (no fresh training, no [THRUPUT]). Set SP_TAG=<sweep-id> to salt the run_id and
+    # force a fresh run/output_path. Empty default -> historical resumable behavior is unchanged.
+    _tag = _env("SP_TAG", "")
+    if _tag:
+        run_id = f"{run_id}-{_tag}"
 
     if data_kind == "datakit":
         # The real CoreWeave pretraining data: nemotron datakit flat parquet on R2
         # (llama3 vocab 128256). smoke -> a single high-quality split for a fast path check.
         data = build_nemotron_datakit_mix(smoke=smoke)
+    elif data_kind == "datakit_eval":
+        # Same caches as datakit but flat_cache=True at /train so SP_EVAL's num_validation_sequences
+        # can slice a held-out eval split (no separate /validation cache exists). Eval-only path.
+        data = build_nemotron_datakit_eval_mix(smoke=smoke)
     elif data_kind == "cw":
         # SAME caches as `datakit`, but read from the CoreWeave cluster-local cwobject mirror
         # (much faster than R2; no cross-stream contention -> enables concurrent runs). Requires

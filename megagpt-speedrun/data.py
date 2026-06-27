@@ -206,6 +206,38 @@ def build_nemotron_datakit_mix(smoke: bool = False):
     )
 
 
+def build_nemotron_datakit_eval_mix(smoke: bool = False):
+    """Datakit mix for POST-HOC bpb eval (held-out slice of the pretrain distribution).
+
+    The standard datakit components are ``source=None`` hardcoded ``/train`` TreeCaches with NO
+    separate ``/validation`` split, so the validation machinery's ``build_caches("validation")``
+    FileNotFound-fails on them. Here each component is ``flat_cache=True`` pointing AT the existing
+    ``/train`` ledger dir: flat caches are SKIPPED for the validation split (datasets.py: flat +
+    split!=train -> None), so no missing cache is read, and ``num_validation_sequences`` (set in
+    launch.py under SP_EVAL=1) slices the held-out eval sequences from the loaded train dataset.
+    Effectively held-out because the 24h run consumed only ~0.19% of the 2.84T-token corpus.
+    """
+    table = _NEMOTRON_R2_SMOKE if smoke else _NEMOTRON_R2_COMPONENTS
+    components = {
+        name: DatasetComponent(
+            source=None,
+            cache_dir=InputName.hardcoded(f"{_R2_TOK_PREFIX}/{rel}/train"),
+            format=TextLmDatasetFormat(),
+            tags=name.split("/"),
+            flat_cache=True,  # cache_root IS the train ledger dir; validation split is skipped
+        )
+        for name, (rel, _) in table.items()
+    }
+    weights = {name: w for name, (_, w) in table.items()}
+    return LmDataConfig(
+        tokenizer=MARIN_TOKENIZER,
+        cache_dir=None,
+        components=components,
+        train_weights=[(0, weights)],
+        auto_build_caches=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # SFT cooldown mixture (chat datasets, assistant-only loss via the chat template's
 # {% generation %} region). These are tokenized INLINE on the worker at cooldown start
@@ -213,9 +245,11 @@ def build_nemotron_datakit_mix(smoke: bool = False):
 # The grug train step already feeds GrugLmExample.loss_weight into the fused-CE `weight` arg,
 # so a ChatLmDatasetFormat component (mask_user_turns=True) yields assistant-only SFT loss with
 # NO train-step change. The marin tokenizer's chat template carries the {% generation %} marker
-# (required by mask_user_turns) and an enable_thinking switch (pinned False -- the data already
-# contains any reasoning inline; we don't want the template to add thinking scaffolding).
-_SFT_R2_CACHE = "s3://marin-na/marin/tokenized/megagpt_sft"  # per-component: /<name>/train
+# (required by mask_user_turns). NB: in marin-levanter>=0.2.28 ``ChatLmDatasetFormat.chat_template_kwargs``
+# is a COLUMN-NAME str|None (per-example kwargs lookup), NOT a static dict -- passing a dict made the
+# processor do ``dict in example`` -> ``TypeError: unhashable type: 'dict'`` and crashed the cache build.
+# We leave it None (no per-example kwargs); enable_thinking is a no-op on the llama3-based marin template.
+_SFT_R2_CACHE = "s3://marin-na/marin/tokenized/megagpt_sft_v2"  # per-component: /<name>/train (v2 = post-fix, clean rebuild)
 
 # name -> (hf id, hf config name, revision, messages column, mixture weight)
 _SFT_COMPONENTS: dict[str, tuple[str, str | None, str | None, str, float]] = {
@@ -234,7 +268,7 @@ def _sft_component(hf_id: str, name: str | None, revision: str | None, messages_
         messages_field=messages_field,
         mask_user_turns=True,  # assistant-only loss (needs the template's {% generation %} marker)
         pack=True,  # pack short conversations to fill seq -- big throughput win for SFT
-        chat_template_kwargs={"enable_thinking": False},
+        chat_template_kwargs=None,  # Jun-26 levanter: COLUMN-NAME str|None (per-example kwargs), NOT a static dict
     )
     src = HfDatasetSourceConfig(
         id=hf_id,

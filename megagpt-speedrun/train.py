@@ -32,7 +32,7 @@ from levanter.data import AsyncDataset, DataLoader
 from levanter.data.mixture import MixtureDataset, rescale_mixture_schedule_for_batch_schedule
 from levanter.data.text import GrugLmExample, LmDataConfig
 from levanter.data.text.examples import grug_lm_example_from_named
-from levanter.eval import TaggedEvaluator, cb_tagged_evaluate
+from levanter.eval import TaggedEvaluator, cb_tagged_evaluate, eval_model
 from levanter.grug.sharding import compact_grug_mesh
 from levanter.models.lm_model import LmExample
 from levanter.optim import AdamConfig, OptimizerConfig
@@ -268,6 +268,43 @@ def _make_mixture_stage_callback(train_dataset: MixtureDataset, batch_schedule: 
         last_mixture_stage = stage
 
     return log_mixture_stage
+
+
+def _make_stdout_throughput_hook(tokens_per_example, batch_schedule, flops_per_example):
+    """Emit a parseable steady-state throughput line to STDOUT every step -- a robust timing signal
+    independent of the throttled tqdm progress bar (which logs only a few times and folds the ~minutes
+    of one-time XLA compile into its early rate). Computes tokens_per_second + MFU directly from
+    levanter's own per-step ``step_duration`` and the device's true peak FLOPs (same formula as
+    levanter.callbacks._metrics.log_performance_stats). Defensive: a hook error NEVER crashes the
+    training loop. Parse with: grep '\\[THRUPUT\\]'."""
+    theoretical = None
+    try:
+        import jax
+        from fray.device_flops import device_flops_for_jax_device
+
+        fpd = device_flops_for_jax_device(jax.devices()[0].device_kind)
+        theoretical = fpd * jax.device_count() if fpd else None
+    except Exception as e:  # pragma: no cover - never fatal
+        print(f"[THRUPUT] device_flops unavailable: {e}", flush=True)
+
+    def hook(step_info):
+        try:
+            dt = float(step_info.step_duration)
+            bs = batch_schedule.batch_size_at_step(step_info.step)
+            if dt > 0:
+                tps = f"{tokens_per_example * bs / dt:.0f}"
+                mfu = (
+                    f"{(flops_per_example * bs / dt) / theoretical * 100:.3f}"
+                    if (flops_per_example and theoretical)
+                    else "na"
+                )
+            else:
+                tps = mfu = "na"
+            print(f"[THRUPUT] step={step_info.step} dt={dt:.4f}s tok_s={tps} mfu={mfu} bs={bs}", flush=True)
+        except Exception as e:  # pragma: no cover - never fatal
+            print(f"[THRUPUT] hook_error: {e}", flush=True)
+
+    return hook
 
 
 @register_dataclass
@@ -586,6 +623,25 @@ def _run_grug_local(config: GrugRunConfig) -> None:
                 eval_cfg=eval_cfg,
             )
 
+        # EVAL-ONLY (SP_EVAL_ONLY=1): run the held-out evaluator ONCE on the loaded checkpoint weights
+        # (true frozen eval -- no train step => no weight drift / data contamination), log bpb, and
+        # return before the training loop. This is the post-hoc bpb headline path, since the pretrain
+        # and cooldown runs trained with eval=None (no validation set wired). Pair with launch.py's
+        # SP_EVAL=1 (holds out SP_VAL_SEQS seqs/component) + SP_INIT_FROM=<checkpoint>.
+        if os.environ.get("SP_EVAL_ONLY") == "1":
+            if evaluator is None:
+                raise ValueError(
+                    "SP_EVAL_ONLY=1 but no eval sets were built -- set SP_EVAL=1 (+ SP_VAL_SEQS) to wire validation."
+                )
+            # Cast params to COMPUTE dtype (bf16) for the eval forward: params are stored in param
+            # dtype (fp32) but the FA4 attention kernel only accepts bf16/fp16, and training casts via
+            # mp.cast_to_compute inside the train step -- the eval forward must match (else float32 -> TypeError).
+            log_dict = eval_model(evaluator, trainer.mp.cast_to_compute(state.params), prefix="eval")
+            levanter.tracker.log(log_dict, step=int(state.step))
+            logger.info("[EVAL_ONLY] " + "  ".join(f"{k}={float(v):.4f}" for k, v in sorted(log_dict.items())))
+            levanter.tracker.current_tracker().finish()
+            return
+
         profiler_cfg = trainer.profiler
         profiler_num_steps = profiler_cfg.resolve_num_profile_steps(num_train_steps=trainer.num_train_steps)
         profiler_enabled = profiler_cfg.is_enabled and profiler_num_steps > 0
@@ -602,6 +658,10 @@ def _run_grug_local(config: GrugRunConfig) -> None:
         state_callbacks.add_hook(
             callbacks.log_performance_stats(config.model.max_seq_len, batch_schedule, flops_per_example),
             every=log_every,
+        )
+        state_callbacks.add_hook(
+            _make_stdout_throughput_hook(config.model.max_seq_len, batch_schedule, flops_per_example),
+            every=1,
         )
         state_callbacks.add_hook(callbacks.pbar_logger(total=trainer.num_train_steps), every=log_every)
         state_callbacks.add_hook(callbacks.log_step_info(trainer.num_train_steps), every=log_every)

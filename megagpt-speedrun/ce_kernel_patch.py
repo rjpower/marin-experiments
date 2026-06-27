@@ -27,9 +27,25 @@ import jax.numpy as jnp
 
 from levanter.kernels.pallas.fused_cross_entropy_loss import api as _api
 from levanter.kernels.pallas.fused_cross_entropy_loss import tuned_block_sizes as _tbs
-from levanter.kernels.pallas.fused_cross_entropy_loss.pallas_gpu import (
-    _max_weight_tile_bytes_for_device,
-)
+
+# marin-levanter >= 0.2.28 (2026-06-26) REMOVED the pallas_gpu fused-CE kernel: the GPU default is
+# now ``batched_xla`` (see api.py ``_default_implementations``), which streams the LM head over vocab
+# in chunks and therefore never materializes the full [tokens, vocab] logits -- the exact OOM this
+# patch guarded against. So on the new levanter there is nothing to patch: import the old pallas_gpu
+# symbol defensively and NO-OP if it's gone.
+try:
+    from levanter.kernels.pallas.fused_cross_entropy_loss.pallas_gpu import (
+        _max_weight_tile_bytes_for_device,
+    )
+
+    _CE_PATCH_ENABLED = True
+except (ImportError, ModuleNotFoundError):
+    _CE_PATCH_ENABLED = False
+    print(
+        "[ce_kernel_patch] pallas_gpu absent (levanter>=0.2.28 uses streaming batched_xla GPU CE) -- "
+        "patch is a no-op; no full-logits materialization to guard against.",
+        flush=True,
+    )
 
 _orig_infer = _tbs.infer_block_sizes_with_tuned_match
 _SAFETY = 0.95  # leave headroom below the hard limit for the kernel's other smem use
@@ -78,6 +94,9 @@ def _patched_infer(b, h, v, *, dtype, x_dtype=None, w_dtype=None, device_kind=No
 
 
 _patched_infer.__wrapped__ = _orig_infer  # type: ignore[attr-defined]
-# Patch both the defining module and the name already imported into `api`.
-_tbs.infer_block_sizes_with_tuned_match = _patched_infer
-_api.infer_block_sizes_with_tuned_match = _patched_infer
+# Patch both the defining module and the name already imported into `api` -- ONLY when the pallas_gpu
+# kernel exists (older levanter). On levanter>=0.2.28 the GPU CE is streaming batched_xla, so leave
+# the tuned-block lookup untouched.
+if _CE_PATCH_ENABLED:
+    _tbs.infer_block_sizes_with_tuned_match = _patched_infer
+    _api.infer_block_sizes_with_tuned_match = _patched_infer
