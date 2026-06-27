@@ -266,14 +266,20 @@ def _embed_prefix(embed_arrays, embed_static, token_ids: jax.Array, spec) -> jax
 
 
 def _head_suffix(head_arrays, head_static, hidden: jax.Array, labels: jax.Array, lw: jax.Array, spec) -> jax.Array:
-    """Stage-P-1 head suffix: optional down-proj + final norms + fused CE → scalar loss."""
+    """Stage-P-1 head suffix: final norms (at D) → optional down-proj (D→d_e) → fused CE.
+
+    Order MUST match model.next_token_loss: final_gated_norm(final_norm(hidden)) runs
+    at the model dim D=hidden_dim, THEN _head_input applies head_down (D → d_e=embed_dim),
+    THEN the fused CE with output_proj [d_e, V]. (Applying head_down first feeds the
+    final_norm a d_e-wide tensor → broadcast error against its D-wide weight.)
+    """
     hd_a, fn_a, fgn_a, op_a = head_arrays
     _hd_s, fn_s, fgn_s, _op_s = head_static
     final_norm = eqx.combine(fn_a, fn_s)
     final_gated_norm = eqx.combine(fgn_a, fgn_s)
+    hidden = final_gated_norm(final_norm(hidden))  # at D=hidden_dim
     if hd_a is not None:
-        hidden = jnp.einsum("bsd,de->bse", hidden, hd_a, out_sharding=spec)
-    hidden = final_gated_norm(final_norm(hidden))
+        hidden = jnp.einsum("bsd,de->bse", hidden, hd_a, out_sharding=spec)  # D -> d_e
     return fused_linear_softmax_cross_entropy_loss(
         hidden, op_a, labels, weight=lw, reduction="mean",
         logsumexp_weight=None, dtype=jnp.float32,
