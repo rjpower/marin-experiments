@@ -145,6 +145,57 @@ SWEEPS = {
                 "SP_SCHEDULE": "linear", "SP_MIN_LR": "0", "SP_WARMUP": "0.02",
                 "SP_TOKENS": "13500000000", "SP_STEPS": "20000"},
     },
+    # ---------------------------------------------------------------------------
+    # Async pipeline-parallel (PP) throughput sweep.
+    #
+    # Goal: measure real H100 throughput of async no-flush PP vs EP+FSDP baseline.
+    # Baseline (run2-e128k8): ~187K tok/s, 15.1% MFU with E128/K8/b16/EP8.
+    # PP eliminates ep_a2a (29% of step) + fsdp_comm (15%) → target ~1.7× raw speedup.
+    # Staleness tax (delay_optim.py profile): ~1.16× at convergence → net ~1.47×.
+    # Expected: ~275K tok/s, ~22% MFU (parametric model from h100_pp_model.py).
+    #
+    # All arms use:
+    #   SP_PP_MODE=async  → launch.py dispatches to train_pp.run_pp_async()
+    #   SP_EP=1           → no expert parallelism (experts local per stage)
+    #   SP_SYNTH_DATA=1   → synthetic data (no loader noise in throughput measurement)
+    #   SP_PP_STAGES=8    → 8 pipeline stages (= 8 H100s per node)
+    #
+    # Safety: unique pp-* prefix for all job names; check client.list_jobs(prefix="/power/")
+    # before and after submit to verify no interference with run2-e128k8/spr1.
+    # ---------------------------------------------------------------------------
+    "pp_async": {
+        # Primary benchmark: production E128/K8 geometry (7.62B model) under async PP
+        # Compare directly to run2-e128k8 at 187K tok/s. SP_EP=1 = experts local per stage.
+        "e128k8p8": {
+            "SP_PP_MODE": "async", "SP_PP_STAGES": "8", "SP_EP": "1",
+            "SP_EXPERTS": "128", "SP_TOPK": "8", "SP_BATCH": "16",
+            "SP_PP_MUON": "1", "SP_PP_REMAT": "1",
+            "SP_STEPS": "80",
+        },
+        # Smaller model: E64/K8 (3.9B, fits in single GPU HBM) — confirms PP overhead
+        "e64k8p8": {
+            "SP_PP_MODE": "async", "SP_PP_STAGES": "8", "SP_EP": "1",
+            "SP_EXPERTS": "64", "SP_TOPK": "8", "SP_BATCH": "16",
+            "SP_PP_MUON": "1", "SP_PP_REMAT": "1",
+            "SP_STEPS": "80",
+        },
+        # No Muon: baseline AdamW to isolate Muon's effect on PP
+        "e128k8p8nomunon": {
+            "SP_PP_MODE": "async", "SP_PP_STAGES": "8", "SP_EP": "1",
+            "SP_EXPERTS": "128", "SP_TOPK": "8", "SP_BATCH": "16",
+            "SP_PP_MUON": "0", "SP_PP_REMAT": "1",
+            "SP_STEPS": "80",
+        },
+        # Bigger batch: P=8 stages means the effective batch per-stage is B/P=2
+        # (each stage processes B=16 seqs sharded across 1 device).
+        # Try larger total batch to amortize optimizer overhead.
+        "e128k8p8b32": {
+            "SP_PP_MODE": "async", "SP_PP_STAGES": "8", "SP_EP": "1",
+            "SP_EXPERTS": "128", "SP_TOPK": "8", "SP_BATCH": "32",
+            "SP_PP_MUON": "1", "SP_PP_REMAT": "1",
+            "SP_STEPS": "80",
+        },
+    },
     # Post-hoc held-out bpb headline (task #17): SP_EVAL_ONLY=1 -> train.py loads the ckpt (geometry
     # MUST match the run that produced it), holds out SP_VAL_SEQS seqs/component from the datakit mix as
     # validation, evals ONCE on the frozen weights, logs `eval/bpb` + per-tag, and exits (no training).

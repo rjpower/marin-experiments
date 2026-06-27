@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+# Copyright The Marin Authors
+# SPDX-License-Identifier: Apache-2.0
+"""Async pipeline-parallel (PP) training entry point for megagpt MoE.
+
+Activated when ``SP_PP_MODE=async`` is set in the environment.
+Reads the same SP_* config vars as train.py, builds the model, and runs
+the async no-flush pipeline (see async_pipeline.py) for SP_STEPS steps.
+
+Key differences from the standard FSDP+EP training (train.py):
+  - No EP (SP_EP is ignored; all experts are local to each stage)
+  - No FSDP all-gather (params resident per stage)
+  - No cross-stage gradient communication
+  - Per-stage Muon (Newton-Schulz on-device, no all-reduce on ortho)
+  - Staleness: stage 0 gradient is (P-1) steps stale; stage P-1 is fresh
+
+Environment variables (subset of standard SP_* + new PP_* vars):
+  SP_PP_STAGES    number of pipeline stages (default 8; should = GPU count)
+  SP_PP_LR        per-stage AdamW learning rate (default 3e-4)
+  SP_PP_MUON      1 (default) to use Muon; 0 for plain AdamW
+  SP_PP_REMAT     1 (default) to use jax.checkpoint per block; 0 off
+  SP_STEPS        number of training steps (default 60)
+  SP_SYNTH_DATA   1 (default for bench) for synthetic data; 0 for real
+  SP_EXPERTS      number of experts (default 128)
+  SP_TOPK         experts per token (default 8)
+  SP_HIDDEN       hidden dim (default 1536)
+  SP_EMBED        embed dim for factorized embedding (default 512)
+  SP_SEQ          sequence length (default 4096)
+  SP_BATCH        batch size in sequences (default 16)
+
+Prints [PP_THRUPUT] lines per step, then exits.  These are parsed by
+monitor.py and emitted to wandb (same as [THRUPUT] lines from train.py).
+
+Launch via iris_jobs.py sweep "pp_async".
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+import logging
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_env():
+    """Parse SP_* environment variables into a config dict."""
+    e = os.environ.get
+    return {
+        "num_stages":   int(e("SP_PP_STAGES", "8")),
+        "lr":           float(e("SP_PP_LR", "3e-4")),
+        "muon":         e("SP_PP_MUON", "1") == "1",
+        "remat":        e("SP_PP_REMAT", "1") == "1",
+        "steps":        int(e("SP_STEPS", "60")),
+        "synth_data":   e("SP_SYNTH_DATA", "1") == "1",
+        "experts":      int(e("SP_EXPERTS", "128")),
+        "topk":         int(e("SP_TOPK", "8")),
+        "hidden_dim":   int(e("SP_HIDDEN", "1536")),
+        "embed_dim":    int(e("SP_EMBED", "512") or "0") or None,  # None = no factorization
+        "seq_len":      int(e("SP_SEQ", "4096")),
+        "batch_size":   int(e("SP_BATCH", "16")),
+        "num_layers":   int(e("SP_LAYERS", "16")),
+        "vocab_size":   int(e("SP_VOCAB", "128256")),
+        "intermediate": int(e("SP_INTERMEDIATE", "768")),
+        "tag":          e("SP_TAG", "pp_async"),
+        "group":        e("SP_GROUP", "megagpt-pp"),
+    }
+
+
+def _build_model_config(cfg: dict):
+    """Build GrugModelConfig from the parsed config dict."""
+    from model import GrugModelConfig
+    return GrugModelConfig(
+        vocab_size=cfg["vocab_size"],
+        hidden_dim=cfg["hidden_dim"],
+        embed_dim=cfg["embed_dim"],
+        intermediate_dim=cfg["intermediate"],
+        shared_expert_intermediate_dim=0,  # no shared expert for PP (simplifies stage split)
+        num_experts=cfg["experts"],
+        num_experts_per_token=cfg["topk"],
+        num_layers=cfg["num_layers"],
+        num_heads=16,
+        num_kv_heads=16,
+        max_seq_len=cfg["seq_len"],
+        sliding_window=cfg["seq_len"],
+        global_attn_every=4,
+        router_z_loss_coef=0.001,
+        remat_mode="recompute_all" if cfg["remat"] else "save_moe",
+    )
+
+
+def _build_wandb(cfg: dict):
+    """Initialize wandb if WANDB_API_KEY is set; else return None."""
+    if not os.environ.get("WANDB_API_KEY"):
+        return None
+    try:
+        import wandb
+        run = wandb.init(
+            project="megagpt-speedrun",
+            group=cfg["group"],
+            name=f"{cfg['tag']}-pp",
+            config={k: v for k, v in cfg.items()},
+            tags=["pp_async", cfg["tag"]],
+        )
+        return run
+    except Exception as e:
+        logger.warning(f"wandb init failed: {e}")
+        return None
+
+
+def _mfu_estimate(model_cfg, steps_per_sec: float, B: int, S: int, num_devices: int) -> float:
+    """Estimate model FLOPs utilization."""
+    try:
+        from levanter.utils.flop_utils import lm_flops_per_token
+        fpt = lm_flops_per_token(
+            hidden_dim=model_cfg.hidden_dim,
+            intermediate_dim=model_cfg.intermediate_dim,
+            shared_intermediate_dim=0,
+            num_layers=model_cfg.num_layers,
+            num_kv_heads=model_cfg.num_kv_heads,
+            num_heads=model_cfg.num_heads,
+            seq_len=S,
+            vocab_size=model_cfg.vocab_size,
+            glu=True,
+            num_experts=model_cfg.num_experts,
+            num_shared_experts=0,
+            num_experts_per_tok=model_cfg.num_experts_per_token,
+        )
+        # 989 TFLOPS/H100 BF16
+        peak = num_devices * 989e12
+        return fpt * B * S * steps_per_sec / peak * 100
+    except Exception:
+        return float("nan")
+
+
+def run_pp_async():
+    """Main entry point for async PP training.
+
+    Called from launch.py when SP_PP_MODE=async.
+    Initializes the model, builds the async pipeline, runs training steps,
+    logs throughput/loss, and exits.
+    """
+    cfg = _parse_env()
+    num_stages = cfg["num_stages"]
+    B = cfg["batch_size"]
+    S = cfg["seq_len"]
+    steps = cfg["steps"]
+
+    logger.info(f"[PP] async pipeline: {num_stages} stages, B={B}, S={S}, steps={steps}")
+    print(f"[PP_CONFIG] stages={num_stages} B={B} S={S} steps={steps} "
+          f"experts={cfg['experts']} topk={cfg['topk']} hidden={cfg['hidden_dim']}", flush=True)
+
+    n_devs = jax.device_count()
+    if n_devs < num_stages:
+        print(f"[PP_WARN] {n_devs} devices < {num_stages} stages; using {n_devs} stages", flush=True)
+        num_stages = n_devs
+
+    # Build model config
+    model_cfg = _build_model_config(cfg)
+
+    # Validate num_layers divisible by num_stages
+    if model_cfg.num_layers % num_stages != 0:
+        # Adjust num_layers
+        adj = (model_cfg.num_layers // num_stages) * num_stages
+        logger.warning(f"num_layers={model_cfg.num_layers} not divisible by {num_stages}; using {adj}")
+        import dataclasses
+        model_cfg = dataclasses.replace(model_cfg, num_layers=adj)
+
+    # Initialize model (using the full multi-device mesh; params will be split to per-stage meshes)
+    from levanter.grug.sharding import compact_grug_mesh
+    from haliax.partitioning import set_mesh
+    from model import Transformer
+    import jax.random
+
+    key = jax.random.PRNGKey(int(os.environ.get("SP_SEED", "0")))
+    # Init on a single-device mesh (faster; params go to device 0, then we split them)
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, AxisType
+    cpu_mesh = Mesh(
+        np.array([[[[jax.devices()[0]]]]]),
+        ("replica_dcn", "data", "expert", "model"),
+        axis_types=(AxisType.Explicit,) * 4,
+    )
+    with set_mesh(cpu_mesh):
+        print("[PP] initializing model...", flush=True)
+        model = Transformer.init(model_cfg, key=key)
+        print(f"[PP] model initialized: {model_cfg.num_layers}L × {model_cfg.hidden_dim}D × "
+              f"{model_cfg.num_experts}E/{model_cfg.num_experts_per_token}K", flush=True)
+
+    # Build async pipeline
+    from async_pipeline import build_async_pipeline
+    print("[PP] building async pipeline...", flush=True)
+    t_build = time.perf_counter()
+    state, step_fn, submeshes = build_async_pipeline(
+        model,
+        num_stages=num_stages,
+        lr=cfg["lr"],
+        muon=cfg["muon"],
+        remat=cfg["remat"],
+    )
+    print(f"[PP] pipeline built in {time.perf_counter() - t_build:.1f}s", flush=True)
+
+    # Warmup
+    warmup_steps = num_stages + 2
+    print(f"[PP] warming up {warmup_steps} steps (JIT compile + pipeline fill)...", flush=True)
+    rng = np.random.default_rng(42)
+    for _ in range(warmup_steps):
+        b = rng.integers(0, model_cfg.vocab_size, (B, S)).astype(np.int32)
+        lw = np.ones((B, S), np.float32)
+        state, _ = step_fn(state, b, lw)
+
+    # Wait for warmup JIT to complete
+    jax.block_until_ready(state.stage_arrays)
+    print("[PP] warmup complete; starting timed training...", flush=True)
+
+    # Initialize wandb
+    wb_run = _build_wandb(cfg)
+
+    # Timed training
+    t0 = time.perf_counter()
+    losses = []
+    step_times = []
+    t_step = t0
+
+    for step in range(steps):
+        if cfg["synth_data"]:
+            b = rng.integers(0, model_cfg.vocab_size, (B, S)).astype(np.int32)
+        else:
+            # Real data not yet wired; fall back to synthetic with a warning
+            logger.warning("SP_SYNTH_DATA=0 requested but real data loader not yet implemented for PP; using synthetic")
+            b = rng.integers(0, model_cfg.vocab_size, (B, S)).astype(np.int32)
+        lw = np.ones((B, S), np.float32)
+
+        state, loss = step_fn(state, b, lw)
+
+        now = time.perf_counter()
+        dt = now - t_step
+        t_step = now
+
+        if loss is not None:
+            losses.append((step, loss))
+
+        elapsed = now - t0
+        # In steady state, each tick produces 1 batch
+        toks = B * S
+        tok_s = toks / dt if dt > 0 else 0
+        step_ms = dt * 1e3
+        step_times.append(dt)
+
+        # MFU estimate (averaged over last 10 steps)
+        if len(step_times) > 1:
+            avg_dt = sum(step_times[-10:]) / min(len(step_times), 10)
+            mfu = _mfu_estimate(model_cfg, 1.0 / avg_dt, B, S, n_devs)
+        else:
+            mfu = float("nan")
+
+        loss_str = f" loss={loss:.4f}" if loss is not None else ""
+        print(
+            f"[PP_THRUPUT] step={step:4d} tok/s={tok_s:.0f} mfu={mfu:.2f}%"
+            f" step_ms={step_ms:.1f}ms{loss_str} elapsed={elapsed:.0f}s",
+            flush=True,
+        )
+
+        if wb_run is not None and loss is not None:
+            wb_run.log({
+                "train/loss": loss,
+                "throughput/tok_s": tok_s,
+                "throughput/mfu_pct": mfu,
+                "throughput/step_ms": step_ms,
+            }, step=step)
+
+    # Final summary
+    jax.block_until_ready(state.stage_arrays)
+    total_elapsed = time.perf_counter() - t0
+    avg_step_ms = sum(step_times) / len(step_times) * 1e3 if step_times else float("nan")
+    avg_tok_s = B * S / (sum(step_times) / len(step_times)) if step_times else float("nan")
+    avg_mfu = _mfu_estimate(model_cfg, 1.0 / (sum(step_times) / len(step_times)), B, S, n_devs) if step_times else float("nan")
+    avg_loss = sum(l for _, l in losses) / len(losses) if losses else float("nan")
+
+    print(
+        f"\n[PP_RESULTS] steps={steps} elapsed={total_elapsed:.1f}s"
+        f" avg_tok_s={avg_tok_s:.0f} avg_mfu={avg_mfu:.2f}%"
+        f" avg_step_ms={avg_step_ms:.1f}ms avg_loss={avg_loss:.4f}",
+        flush=True,
+    )
+
+    if wb_run is not None:
+        wb_run.log({
+            "summary/avg_tok_s": avg_tok_s,
+            "summary/avg_mfu_pct": avg_mfu,
+            "summary/avg_step_ms": avg_step_ms,
+            "summary/avg_loss": avg_loss,
+        })
+        wb_run.finish()
+
+    return {
+        "avg_tok_s": avg_tok_s,
+        "avg_mfu_pct": avg_mfu,
+        "avg_step_ms": avg_step_ms,
+        "avg_loss": avg_loss,
+    }
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    result = run_pp_async()
+    print(f"[PP_DONE] {result}")

@@ -520,6 +520,17 @@ def _make_step() -> ExecutorStep:
 
 
 if __name__ == "__main__":
+    # Async pipeline-parallel (PP) training path.  When SP_PP_MODE=async the standard
+    # FSDP+EP training is bypassed: train_pp.run_pp_async() builds the per-stage
+    # submeshes, runs the async no-flush schedule, emits [PP_THRUPUT] lines, and exits.
+    # This avoids the EP all-to-all (29%) + FSDP all-gather (15%) overhead by keeping
+    # all experts and params local to each stage's device.
+    if os.environ.get("SP_PP_MODE", "") == "async":
+        import sys
+        from train_pp import run_pp_async
+        run_pp_async()
+        sys.exit(0)
+
     # Fast worker-side diagnostics that reuse the normal job bundle but skip the
     # full training pipeline (e.g. SP_DIAG=ragged probes the MoE grouped-matmul
     # backend that drives the 278 GiB OOM).
