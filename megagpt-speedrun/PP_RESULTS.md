@@ -1,108 +1,120 @@
 # Async Pipeline Parallelism — Results
 
-## STATUS: NO MEASURED THROUGHPUT YET
+## STATUS: COMPLETE — NEGATIVE RESULT (measured)
 
-**There are currently zero measured `[PP_THRUPUT]` readings.** The first batch of
-8-GPU jobs all OOM'd during compilation (root cause below, now fixed). Everything
-in the "Predictions" section is a PARAMETRIC MODEL, not a measurement. Do not cite
-it as a result. This file will only report measured numbers once a job emits real
-`[PP_THRUPUT]` lines.
+Async no-flush pipeline parallelism (P=8 stages, 1 H100/stage, experts-local,
+params-resident, per-stage Muon) was built, verified for schedule correctness, and
+**measured on a real 8×H100 node**. It does **not** beat the EP+FSDP baseline — it is
+~5.7× slower. The bottleneck is structural (single-threaded eager JAX dispatch cannot
+overlap 8 device streams), not a tunable. Recommendation: **do not pursue PP** for this
+model/hardware; keep the EP+FSDP pretrain (`run2-e128k8`, 187K tok/s, 15.1% MFU).
 
-## Root Cause of the First Failure (diagnosed from real logs)
-
-All three `pp2-*` jobs died at compile with `RESOURCE_EXHAUSTED: Out of memory
-trying to allocate 16.00GiB`. The actual allocation site (from the job log):
-
-```
-jit(forward)/checkpoint/Block/CausalSelfAttention/bqhd,bkhd->bhqk/dot_general
-%gemm_fusion_dot.27 = f32[256,4096,4096]
-```
-
-That is the **attention score matrix** `[B*H, S, S]` in **f32**, NOT the logits:
-`256 × 4096 × 4096 × 4 bytes = 16 GiB`. The OOM was at **stage 0** (attention),
-not the last stage. Three compounding bugs in the PP path, all now fixed:
-
-1. **`attention_implementation` defaulted to `None`** → `reference_attention`,
-   which materializes the full `[B*H,S,S]` score matrix. The EP+FSDP baseline sets
-   `SP_ATTN=gpu_fa4_cute` (FlashAttention-4, never materializes the matrix).
-   FIX: build the model config via the same `MoeAdamHHeuristic` + override path as
-   `launch.py`, setting `attention_implementation="gpu_fa4_cute"`.
-
-2. **f32 compute** (no mixed precision). Baseline runs `compute=bfloat16`; the FA4
-   kernel ONLY accepts bf16/fp16 inputs (train.py:636-639). FIX: store f32 master
-   weights per stage, cast to bf16 inside each stage's forward (`_cast_compute`);
-   the vjp upcasts grads back to f32 for the optimizer/Muon.
-
-3. **No packed `segment_ids`** on the attention mask. `gpu_fa4_cute` raises
-   `NotImplementedError` when `mask.segment_ids is None`. FIX: `_build_stage_masks`
-   now attaches segment_ids matching the synthetic-data loader (~1024-token docs).
-
-Bonus geometry fix: the hardcoded `num_heads=16` gave the wrong `B*H`; the
-heuristic-built config uses the production 12 heads / 3 KV heads / I=768 / 16 layers,
-so the PP benchmark now runs at the EXACT same geometry as the run2-e128k8 anchor.
-
-Note: the relayed diagnosis (full-logits CE materialization) was incorrect for this
-failure — the logs show it was the attention score matrix at stage 0. The CE head
-was already using the chunked `fused_linear_softmax_cross_entropy_loss`.
-
-## Verification Plan (economical: 1-GPU before 8-GPU)
-
-1. **CPU schedule smoke** (`smoke_async_pp.py`): PASS 4/4 — schedule correctness,
-   staleness profile (all 8 stages fire at tick P-1=7), buffer depths exact.
-   (Linear einsum model; does not exercise FA4/Pallas.)
-2. **1-GPU stage smoke** (`iris_jobs.py pp_smoke --gpus H100x1`, SP_PP_SMOKE=1):
-   builds production-geometry model, runs fwd+bwd for first/mid/last stage types on
-   ONE device at real per-stage shape. Confirms the attention fix fits per-device
-   memory WITHOUT burning an 8-GPU node. STATUS: <pending>
-3. **8-GPU throughput** (`iris_jobs.py pp_async --gpus H100x8`): only after (2) passes.
-   STATUS: <pending>
-
-## Parametric PREDICTIONS (NOT measurements — from h100_pp_model.py)
-
-Profiled EP+FSDP step decomposition (E128/K8/b16): compute 31% | ep_a2a 29% |
-fsdp_comm 15% | opt 10% | bubble 15%. PP eliminates ep_a2a+fsdp_comm = 44%.
-
-| Quantity | Predicted (unverified) |
-|----------|------------------------|
-| Raw PP speedup | ~1.9× |
-| Staleness tax (per-stage τ, 15k steps) | ~1.16× |
-| Net speedup | ~1.64× |
-| tok/s at E128/K8/b16 | ~307K (baseline 187K) |
-| MFU | ~24.8% (baseline 15.1%) |
-
-These are hypotheses to be confirmed or refuted by measurement.
+All numbers below are MEASURED (`[PP_THRUPUT]`/`[PP_RESULTS]` log lines), at the exact
+production geometry (16L × 1536D × 128E/8K, B=16, S=4096, synthetic data SP_SYNTH_DATA=1).
 
 ## MEASURED RESULTS
 
-_(empty — no `[PP_THRUPUT]` reading yet)_
+| Run | Schedule / transport | tok/s (steady median) | MFU | step_ms | vs EP+FSDP |
+|-----|----------------------|-----------------------|-----|---------|------------|
+| EP+FSDP baseline (`run2-e128k8`) | sharded single-jit over full mesh | **187,000** | **15.1%** | — | 1.0× |
+| pp6 | forward-sweep + sequential backward-sweep | 21,500 | 0.52% | ~3050 | 0.115× |
+| pp7 | 1F1B, transport interleaved between dispatches | 21,500 | 0.52% | ~3050 | 0.115× |
+| pp8 | 1F1B, **all transports deferred** off dispatch path | **32,702** | **0.79%** | 2004 | **0.175×** |
 
-### Primary: E128/K8/b16 + Muon
-```
-tok/s:    <pending>     (baseline 187K)
-MFU:      <pending>     (baseline 15.1%)
-step_ms:  <pending>
-avg_loss: <pending>
-```
+pp8 steady state (steps 16→80) is flat and stable: 31.9K–32.9K tok/s, 0.78–0.79% MFU,
+~2.0 s/step. (Step-8 chunk = 2.5K tok/s is the one-time pipeline-fill + first-touch
+allocation; excluded from the median, as designed.) Loss is flat ~11.77 — expected, this
+is an 80-step throughput benchmark on random synthetic tokens, not a convergence run.
 
-## Go/No-Go Criteria (to be evaluated against MEASURED numbers)
+### What each fix bought (measured deltas)
+- **1F1B vs sweep** (pp7 vs pp6): **0×** — identical 21.5K. The schedule shape is
+  irrelevant when the stages don't actually overlap.
+- **Deferring all cross-device transfers** off the dispatch thread (pp8 vs pp7):
+  **1.52×** (21.5K → 32.7K). Real, but the transport was only ~1/3 of the per-step
+  time; removing it from the critical path does not create cross-device overlap.
 
-- GO if measured tok/s ≥ 250K (≥1.34× over 187K) OR MFU ≥ 20%.
-- NO-GO (valid negative result) if PP cannot beat EP+FSDP after the fix — report
-  the measured numbers and the bottleneck (P2P, sequential backward, opt overhead).
+## Root Cause (the negative result, explained)
 
-## Deliverables Still Outstanding
+A ~2.0 s step with 8 stages is **~0.25 s/stage running serially**. Full overlap would put
+the step time at ~one stage time (~0.25 s → ~256K tok/s). We never get there.
 
-- [ ] A real `[PP_THRUPUT]` reading (tok/s + MFU) at E128/K8.
-- [ ] Staleness token-tax: loss-vs-tokens of async-PP vs the non-pipelined baseline.
-- [ ] Whether experts-local frees HBM for chonkier experts (memory headroom probe).
+The pipeline is implemented as **eager, single-Python-thread, per-device `jit` dispatch**:
+each tick the host loops `for s in range(8): fns[s].forward(...)` then the backwards, one
+device per call. Two things keep this serial regardless of schedule:
+
+1. **Cross-device `device_put` blocks the dispatch thread.** A device→device transfer that
+   routes through host does a synchronous `device_get` (waits for the source to be ready)
+   on the only thread that issues compute. pp7 paid this between every stage. pp8 defers
+   all transfers to after all dispatches — which is why pp8 is 1.5× faster — but it is not
+   enough to overlap.
+2. **Single-thread eager dispatch cannot saturate 8 device streams.** Even with transfers
+   removed from the critical path, issuing 8 independent `jit` calls from one Python thread
+   does not get the 8 GPUs computing concurrently: per-call host dispatch latency plus the
+   per-tick weight-update dependency chain (each stage updates its own weights every tick,
+   so tick t+1's stage-s forward waits on tick t's stage-s optimizer) serialize the work.
+
+This is exactly why EP+FSDP wins: it is **one** `jit`'d computation over the full 8-GPU
+mesh, so XLA schedules all-device compute and collectives together. Our PP is 8 separate
+eager computations the host feeds one at a time.
+
+`grug-moe-pp/thread_probe.py` PASSES — it proves a *background transport thread* can move
+arrays concurrently with main-thread dispatch without deadlock. That is the mechanism the
+real fix would need, but it is a different (threaded/multi-process) execution model than the
+eager loop measured here.
+
+## Did experts-local free HBM for chonkier experts?
+
+Partially confirmed, but moot. With EP=1 per stage each device holds only 2 of 16 layers'
+worth of all 128 experts, fully resident, no FSDP all-gather — pp8 ran the full E128
+production geometry on 8×H100 with **no OOM** (the EP+FSDP baseline needs `save_moe` remat
+and sits near the fragmentation edge above ~E144). So PP does free per-device memory. But
+freed HBM is worthless when the pipeline can't keep the GPUs busy: at 0.79% MFU you cannot
+exploit bigger experts. No memory-headroom sweep was run — there is no point chasing
+capacity on a 6×-slower trainer.
+
+## Staleness token-tax
+
+Not measured as a loss-vs-tokens curve: it would only matter if PP were throughput-
+competitive, and it is not (6× slower kills it before staleness is even relevant). The
+schedule's staleness is, however, verified exactly on CPU (`smoke_async_pp.py`,
+`test_staleness_profile` PASS): 1F1B grad delay = 2·(P−1)−s ticks, i.e. stage 0 applies
+gradients 14 ticks stale, the last stage fresh. At P=8 that is a *large* delay; the CPU
+toy (linear model, no Muon, high LR) diverges under it, a reminder that P=8 async-no-flush
+staleness is aggressive — another reason not to pursue this path.
+
+## Go / No-Go
+
+**NO-GO.** Measured 32.7K tok/s / 0.79% MFU is 5.7× slower than EP+FSDP's 187K / 15.1%.
+The GO bar (≥250K tok/s or ≥20% MFU) is missed by an order of magnitude, and the gap is
+structural, not parametric. Keep the EP+FSDP pretrain.
+
+### If PP were ever revisited (not recommended for this model)
+The only path to real overlap is to abandon single-thread eager dispatch:
+- **multi-process JAX**, one process per GPU, explicit send/recv (`ppermute`) collectives
+  between neighbor stages, each process driving its own device stream; or
+- a **single `shard_map`/manual-collective pipeline** `jit`'d over the whole mesh (let XLA
+  schedule the stages), which is essentially what EP+FSDP already does.
+Both are substantial rewrites with uncertain payoff given EP+FSDP already runs at 15.1% MFU.
+
+## Schedule-correctness verification (passed before the GPU runs)
+
+- `smoke_async_pp.py` (CPU, 8 simulated devices): **4/4 PASS** — warmup fill, buffer depths
+  exact (`act_fifo[s]` depth 2·(P−1−s), `label_pipe` depth P−1), staleness profile exact
+  (`[14,13,12,11,10,9,8,7]`). The schedule is correct; the execution model is the problem.
+- Attention/CE memory: the original 8-GPU OOM was the **attention score matrix**
+  `f32[256,4096,4096]` at stage 0 (reference attention in f32), NOT the logits. Fixed with
+  `gpu_fa4_cute` + bf16 compute + packed `segment_ids` + heuristic geometry; pp6/pp7/pp8 all
+  ran clean. (The relayed "full-logits CE" diagnosis was incorrect for this failure; the CE
+  head already used the chunked `fused_linear_softmax_cross_entropy_loss`.)
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `async_pipeline.py` | Core: schedule, buffers, per-stage Muon, bf16 cast, segment_ids |
-| `smoke_async_pp.py` | CPU schedule correctness tests (PASS 4/4) |
+| `async_pipeline.py` | Core: 1F1B schedule, per-stage buffers, per-stage Muon, bf16 cast, segment_ids, **deferred transport** |
+| `smoke_async_pp.py` | CPU schedule-correctness tests (PASS 4/4) |
 | `train_pp.py` | H100 entry point + `gpu_smoke()` (SP_PP_SMOKE=1, 1-GPU) |
 | `iris_jobs.py` | `pp_smoke` (1-GPU verify) + `pp_async` (8-GPU benchmark) sweeps |
 | `launch.py` | SP_PP_MODE=async dispatch hook |
-| `h100_pp_model.py` | Parametric model (predictions only) |
+| `grug-moe-pp/thread_probe.py` | Proves the threaded-transport mechanism (the real-fix prerequisite) |
+| `h100_pp_model.py` | Parametric model — PREDICTIONS ONLY, superseded by the measurements above |

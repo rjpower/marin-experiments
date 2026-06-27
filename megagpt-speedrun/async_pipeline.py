@@ -576,17 +576,27 @@ def build_async_pipeline(
         new_bwd_in = [None] * num_stages
         loss_dev = None
 
-        # ----- FORWARD HOPS (+ last stage's immediate backward) -----
-        # Stage 0 always forwards the freshly arrived batch.
+        # CRITICAL for overlap: dispatch ALL per-stage compute back-to-back FIRST, and
+        # defer every cross-device _transport (device_put) to AFTER all dispatches.
+        # An interleaved `device_put(stage_output, next_device)` between forward
+        # dispatches blocks the single host dispatch thread until that stage finishes
+        # -> the 8 stages run strictly serially (measured: 21.5K tok/s / 0.52% MFU,
+        # identical for the sweep and 1F1B schedules). Issuing all 8 forwards (then all
+        # backwards) without an intervening transfer lets JAX queue them on all 8 device
+        # streams so they actually overlap; the transfers then run over already-overlapping
+        # compute. (See grug-moe-pp/thread_probe.py: transport on the dispatch thread
+        # serializes the pipeline.)
+
+        fwd_out = [None] * num_stages   # raw stage outputs (on device s), pre-transport
+        bwd_dx = [None] * num_stages    # raw upstream cotangents (on device s), pre-transport
+        opt_jobs = []                   # (stage, dparams) applied after all dispatches
+
+        # ----- dispatch ALL forward hops (+ last stage's immediate backward) -----
         tok0 = _put_batch(batch_tokens_np, submeshes[0])
         with set_mesh(submeshes[0]):
             h0, _z0 = fns[0].forward(stage_arrays[0], tok0)
         act_fifo[0].append(tok0)
-        if num_stages > 1:
-            new_fwd_in[1] = _transport(h0, submeshes[1])
-        else:
-            # Degenerate single-stage case: treat stage 0 as the last stage.
-            pass
+        fwd_out[0] = h0
 
         for s in range(1, num_stages):
             a = fwd_in[s]
@@ -596,7 +606,7 @@ def build_async_pipeline(
                 with set_mesh(submeshes[s]):
                     hs, _zs = fns[s].forward(stage_arrays[s], a)
                 act_fifo[s].append(a)
-                new_fwd_in[s + 1] = _transport(hs, submeshes[s + 1])
+                fwd_out[s] = hs
             else:
                 # LAST stage: forward (with labels) then immediately backward.
                 lbl_np, lw_np = label_pipe.popleft()
@@ -607,23 +617,35 @@ def build_async_pipeline(
                     loss_v, z_v = fns[s].forward(stage_arrays[s], a, lbl, lw)
                     dparams, dx = fns[s].backward(stage_arrays[s], a, lbl, lw, dloss_one, dz_scalar)
                 loss_dev = loss_v + z_v * z_coef
-                _apply_opt(s, dparams, stage_arrays, stage_opt_st)
+                opt_jobs.append((s, dparams))
                 if s > 0:
-                    new_bwd_in[s - 1] = _transport(dx, submeshes[s - 1])
+                    bwd_dx[s] = dx  # transported below to stage s-1
 
-        # ----- BACKWARD HOPS for stages 0..last-1 (cotangent arrived last tick) -----
-        for s in range(last):  # 0 .. last-1
+        # ----- dispatch ALL backward hops for stages 0..last-1 (cotangent from last tick) -----
+        for s in range(last):
             c = bwd_in[s]
             if c is None:
                 continue  # cotangent hasn't reached this stage yet
-            old_in = act_fifo[s].popleft()  # matching saved forward input (on device s)
+            old_in = act_fifo[s].popleft()
             mesh = submeshes[s]
             with set_mesh(mesh):
                 if s == 0:
                     dparams = fns[0].backward(stage_arrays[0], old_in, c, dz_scalar)
                 else:
                     dparams, dx = fns[s].backward(stage_arrays[s], old_in, c, dz_scalar)
-                    new_bwd_in[s - 1] = _transport(dx, submeshes[s - 1])
+                    bwd_dx[s] = dx
+            opt_jobs.append((s, dparams))
+
+        # ----- now do the cross-device transfers (compute already dispatched/overlapping) -----
+        for s in range(num_stages - 1):
+            if fwd_out[s] is not None:
+                new_fwd_in[s + 1] = _transport(fwd_out[s], submeshes[s + 1])
+        for s in range(1, num_stages):
+            if bwd_dx[s] is not None:
+                new_bwd_in[s - 1] = _transport(bwd_dx[s], submeshes[s - 1])
+
+        # ----- apply per-stage optimizers (local, async) -----
+        for s, dparams in opt_jobs:
             _apply_opt(s, dparams, stage_arrays, stage_opt_st)
 
         new_state = AsyncPipelineState(
