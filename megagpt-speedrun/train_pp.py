@@ -37,12 +37,23 @@ from __future__ import annotations
 
 import os
 import sys
+import dataclasses
 import time
 import logging
 
 import jax
 import jax.numpy as jnp
+import jax.random  # explicit submodule import avoids UnboundLocalError from lazy imports
 import numpy as np
+import optax
+import equinox as eqx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, AxisType
+
+# Module-level imports of local files (uploaded with workspace to worker)
+from levanter.grug.sharding import compact_grug_mesh
+from haliax.partitioning import set_mesh
+from model import Transformer, GrugModelConfig
+from async_pipeline import build_async_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -167,31 +178,22 @@ def run_pp_async():
         # Adjust num_layers
         adj = (model_cfg.num_layers // num_stages) * num_stages
         logger.warning(f"num_layers={model_cfg.num_layers} not divisible by {num_stages}; using {adj}")
-        import dataclasses
         model_cfg = dataclasses.replace(model_cfg, num_layers=adj)
 
-    # Initialize model (using the full multi-device mesh; params will be split to per-stage meshes)
-    from levanter.grug.sharding import compact_grug_mesh
-    from haliax.partitioning import set_mesh
-    from model import Transformer
-    import jax.random
-
+    # Initialize model on a single-device mesh for speed.
+    # Params are split to per-stage submeshes inside build_async_pipeline.
     key = jax.random.PRNGKey(int(os.environ.get("SP_SEED", "0")))
-    # Init on a single-device mesh (faster; params go to device 0, then we split them)
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, AxisType
-    cpu_mesh = Mesh(
+    init_mesh = Mesh(
         np.array([[[[jax.devices()[0]]]]]),
         ("replica_dcn", "data", "expert", "model"),
         axis_types=(AxisType.Explicit,) * 4,
     )
-    with set_mesh(cpu_mesh):
+    with set_mesh(init_mesh):
         print("[PP] initializing model...", flush=True)
         model = Transformer.init(model_cfg, key=key)
         print(f"[PP] model initialized: {model_cfg.num_layers}L × {model_cfg.hidden_dim}D × "
               f"{model_cfg.num_experts}E/{model_cfg.num_experts_per_token}K", flush=True)
 
-    # Build async pipeline
-    from async_pipeline import build_async_pipeline
     print("[PP] building async pipeline...", flush=True)
     t_build = time.perf_counter()
     state, step_fn, submeshes = build_async_pipeline(
