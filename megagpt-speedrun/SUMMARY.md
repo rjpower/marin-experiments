@@ -105,10 +105,16 @@ uv run python analyze_profile.py <run_id_substr>
   (in `BASE` + launch.py). **Any new run must carry this.**
 - **Silent data-loading hang:** loader blocks ("Data loading is taking a long time: N seconds, Waiting
   for K items"), step frozen, state stays `running`, `--max-retries` does NOT recover. Hit both the
-  pretrain and the SFT cooldown. Recovery: kill the FULL job name, confirm released, relaunch identical →
-  resumes from the last 30-min temp checkpoint (`s3://marin-na/tmp/ttl=14d/checkpoints-temp/…`). NB job
-  logs MIX the killed attempt's tail with the new run — diagnose by ADVANCING step numbers / fresh
-  timestamps, and treat a *constant* "Data loading" value as stale (a real hang *climbs*).
+  pretrain and the SFT cooldown. **ROOT-CAUSED + FIXED (see `SFT.md`):** the SFT `cool` sweep was missing
+  `LEVANTER_TS_CACHE_LIMIT` (default 1GB ⇒ R2 re-fetch thrash ⇒ a hung R2 GET with no timeout ⇒ the
+  loader's `get_batch()` blocks forever). NOT the inline tokenization — all 3 caches consolidated ~20 min
+  before the stall. Fix: (a) `iris_jobs.py BASE` now exports `LEVANTER_TS_CACHE_LIMIT=32GB`; (b)
+  `data.build_sft_mix` reads the STATIC pre-built cache (`auto_build_caches=False`, no zephyr build
+  sub-job) and by default LOCALIZES the (3.3GB) cache to the worker's local disk ⇒ zero R2 reads during
+  training ⇒ a hung GET is structurally impossible. Validated by a 12k-step CPU loader soak (past the
+  ~9.8k hang point). Recovery for any *other* hang: kill the FULL job name, confirm released, relaunch
+  identical → resumes from the last 30-min temp checkpoint. NB job logs MIX the killed attempt's tail with
+  the new run — diagnose by ADVANCING step numbers / fresh timestamps (a real hang *climbs*).
 - **Version-drift:** the worker runs INSTALLED wheels, not the dev tree. After a marin bump, re-validate
   actual call paths (the SFT chat formatter's `chat_template_kwargs` flipped from a static dict to a
   column-name string between locks → `TypeError: unhashable type: 'dict'` in the cache build).

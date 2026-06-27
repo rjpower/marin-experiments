@@ -37,6 +37,13 @@ BASE = {
     # written by XLA's C++ tsl::Env, which is FATAL for the batched_xla CE's __triton_gemm fusions
     # (levanter>=0.2.28). marin does this in resolve_training_env; the grug path bypasses it. See launch.py.
     "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES": "none",
+    # Tensorstore read cache (32GB). launch_cw.sh sets this; iris_jobs.py did NOT, which is what
+    # SILENTLY HUNG cool2-sft (default 1GB -> the block-shuffle window's ~2GB working set is evicted
+    # and re-fetched from R2 -> "re-fetch thrash" -> eventually one R2 GET hangs with no timeout ->
+    # the data loader's get_batch() blocks forever, job stays state=running, --max-retries can't
+    # recover). 32GB holds any of our real-data working sets in RAM after the first touch. No-op for
+    # SP_SYNTH_DATA=1 benchmarks; not part of the run_id, so it never affects cache identity.
+    "LEVANTER_TS_CACHE_LIMIT": "34359738368",
 }
 
 # --- Named sweeps. Each entry: suffix -> dict of SP_* overrides on top of BASE. ---
@@ -123,15 +130,20 @@ SWEEPS = {
         "e64k8prof": {"SP_EXPERTS": "64", "SP_TOPK": "8", "SP_BATCH": "16", "SP_EP": "8",
                       "SP_STEPS": "40", "SP_PROFILE": "1", "SP_PROF_START": "20", "SP_PROF_STEPS": "4"},
     },
-    # SFT cooldown of the spr1 production checkpoint (E64/K8/seq4096, constant-LR pretrain). Geometry
-    # MUST match spr1 exactly so train.py grafts the model params. REAL data (synth off), assistant-only
-    # chat loss, linear decay peak->0. Pass --init-from <spr1 final ckpt>. SP_TOKENS=5.4e9 reproduces
-    # the pretrain peak LR (heuristic derives LR from token magnitude); SP_STEPS sets the short horizon.
+    # SFT cooldown of the run2 production checkpoint. Geometry MUST match run2 (E128/K8/seq4096/b16/EP8/
+    # save_moe) so train.py grafts the model params (SP_INIT_FROM = weights-only, step->0, fresh opt).
+    # REAL data via the ROBUST static SFT path (data.build_sft_mix: auto_build_caches=False, pre-built
+    # cache localized to the worker's local disk -> zero R2 reads -> no silent data-loader hang; the
+    # cool2-sft hang was the MISSING LEVANTER_TS_CACHE_LIMIT, now in BASE). Assistant-only chat loss,
+    # linear LR decay peak->0. SP_TOKENS=13.5e9 reproduces run2's pretrain peak LR (heuristic derives LR
+    # from token magnitude). SP_STEPS=20000 -> ~1.31B SFT tokens (~2 epochs of the 3.3GB cache / ~10%
+    # of the 13.5B pretrain budget / ~2h at run2's ~178K tok/s). Bump SP_STEPS for a longer cooldown.
+    # Run: uv run python iris_jobs.py cool --tag run2cool --init-from <run2 final /checkpoints dir>
     "cool": {
-        "sft": {"SP_EXPERTS": "64", "SP_TOPK": "8", "SP_BATCH": "16", "SP_EP": "8", "SP_SEQ": "4096",
+        "sft": {"SP_EXPERTS": "128", "SP_TOPK": "8", "SP_BATCH": "16", "SP_EP": "8", "SP_SEQ": "4096",
                 "SP_REMAT": "save_moe", "SP_SYNTH_DATA": "0", "SP_DATA": "sft",
                 "SP_SCHEDULE": "linear", "SP_MIN_LR": "0", "SP_WARMUP": "0.02",
-                "SP_TOKENS": "5400000000", "SP_STEPS": "16000"},
+                "SP_TOKENS": "13500000000", "SP_STEPS": "20000"},
     },
     # Post-hoc held-out bpb headline (task #17): SP_EVAL_ONLY=1 -> train.py loads the ckpt (geometry
     # MUST match the run that produced it), holds out SP_VAL_SEQS seqs/component from the datakit mix as

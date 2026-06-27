@@ -25,6 +25,8 @@ llama3-equivalent and not gated, so we use it for every component (mixtures asse
 shared tokenizer).
 """
 
+import os
+
 from levanter.data.text import (
     ChatLmDatasetFormat,
     DatasetComponent,
@@ -240,16 +242,34 @@ def build_nemotron_datakit_eval_mix(smoke: bool = False):
 
 # ---------------------------------------------------------------------------
 # SFT cooldown mixture (chat datasets, assistant-only loss via the chat template's
-# {% generation %} region). These are tokenized INLINE on the worker at cooldown start
-# (auto_build_caches=True) from HF and the TreeCache is written to R2 so a retry reuses it.
-# The grug train step already feeds GrugLmExample.loss_weight into the fused-CE `weight` arg,
-# so a ChatLmDatasetFormat component (mask_user_turns=True) yields assistant-only SFT loss with
-# NO train-step change. The marin tokenizer's chat template carries the {% generation %} marker
-# (required by mask_user_turns). NB: in marin-levanter>=0.2.28 ``ChatLmDatasetFormat.chat_template_kwargs``
-# is a COLUMN-NAME str|None (per-example kwargs lookup), NOT a static dict -- passing a dict made the
-# processor do ``dict in example`` -> ``TypeError: unhashable type: 'dict'`` and crashed the cache build.
-# We leave it None (no per-example kwargs); enable_thinking is a no-op on the llama3-based marin template.
-_SFT_R2_CACHE = "s3://marin-na/marin/tokenized/megagpt_sft_v2"  # per-component: /<name>/train (v2 = post-fix, clean rebuild)
+# {% generation %} region). tulu-3 + smoltalk + OpenThoughts-Agent. The grug train step
+# already feeds GrugLmExample.loss_weight into the fused-CE `weight` arg, so a
+# ChatLmDatasetFormat component (mask_user_turns=True) yields assistant-only SFT loss with NO
+# train-step change. The marin tokenizer's chat template carries the {% generation %} marker.
+#
+# ROBUST READ PATH -- post-mortem of cool2-sft's SILENT ~4.5h data-loader hang at ~step 9.8k
+# ("Data loading is taking a long time ... Waiting for 1024 items", climbing to 16,310s, job
+# stays state=running, --max-retries cannot recover):
+#   * The hang was NOT the inline tokenization. All 3 component caches built & consolidated
+#     fine (tulu3/smoltalk/ot_agent finished ~05:23/05:34/05:42) ~20 min BEFORE the stall began
+#     (~06:01). It was a READ-side stall: cool2-sft was launched via iris_jobs.py, whose BASE
+#     env LACKS ``LEVANTER_TS_CACHE_LIMIT`` (launch_cw.sh sets it to 32GB). With the default 1GB
+#     tensorstore read cache the block-shuffle window's ~2GB working set is evicted and
+#     re-fetched from R2 ("re-fetch thrash"), and eventually one R2 GET hangs with NO timeout
+#     -> the loader's get_batch() blocks forever (tensorstore s3 driver has no read timeout).
+# FIX (defense in depth):
+#   (1) auto_build_caches=False + source=None: read the STATIC pre-built TreeCache directly --
+#       NO inline zephyr cache-build sub-job inside the training process at all. The cache is
+#       already on R2 (all 3 components consolidated); (re)build it with build_sft_cache_build_mix().
+#   (2) By default LOCALIZE the (tiny, 3.3GB) cache to the worker's LOCAL DISK at startup and
+#       read it via the tensorstore "file" driver -> ZERO R2 reads during training -> a hung R2
+#       GET is structurally impossible. SP_SFT_LOCAL=0 disables this (reads the R2 cache directly,
+#       then relying on LEVANTER_TS_CACHE_LIMIT to hold the whole working set in RAM).
+#   (3) iris_jobs.py `cool` sweep also exports LEVANTER_TS_CACHE_LIMIT (belt + braces for (2) off).
+# NB marin-levanter>=0.2.28 ``ChatLmDatasetFormat.chat_template_kwargs`` is a COLUMN-NAME str|None
+# (per-example kwargs lookup), NOT a static dict -- a dict made the processor do ``dict in example``
+# -> ``TypeError: unhashable type: 'dict'``; we leave it None.
+_SFT_R2_CACHE = "s3://marin-na/marin/tokenized/megagpt_sft_v2"  # per-component: /<name>/train (consolidated)
 
 # name -> (hf id, hf config name, revision, messages column, mixture weight)
 _SFT_COMPONENTS: dict[str, tuple[str, str | None, str | None, str, float]] = {
@@ -263,39 +283,121 @@ _SFT_COMPONENTS: dict[str, tuple[str, str | None, str | None, str, float]] = {
 }
 
 
-def _sft_component(hf_id: str, name: str | None, revision: str | None, messages_field: str, tag: str):
-    fmt = ChatLmDatasetFormat(
+def _sft_format(messages_field: str) -> ChatLmDatasetFormat:
+    return ChatLmDatasetFormat(
         messages_field=messages_field,
         mask_user_turns=True,  # assistant-only loss (needs the template's {% generation %} marker)
         pack=True,  # pack short conversations to fill seq -- big throughput win for SFT
-        chat_template_kwargs=None,  # Jun-26 levanter: COLUMN-NAME str|None (per-example kwargs), NOT a static dict
+        chat_template_kwargs=None,  # COLUMN-NAME str|None in levanter>=0.2.28, NOT a static dict
     )
-    src = HfDatasetSourceConfig(
-        id=hf_id,
-        name=name,
-        revision=revision,
-        format=fmt,
-        splits=["train"],
-        stream=True,
+
+
+def _localize_sft_cache(names: list[str], s3_prefix: str = _SFT_R2_CACHE, local_root: str | None = None) -> str:
+    """Mirror each component's consolidated TreeCache (shard_ledger.json + input_ids/ +
+    assistant_masks/) from R2 to local disk, then return the local root so training reads it via
+    the tensorstore "file" driver -- no R2 reads during training => the cool2-sft hung-GET hang
+    is structurally impossible. Uses fsspec (which, unlike tensorstore's raw s3 driver, has
+    request timeouts/retries), so a download problem CRASHES loudly + is --max-retries-recoverable
+    rather than hanging silently.
+
+    Idempotent: a component whose local ``.localized`` marker exists is skipped (instant on a
+    --max-retries resume that kept the pod; ~30s-2min cold for the ~3.3GB set on a fresh pod).
+    """
+    import fsspec
+
+    local_root = local_root or os.environ.get("SP_SFT_LOCAL_DIR", "/tmp/megagpt_sft_v2")
+    fs = fsspec.filesystem(
+        "s3",
+        endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+        key=os.environ.get("AWS_ACCESS_KEY_ID"),
+        secret=os.environ.get("AWS_SECRET_ACCESS_KEY"),
     )
+    s3_base = s3_prefix.replace("s3://", "")  # fsspec s3 paths are bucket/key (no scheme)
+    for name in names:
+        dst = os.path.join(local_root, name, "train")
+        marker = os.path.join(dst, ".localized")
+        if os.path.exists(marker):
+            continue
+        os.makedirs(dst, exist_ok=True)
+        src = f"{s3_base}/{name}/train"
+        fs.get(f"{src}/shard_ledger.json", os.path.join(dst, "shard_ledger.json"))
+        # consolidated layout: the reader (TreeStore.open) only needs the flat field dirs + ledger
+        for field in ("input_ids", "assistant_masks"):
+            fs.get(f"{src}/{field}", os.path.join(dst, field), recursive=True)
+        with open(marker, "w") as fh:
+            fh.write("ok\n")
+    return local_root
+
+
+def _sft_static_component(name: str, messages_field: str, prefix: str) -> DatasetComponent:
+    """Read-only component over a pre-built ChatLmDatasetFormat TreeCache (NO inline build).
+
+    ``prefix`` is an absolute local dir (file driver) or ``s3://...`` (R2). ``flat_cache=False``
+    appends ``/train``; the format must match the build's (ChatProcessor exemplar input_ids +
+    assistant_masks). A metadata mismatch only WARNS (CacheLedger.load), never raises.
+    """
+    fmt = _sft_format(messages_field)
     return DatasetComponent(
-        source=src,
-        cache_dir=f"{_SFT_R2_CACHE}/{tag}",
+        source=None,  # static cache: no inline tokenization / no zephyr build sub-job
+        cache_dir=InputName.hardcoded(f"{prefix}/{name}"),  # abs path -> passed through unchanged
         format=fmt,
         pack=True,
-        tags=[tag],
+        tags=[name],
         split="train",
+        flat_cache=False,  # cache_root/train holds the shard_ledger.json
     )
 
 
-def build_sft_mix():
-    """SFT cooldown mixture (tulu-3 + smoltalk + OpenThoughts-Agent), chat-format, assistant-only loss.
+def build_sft_mix() -> LmDataConfig:
+    """SFT cooldown mixture, reading the STATIC pre-built cache (``auto_build_caches=False``).
 
-    auto_build_caches=True -> tokenized inline from HF on the worker at cooldown start, written to
-    R2 under ``megagpt_sft/``. Consumed by the cooldown run (resume-from-pretrain + LR decay->0).
+    Default: localize the cache to local disk (``SP_SFT_LOCAL`` != 0) and read it via the file
+    driver. Used by ``SP_DATA=sft``. Pair with ``SP_INIT_FROM`` (resume the pretrain ckpt) +
+    ``SP_SCHEDULE=linear SP_MIN_LR=0`` (decay the WSD cooldown peak->0).
     """
+    names = list(_SFT_COMPONENTS)
+    prefix = _SFT_R2_CACHE
+    if os.environ.get("SP_SFT_LOCAL", "1").strip().lower() not in ("0", "false", "no"):
+        try:
+            prefix = _localize_sft_cache(names)
+        except Exception as e:  # noqa: BLE001 -- auto-degrade: never crash the cooldown on localize
+            # Fall back to reading the static R2 cache directly; LEVANTER_TS_CACHE_LIMIT (32GB in
+            # iris_jobs BASE) still holds the whole 3.3GB working set in RAM -> no re-fetch thrash.
+            import logging
+
+            logging.getLogger("data").warning(
+                "SFT cache localize to local disk failed (%s); reading R2 static cache directly "
+                "(relying on LEVANTER_TS_CACHE_LIMIT).", e
+            )
     components = {
-        name: _sft_component(hf_id, cfg, rev, field, name)
+        name: _sft_static_component(name, field, prefix)
+        for name, (_, _, _, field, _) in _SFT_COMPONENTS.items()
+    }
+    weights = {name: w for name, (_, _, _, _, w) in _SFT_COMPONENTS.items()}
+    return LmDataConfig(
+        tokenizer=MARIN_TOKENIZER,
+        cache_dir=None,
+        components=components,
+        train_weights=[(0, weights)],
+        auto_build_caches=False,
+    )
+
+
+def build_sft_cache_build_mix() -> LmDataConfig:
+    """INLINE-BUILD path: tokenize tulu-3 + smoltalk + OpenThoughts-Agent from HF and write the
+    TreeCaches to ``_SFT_R2_CACHE``. NOT used for training (that read-thrashes; see build_sft_mix).
+    Run it ONCE to (re)build the static cache when the mixture changes, then build_sft_mix() reads
+    it. Verify each ``<name>/train/shard_ledger.json`` has ``is_finished: true`` afterward.
+    """
+    def _src_component(hf_id, cfg, rev, field, name):
+        fmt = _sft_format(field)
+        src = HfDatasetSourceConfig(id=hf_id, name=cfg, revision=rev, format=fmt, splits=["train"], stream=True)
+        return DatasetComponent(
+            source=src, cache_dir=f"{_SFT_R2_CACHE}/{name}", format=fmt, pack=True, tags=[name], split="train"
+        )
+
+    components = {
+        name: _src_component(hf_id, cfg, rev, field, name)
         for name, (hf_id, cfg, rev, field, _) in _SFT_COMPONENTS.items()
     }
     weights = {name: w for name, (_, _, _, _, w) in _SFT_COMPONENTS.items()}
