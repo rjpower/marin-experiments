@@ -1,0 +1,240 @@
+# Copyright The Marin Authors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tokenizer bake-off launcher: one grug-moe proxy run for a single tokenizer arm.
+
+A thin variant of :mod:`experiments.grug.moe.launch_cw_scale` that makes the tokenizer the
+independent variable. It differs from the scale launcher in exactly the three ways the
+bake-off needs (everything else — the SCALE_* shape/mesh/batch/step knobs — is inherited):
+
+1. **Tokenizer is chosen by ``BAKEOFF_ARM``** (default ``marin-128k``), resolved through
+   the arm registry in :mod:`arms`. That one choice sets
+   both the data tokenization *and* the model ``vocab_size`` (the scale launcher hardcodes
+   llama3 and 128256 independently).
+2. **A held-out validation set is attached** — the Uncheatable-Eval subsets, tokenized with
+   the arm's tokenizer, so every arm is scored on the same raw bytes.
+3. **BPB eval is on** (``GrugEvalConfig(compute_bpb=True)``); the scale launcher passes
+   ``eval=None``.
+
+Run one arm at one compute point (the isoFLOP ladder is several of these — vary SCALE_STEPS):
+
+    uv run iris --cluster=cw-rno2a job run --cpu 2 --memory 3GB --extra cpu \
+      --job-name grug-bakeoff-marin-c0 \
+      -e BAKEOFF_ARM marin-128k \
+      -e SCALE_GPU_REPLICAS 1 -e SCALE_EXPERT_AXIS 4 -e SCALE_HIDDEN_DIM 1024 \
+      -e SCALE_NUM_LAYERS 16 -e SCALE_NUM_EXPERTS 32 -e SCALE_TOP_K 4 \
+      -e SCALE_BATCH 128 -e SCALE_SEQ_LEN 1024 -e SCALE_STEPS 2000 \
+      -e SCALE_TRACKER wandb -e RUN_ID bakeoff-marin-c0 \
+      -- python proxy_ladder.py
+
+Use ``SCALE_TRACKER=wandb`` for a durable, queryable ``eval/bpb`` history; the default
+``json_logger`` only writes to the run log (scrape with
+``collect_results``).
+"""
+
+import dataclasses
+import datetime
+import math
+import os
+
+from fray.cluster import ResourceConfig
+from levanter.callbacks.profiler import ProfilerConfig
+from levanter.checkpoint import CheckpointerConfig
+from levanter.grug.ngram_embed import NgramEmbedConfig
+from levanter.tracker.json_logger import JsonLoggerConfig
+from levanter.tracker.wandb import WandbConfig
+from marin.execution.lazy import ArtifactStep, StepContext
+from marin.execution.step_runner import StepRunner
+from marin.experiment.data import mixture, tokenized
+from marin.experiment.namespacing import user_namespaced_name
+from marin.training.training import LevanterCheckpoint
+
+from experiments.datasets.uncheatable import UNCHEATABLE_SUBSETS, uncheatable_raw
+from experiments.grug.moe.launch import GrugMoeLaunchConfig, env_int, run_grug_moe_trial
+from experiments.grug.moe.launch_cw_scale import (
+    _SLIMPAJAMA_SHUFFLE,
+    GPUS_PER_NODE,
+    OUTPUT_SUBDIR,
+    SCALE_OPTIMIZER,
+    SCALE_TRAINER_DEFAULTS,
+    build_scale_model,
+)
+from experiments.grug.moe.train import GrugEvalConfig, GrugTrainerConfig
+from arms import arm_by_name
+
+# SlimPajama-6B tokenization OOMs at the default worker resources (matches launch.py).
+_SLIMPAJAMA_TOKENIZE_RESOURCES = ResourceConfig(ram="64g", disk="64g")
+
+# These runs live under their own subtree so the ladder stays grouped and separable from the
+# throughput scale runs that share OUTPUT_SUBDIR's sibling.
+BAKEOFF_SUBDIR = f"{OUTPUT_SUBDIR}/tokenizer-bakeoff"
+
+# Held-out BPB eval every this many steps; cheap enough to leave on for short proxy runs.
+_STEPS_PER_EVAL = 500
+
+
+def slimpajama_6b_for(arm_name: str, tokenizer: str) -> ArtifactStep:
+    """SlimPajama-6B tokenized with ``tokenizer`` — the bake-off's shared training corpus.
+
+    The cache name is suffixed with the arm so each arm builds its own tokenization rather
+    than adopting a pre-existing cache registered under a shared name (the artifact store
+    adopts by name@version, so a shared name would silently reuse another tokenizer's tokens).
+    """
+    return tokenized(
+        f"bakeoff-train/slimpajama-6b-{arm_name}",
+        source="DKYoon/SlimPajama-6B",
+        tokenizer=tokenizer,
+        resources=_SLIMPAJAMA_TOKENIZE_RESOURCES,
+        version="2026.06.28",
+    )
+
+
+def bakeoff_validation(arm_name: str, tokenizer: str) -> list[ArtifactStep]:
+    """The Uncheatable-Eval subsets tokenized with ``tokenizer`` as held-out validation.
+
+    Named per arm for the same reason as the training corpus: the shared
+    ``uncheatable_datasets`` handles are registered under ``-llama3`` names and would be
+    adopted with the llama3 tokenizer regardless of the tokenizer requested here.
+    """
+    raw = uncheatable_raw()
+    return [
+        tokenized(
+            f"bakeoff-val/{subset}-{arm_name}",
+            tokenizer=tokenizer,
+            version="2026.06.28",
+            raw=raw,
+            glob=UNCHEATABLE_SUBSETS[subset],
+            validation=True,
+        )
+        for subset in UNCHEATABLE_SUBSETS
+    ]
+
+
+def build_bakeoff_checkpoint(*, version: str = "dev") -> ArtifactStep[LevanterCheckpoint]:
+    """One tokenizer arm's proxy run as a lazy :class:`LevanterCheckpoint` from BAKEOFF_ARM + SCALE_* env."""
+    arm = arm_by_name(os.environ.get("BAKEOFF_ARM", "marin-128k"))
+    run_id = os.environ.get("RUN_ID") or datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S")
+
+    replicas = env_int("SCALE_GPU_REPLICAS", 1)
+    expert_axis = env_int("SCALE_EXPERT_AXIS", 4)
+    replica_axis = env_int("SCALE_REPLICA_AXIS", 1)
+    batch_size = env_int("SCALE_BATCH", 128)
+    steps = env_int("SCALE_STEPS", 2000)
+    processes_per_task = env_int("SCALE_PROCESSES_PER_TASK", 1)
+
+    # The model shape comes from SCALE_* exactly as in the scale launcher; only the vocab is
+    # the arm's, so the output head and embedding table size track the tokenizer under test.
+    model = dataclasses.replace(build_scale_model(), vocab_size=arm.vocab_size)
+
+    # BAKEOFF_NGRAM toggles the hashed multi-gram input embedding (Over-Encoding / LongCat,
+    # arXiv 2501.16975 & 2601.21204). It adds input-side embedding capacity at the same vocab,
+    # output head, and serving FLOPs, so a BPB drop vs the same arm without it is a compute-free
+    # uplift. The paper's gain needs a LARGE hashed n-gram vocabulary (30x base = millions of
+    # buckets per table); low-rank sub-tables (rank << hidden) keep that memory-feasible, and
+    # mean-combine with a norm-matched init keeps the initial embedding at the baseline output
+    # norm (Embedding Amplification). Every knob is env-swept by the ladder driver.
+    ngram_enabled = bool(os.environ.get("BAKEOFF_NGRAM"))
+    if ngram_enabled:
+        orders = tuple(int(o) for o in os.environ.get("BAKEOFF_NGRAM_ORDERS", "2,3,4").split(","))
+        rank = env_int("BAKEOFF_NGRAM_RANK", 128)
+        width = rank if rank > 0 else model.hidden_dim
+        # The module builds tables with per-element std init_std_scale/sqrt(width); the base token
+        # embedding has per-element std model.initializer_std, so this multiplier makes each n-gram
+        # term match the base embedding scale (ratio 1.0) and lets the ratio be swept.
+        ratio = float(os.environ.get("BAKEOFF_NGRAM_RATIO", "1.0"))
+        model = dataclasses.replace(
+            model,
+            ngram=NgramEmbedConfig(
+                orders=orders,
+                num_hashes=env_int("BAKEOFF_NGRAM_HASHES", 2),
+                hash_buckets=env_int("BAKEOFF_NGRAM_BUCKETS", 4_000_037),
+                rank=rank if rank > 0 else None,
+                combine=os.environ.get("BAKEOFF_NGRAM_COMBINE", "mean"),
+                init_std_scale=ratio * model.initializer_std * math.sqrt(width),
+            ),
+        )
+    if model.num_experts % expert_axis != 0:
+        raise ValueError(f"num_experts={model.num_experts} must be divisible by SCALE_EXPERT_AXIS={expert_axis}")
+
+    data_axis = (replicas * GPUS_PER_NODE) // (replica_axis * expert_axis)
+    batch_shards = replica_axis * data_axis * expert_axis
+    if batch_size % batch_shards != 0:
+        raise ValueError(f"SCALE_BATCH={batch_size} must be divisible by batch shards={batch_shards}")
+
+    # The n-gram embedding adds up to ~12 GB of hash tables (~50 GB with fp32 Adam state), and the
+    # final checkpoint gathers that whole train state to host to serialize it. SCALE_RAM lets the
+    # heavy n-gram runs request enough host memory (the nodes have ~1.5 TB) to survive that gather.
+    ram = os.environ.get("SCALE_RAM", "256g")
+    resources = ResourceConfig.with_gpu("H100", count=GPUS_PER_NODE, cpu=32, ram=ram, disk="256g", replicas=replicas)
+
+    use_wandb = os.environ.get("SCALE_TRACKER", "json_logger").lower() == "wandb"
+    json_logger_name = os.environ.get("SCALE_JSON_LOGGER", "grug_moe_scale.metrics")
+    wandb_project = os.environ.get("WANDB_PROJECT", "marin_moe")
+
+    grug_trainer = GrugTrainerConfig(
+        expert_axis_size=expert_axis,
+        replica_axis_size=replica_axis,
+        **SCALE_TRAINER_DEFAULTS,
+    )
+    mp = os.environ.get("SCALE_MP", "params=float32,compute=bfloat16,output=bfloat16")
+
+    train = slimpajama_6b_for(arm.name, arm.ref)
+    validation = bakeoff_validation(arm.name, arm.ref)
+    variant = "-ngram" if ngram_enabled else ""
+    name = f"grug-bakeoff-{arm.name}{variant}-d{model.hidden_dim}-L{model.num_layers}"
+
+    def build_config(ctx: StepContext) -> GrugMoeLaunchConfig:
+        if use_wandb:
+            tracker = WandbConfig(
+                project=wandb_project,
+                tags=["grug", "moe", "cw", "h100", "tokenizer-bakeoff", arm.name],
+                group="tokenizer-flop-bakeoff",
+                name=None,
+                replicate_path=ctx.output_path,
+            )
+        else:
+            tracker = JsonLoggerConfig(logger_name=json_logger_name)
+        return GrugMoeLaunchConfig(
+            model=model,
+            data=mixture(ctx, {train: 1.0}, validation=validation, shuffle=_SLIMPAJAMA_SHUFFLE),
+            output_path=ctx.output_path,
+            run_id=run_id,
+            resources=ctx.runtime_arg("train_resources"),
+            steps=steps,
+            batch_size=batch_size,
+            seed=0,
+            mp=mp,
+            tracker=tracker,
+            optimizer=SCALE_OPTIMIZER,
+            grug_trainer=grug_trainer,
+            processes_per_task=processes_per_task,
+            eval=GrugEvalConfig(
+                compute_bpb=True,
+                eval_batch_size=batch_size,
+                steps_per_eval=env_int("SCALE_STEPS_PER_EVAL", _STEPS_PER_EVAL),
+                max_eval_batches=16,
+                eval_current=True,
+                eval_ema=False,
+            ),
+            profiler=ProfilerConfig(enabled=False),
+            checkpointer=CheckpointerConfig(
+                base_path=f"/tmp/grug-bakeoff-ckpt/{run_id}",
+                append_run_id_to_base_path=False,
+                save_interval=None,
+                keep=None,
+            ),
+        )
+
+    return ArtifactStep(
+        name=user_namespaced_name(f"{BAKEOFF_SUBDIR}/{name}-{run_id}", version),
+        version=version,
+        artifact_type=LevanterCheckpoint,
+        run=run_grug_moe_trial,
+        build_config=build_config,
+        deps=(train, *validation),
+        runtime_args={"train_resources": resources},
+    )
+
+
+if __name__ == "__main__":
+    StepRunner().run([build_bakeoff_checkpoint().lower()])
