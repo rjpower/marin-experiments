@@ -992,7 +992,7 @@ wheels = [
 
 [[package]]
 name = "huggingface-hub"
-version = "1.24.0"
+version = "1.25.0rc0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -1005,9 +1005,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/df/9b/d3bb4e7d792835daf34dd7091bbc7d7b4e0437d9388f1ea7239cce49f478/huggingface_hub-1.24.0.tar.gz", hash = "sha256:18431ff4daae0749aa9ba102fc952e314c98e1d30ebdec5319d85ca0a83e1ae5", size = 921848, upload-time = "2026-07-17T09:54:01.022Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/74/11/d8d55cb4de592126056061d0c43b47390460f610c3a9a41258178f4ff0ca/huggingface_hub-1.25.0rc0.tar.gz", hash = "sha256:a8052527dfbadc6e6ad5e6ae781be42fe6914afba31088c2c11b7f8648801d11", size = 928571, upload-time = "2026-07-27T08:04:50.192Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5f/c3/aeaaf3911d2529614be18d1c8b5496afc185560e76568063d517283318af/huggingface_hub-1.24.0-py3-none-any.whl", hash = "sha256:6ed4120a84a6beec900640aa7e346bd766a6b7341e41526fef5dc8bd81fb7d59", size = 771904, upload-time = "2026-07-17T09:53:59.106Z" },
+    { url = "https://files.pythonhosted.org/packages/74/62/2c177cbdab4050f7d9c5cd98505f84f752145f95ea78bd34f0cd8529c055/huggingface_hub-1.25.0rc0-py3-none-any.whl", hash = "sha256:5fbcb125d2d8fe90e7dffc475b0831f492145c035433a03a1df092ea48a602e9", size = 774939, upload-time = "2026-07-27T08:04:48.225Z" },
 ]
 
 [[package]]
@@ -1930,11 +1930,11 @@ wheels = [
 
 [[package]]
 name = "pylatexenc"
-version = "3.0a33"
+version = "3.0b1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/97/6c/37cf2bfa76f122885acec21d62018fd9503ece009a05ea5d32dd348133e2/pylatexenc-3.0a33.tar.gz", hash = "sha256:087c9d6d280ba1242e01caf0a6436b18e9790e07148eb9430aeaa51b68d2c114", size = 205228, upload-time = "2025-08-26T09:09:26.385Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ad/36/aefa4baa95a91332dfc8536f1ad61e2900c2717bd5bd55f70c0d15041c10/pylatexenc-3.0b1.tar.gz", hash = "sha256:486042df4496c1ecf2d2b722bcca6eeac0b594ddaa0a214d10cc1b9b25e9bf70", size = 236097, upload-time = "2026-07-26T14:19:44.676Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c6/43/0a8a0b4b42b9b38f01f255b777bd4697099eb75ea7201444b528794a2a4f/pylatexenc-3.0a33-py3-none-any.whl", hash = "sha256:71221905d8e731c0600cde10af08f16f539723b6ffe17f478e56f5c0208c507a", size = 267673, upload-time = "2025-08-26T09:09:24.832Z" },
+    { url = "https://files.pythonhosted.org/packages/11/43/a4fd7708955ae891ff9915871c97f8b857f5a92c73def122a312502d4e61/pylatexenc-3.0b1-py3-none-any.whl", hash = "sha256:653bbb8ca2535ba23e8a54d1ab44c54b41aeb654ca2d18196dd90061f269fb89", size = 298459, upload-time = "2026-07-26T14:19:43.437Z" },
 ]
 
 [[package]]
