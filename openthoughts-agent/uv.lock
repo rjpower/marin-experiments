@@ -143,11 +143,11 @@ wheels = [
 
 [[package]]
 name = "annotated-doc"
-version = "0.0.4"
+version = "0.0.5"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/57/ba/046ceea27344560984e26a590f90bc7f4a75b06701f653222458922b558c/annotated_doc-0.0.4.tar.gz", hash = "sha256:fbcda96e87e9c92ad167c2e53839e57503ecfda18804ea28102353485033faa4", size = 7288, upload-time = "2025-11-10T22:07:42.062Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/8e/38aa427ed5402449e226975b649c5dc73ccadfefeb95e6aecb8f8ea4b6b6/annotated_doc-0.0.5.tar.gz", hash = "sha256:c7e58ce09192557605d8bbd92836d7e1d520ac9580096042c0bfd197efacf1bb", size = 10758, upload-time = "2026-07-28T13:50:58.129Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/d3/26bf1008eb3d2daa8ef4cacc7f3bfdc11818d111f7e2d0201bc6e3b49d45/annotated_doc-0.0.4-py3-none-any.whl", hash = "sha256:571ac1dc6991c450b25a9c2d84a3705e2ae7a53467b5d111c24fa8baabbed320", size = 5303, upload-time = "2025-11-10T22:07:40.673Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/30/e900b21425a860e195f32e37657aa1f7c7f2b1bfb26f03ca209b90933c06/annotated_doc-0.0.5-py3-none-any.whl", hash = "sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101", size = 5302, upload-time = "2026-07-28T13:50:57.239Z" },
 ]
 
 [[package]]
@@ -515,7 +515,7 @@ etree = [
 
 [[package]]
 name = "fastapi"
-version = "0.140.7"
+version = "0.140.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
@@ -524,9 +524,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "typing-inspection" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e1/33/e0dfa29ccce4eb8c9a073f9e557b0d6bacbb3aa32e7ad595f678de4d036a/fastapi-0.140.7.tar.gz", hash = "sha256:09a640af2d29006345e1f28e4f031fa60f89b1a75d29f26070f3afa677d66cce", size = 422051, upload-time = "2026-07-27T17:34:45.908Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2f/cb/7a4d2c2eb5a5d8a91763c05b7383d72917862e32f780daa0e27ffbb34cc6/fastapi-0.140.13.tar.gz", hash = "sha256:500172a08cf1459901f90b05c37d93060dada3b573fec8f0862445db52ba6b4b", size = 424843, upload-time = "2026-07-28T15:37:00.805Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7b/0e/00cddd6b8668884e9c7588ab0eeb73becbd1efa3eaead34397f2e9a8de49/fastapi-0.140.7-py3-none-any.whl", hash = "sha256:960bb9696d8fd19dff488aa4f67f276364542cfcce9f7e68a82fe49dce126626", size = 131085, upload-time = "2026-07-27T17:34:47.036Z" },
+    { url = "https://files.pythonhosted.org/packages/84/4e/f9e8c762ef5e05c40482131e3d5e8b36bca13fa127578261f1d6b35a25d4/fastapi-0.140.13-py3-none-any.whl", hash = "sha256:8b017110e1e9f30a95e8bdb8f71fbe2f0fe3af5717109e5b14f9e069df54f6d4", size = 131222, upload-time = "2026-07-28T15:37:02.124Z" },
 ]
 
 [[package]]
@@ -1538,14 +1538,14 @@ wheels = [
 
 [[package]]
 name = "omegaconf"
-version = "2.4.0.dev13"
+version = "2.4.0.dev14"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a1/15/74f85f44f696ae0ba5b0e443d6740711e581a233423df3cc836070c499bf/omegaconf-2.4.0.dev13.tar.gz", hash = "sha256:11641b52e3df4194e560c158fbae277550084512d7a3f73955e0f51781625432", size = 3478118, upload-time = "2026-07-18T20:23:54.106Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/44/c0f9f0636aa65c3303915fa19dfa40af520b0a07bb0240ee164b36dfad88/omegaconf-2.4.0.dev14.tar.gz", hash = "sha256:45fd4cb9d9bc4b0e869f2ed7cd08706c370518880823d575190bcb5ef96973aa", size = 3493569, upload-time = "2026-07-29T04:57:03.399Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7a/ff/bb1e91f6ccf8fd529125745d570e869bfa9e9b925f83dc75c93406561056/omegaconf-2.4.0.dev13-py3-none-any.whl", hash = "sha256:a9725a3b578e9ab4b95bd7413751133287740ee4eeb7644c233821380889fd3d", size = 240075, upload-time = "2026-07-18T20:23:50.911Z" },
+    { url = "https://files.pythonhosted.org/packages/07/18/5dd2289514303640c42b612536b9ebf396e99f6412b0b1f5dc1e1d08abb4/omegaconf-2.4.0.dev14-py3-none-any.whl", hash = "sha256:9e3a131a6017b24ff3858ddfc53ac5cdb5bc104e4fbdd17d57ea0e111e2fc51a", size = 245705, upload-time = "2026-07-29T04:57:00.424Z" },
 ]
 
 [[package]]
@@ -2000,11 +2000,11 @@ wheels = [
 
 [[package]]
 name = "pylatexenc"
-version = "3.0b1"
+version = "3.0b2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ad/36/aefa4baa95a91332dfc8536f1ad61e2900c2717bd5bd55f70c0d15041c10/pylatexenc-3.0b1.tar.gz", hash = "sha256:486042df4496c1ecf2d2b722bcca6eeac0b594ddaa0a214d10cc1b9b25e9bf70", size = 236097, upload-time = "2026-07-26T14:19:44.676Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/20/51/68a89d104d9b892bf459912367256b1c5222aca544f655303a1981d94755/pylatexenc-3.0b2.tar.gz", hash = "sha256:14c6148c3cabebaff5e488e304abb21024f86fdab7d70bafc9f29d62463a7d9d", size = 260045, upload-time = "2026-07-28T15:26:14.179Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/43/a4fd7708955ae891ff9915871c97f8b857f5a92c73def122a312502d4e61/pylatexenc-3.0b1-py3-none-any.whl", hash = "sha256:653bbb8ca2535ba23e8a54d1ab44c54b41aeb654ca2d18196dd90061f269fb89", size = 298459, upload-time = "2026-07-26T14:19:43.437Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/f9/44351165a7f14073e75825769fd1aec61d1da944b61a7296725cc95ff889/pylatexenc-3.0b2-py3-none-any.whl", hash = "sha256:0cd14a2104ec4eaeaaadcab85b2da8c183a5feb39d71301a4db9d033b3e6e349", size = 322323, upload-time = "2026-07-28T15:26:13.172Z" },
 ]
 
 [[package]]
